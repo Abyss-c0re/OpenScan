@@ -6,7 +6,7 @@ fox3d scans one object. You can turn the object, or walk the scanner around it, 
 
 1. Plug in the scanner. `./build/fox3d devices` should list camera A and camera B and the serial.
 2. Start `./build/fox3d`.
-3. Set the object inside the green outline. The right-hand view is the 3D model.
+3. Set the object inside the green outline. The right-hand view is the 3D model, shaded with the same gray as the camera. The side panels are the rectified stereo pair: lens distortion is removed, and a feature is on the same row in both.
 4. Press **Start scan**. Move so each new view still sees part of the object you already have.
 5. Press **Stop** when that pass is done. The model stays.
 6. Press **Export…** and choose STL, OBJ, or PLY.

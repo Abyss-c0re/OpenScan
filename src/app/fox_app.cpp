@@ -107,7 +107,7 @@ public:
               int exposure_a, int gain_a_init, int exposure_b, int gain_b_init)
         : a(cam_a), b(cam_b), live(model), serial(std::move(serial_text)),
           exp_a(exposure_a), gain_a(gain_a_init), exp_b(exposure_b), gain_b(gain_b_init) {
-        setWindowTitle("Fox 3D");
+        setWindowTitle(QString("Fox 3D " FOX3D_VERSION));
         resize(1280, 860);
 
         start = new QPushButton("Start scan");

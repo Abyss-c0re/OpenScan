@@ -23,7 +23,7 @@ static void on_sigint(int) { g_stop = 1; }
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "fox3d — open-source scanner for the 3DMakerpro Fox (JMM8)\n"
+            "fox3d " FOX3D_VERSION " — open-source scanner for the 3DMakerpro Fox (JMM8)\n"
             "\n"
             "  %s\n"
             "      Open the app. The cameras and 3D view come up idle.\n"
@@ -509,6 +509,10 @@ static int cmd_asic(const char *hexaddr) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "version"))) {
+        printf("fox3d %s\n", FOX3D_VERSION);
+        return 0;
+    }
     if (argc < 2) {
         /* Negative camera values mean "use the saved Settings". */
         return fox_app_main(argc, argv, nullptr, -1, -1, -1, -1, 0.5, 80, 550);

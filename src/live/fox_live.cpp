@@ -25,6 +25,7 @@ namespace {
 
 struct Tri {
     cv::Vec3f a, b, c;
+    float tone = 0.6f; /* camera gray, 0..1, so the model matches the picture */
 };
 
 static const int kEdgeCorner[12][2] = {
@@ -254,6 +255,8 @@ static Geom build_geom(const fox_calib *cal, const fox_scan_opts &opt, cv::Size 
     /* alpha 0 makes OpenCV zoom the shared field of view until the focal length
      * is several times too long, so the working-distance disparity falls outside
      * the search. alpha < 0 keeps the calibrated focal length. */
+    /* alpha -1 keeps the calibrated focal length. alpha 0 zooms until the
+     * picture is a few valid pixels wide and the pair is useless. */
     cv::stereoRectify(K1, D1, K2, D2, size, R, T, R1, R2, P1, P2, g.Q,
                       cv::STEREO_ZERO_DISPARITY, -1, size);
     cv::initUndistortRectifyMap(K1, D1, R1, P1, size, CV_32FC1, g.map1x, g.map1y);
@@ -540,6 +543,7 @@ struct fox_live {
         cv::Vec3f p[3];
         uint64_t k[3];
         int bin;
+        float tone = 0.6f;
     };
     std::vector<TriRef> refs;
     std::unordered_set<uint64_t> seen_cells;
@@ -555,7 +559,7 @@ struct fox_live {
     float radius_mm = 27.f;
     float span_y0 = 0.f, span_y1 = 0.f;
     int scanned_bins = 0;
-    float yaw = 0.42f;
+    float yaw = 0.18f;
     float pitch = -0.10f;
     float dist = -1.f;
     int spin = 0;
@@ -565,7 +569,25 @@ struct fox_live {
     int drag_y = 0;
     int view_x = 0, view_y = 0, view_w = 0, view_h = 0;
     std::vector<FoxButton> buttons;
+    /* Full-resolution undistort of each sensor, in the sensor's own orientation. */
+    cv::Mat und_ax, und_ay, und_bx, und_by;
+    double view_fx = 0, view_fy = 0, view_cx = 0, view_cy = 0;
+    cv::Mat stereo_a, stereo_b;
 };
+
+/* Remove lens distortion without zooming the picture. alpha 1 keeps every
+ * source pixel, so the skull is not cropped again to hide the bend. */
+static void build_undistort(const fox_pinhole &cam, cv::Size size, cv::Mat &mx, cv::Mat &my,
+                            double &fx, double &fy, double &cx, double &cy) {
+    cv::Mat K = pinhole_k(cam, 1.0);
+    cv::Mat D = pinhole_d(cam);
+    cv::Mat neu = cv::getOptimalNewCameraMatrix(K, D, size, 1.0, size);
+    cv::initUndistortRectifyMap(K, D, cv::Mat(), neu, size, CV_32FC1, mx, my);
+    fx = neu.at<double>(0, 0);
+    fy = neu.at<double>(1, 1);
+    cx = neu.at<double>(0, 2);
+    cy = neu.at<double>(1, 2);
+}
 
 fox_live *fox_live_create(const fox_calib *calib, const fox_scan_opts *opt) {
     fox_live *L = new fox_live();
@@ -581,6 +603,13 @@ fox_live *fox_live_create(const fox_calib *calib, const fox_scan_opts *opt) {
     sh = std::max(32, sh & ~7);
     L->size = cv::Size(sw, sh);
     L->geom = build_geom(&L->calib, L->opt, L->size);
+    if (calib->width > 16 && calib->height > 16) {
+        cv::Size full(calib->width, calib->height);
+        double afx = 0, afy = 0, acx = 0, acy = 0;
+        build_undistort(calib->cam[0], full, L->und_ax, L->und_ay, afx, afy, acx, acy);
+        build_undistort(calib->cam[1], full, L->und_bx, L->und_by, L->view_fx, L->view_fy, L->view_cx,
+                        L->view_cy);
+    }
     snprintf(L->line1, sizeof L->line1, "stopped");
     L->wedge.resize(72);
     snprintf(L->line2, sizeof L->line2, "Start begins the model. Drag it to orbit. Close stays closed.");
@@ -1436,25 +1465,25 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
     if (dist && *dist <= 1.f) *dist = use;
     float yaw = yaw_deg * 3.14159265f / 180.f;
     float pitch = pitch_deg * 3.14159265f / 180.f;
-    cv::Vec3f eye = c + cv::Vec3f(std::sin(yaw) * std::cos(pitch), std::sin(pitch),
-                                  std::cos(yaw) * std::cos(pitch)) *
-                            use;
-    cv::Vec3f forward = c - eye;
-    forward /= std::sqrt(forward.dot(forward));
-    cv::Vec3f world_up(0, 1, 0);
-    cv::Vec3f right = forward.cross(world_up);
-    float rl = std::sqrt(right.dot(right));
-    if (rl < 1e-4f) right = cv::Vec3f(1, 0, 0);
-    else right /= rl;
-    cv::Vec3f cam_up = right.cross(forward);
-    float focal = std::min(h * 1.35f, h * 1.05f * (extent / std::max(ext_y, 1.f)));
+    /* Orthographic. A perspective camera makes the nearer centre bulge and
+     * pinches the outline, so the texture no longer sits on the camera pixels. */
+    float scale = 1.05f * (float)h / std::max(use, 1.f);
+    float cyaw = std::cos(yaw), syaw = std::sin(yaw);
+    float cp = std::cos(pitch), sp = std::sin(pitch);
+    (void)extent;
+    (void)user_zoom;
     std::vector<float> zbuf((size_t)w * h, 1e9f);
+    auto project_point = [&](const cv::Vec3f &p, float &sx, float &sy, float &zc) {
+        cv::Vec3f d = p - c;
+        float x1 = cyaw * d[0] + syaw * d[2];
+        float z1 = -syaw * d[0] + cyaw * d[2];
+        float y2 = cp * d[1] - sp * z1;
+        zc = sp * d[1] + cp * z1;
+        sx = w * 0.50f + x1 * scale;
+        sy = h * 0.50f - y2 * scale;
+    };
     auto proj = [&](const ShadeVert &v, float &sx, float &sy, float &zc) {
-        cv::Vec3f p(v.x, v.y, v.z - bump_mm * v.bump);
-        cv::Vec3f d = p - eye;
-        zc = d.dot(forward);
-        sx = w * 0.50f + focal * d.dot(right) / std::max(zc, 1.f);
-        sy = h * 0.50f - focal * d.dot(cam_up) / std::max(zc, 1.f);
+        project_point(cv::Vec3f(v.x, v.y, v.z - bump_mm * v.bump), sx, sy, zc);
     };
     for (int gy = 0; gy < gh - 1; gy++) {
         for (int gx = 0; gx < gw - 1; gx++) {
@@ -1474,17 +1503,13 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
                 float ln = std::sqrt(nrm.dot(nrm));
                 if (ln < 1e-6f) continue;
                 nrm /= ln;
-                cv::Vec3f light = eye - pa;
-                light /= std::sqrt(light.dot(light));
-                cv::Vec3f lamp = cv::normalize(cv::Vec3f(-0.45f, 0.55f, -0.7f));
-                float lam = nrm.dot(light) * 0.55f + 0.45f;
-                if (lam < 0.15f) lam = 0.15f;
-                float lam2 = std::max(0.f, -nrm.dot(lamp));
-                float alb = 0.35f + 0.95f * t[0]->albedo;
-                float shade = alb * (0.28f + 0.40f * lam + 0.34f * lam2);
+                cv::Vec3f light = cv::normalize(cv::Vec3f(-syaw, 0.25f, -cyaw));
+                float lam = nrm.dot(light) * 0.35f + 0.65f;
+                if (lam < 0.45f) lam = 0.45f;
+                float alb = t[0]->albedo;
+                float shade = alb * (0.72f + 0.28f * lam);
                 int g = (int)std::min(255.f, 255.f * shade);
-                cv::Vec3b col((uint8_t)(g * 0.80f), (uint8_t)(g * 0.86f),
-                              (uint8_t)std::min(255, g + 6));
+                cv::Vec3b col((uint8_t)g, (uint8_t)g, (uint8_t)g);
                 float ax, ay, az, bx, by, bz, cxp, cyp, cz;
                 proj(*t[0], ax, ay, az);
                 proj(*t[1], bx, by, bz);
@@ -1700,12 +1725,25 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
             bool b = displaced(gy, gx + 1, p10);
             bool c0 = displaced(gy + 1, gx, p01);
             bool d = displaced(gy + 1, gx + 1, p11);
+            auto tone3 = [&](int y0, int x0, int y1, int x1, int y2, int x2) {
+                const int ys[3] = {y0, y1, y2};
+                const int xs[3] = {x0, x1, x2};
+                float s = 0;
+                int n = 0;
+                for (int i = 0; i < 3; i++) {
+                    const ShadeVert &v = grid[(size_t)ys[i] * gw + xs[i]];
+                    if (!v.ok) continue;
+                    s += v.albedo;
+                    n++;
+                }
+                return n ? s / (float)n : 0.55f;
+            };
             if (a && b && c0 && cv::norm(p00 - p10) < 14.f && cv::norm(p00 - p01) < 14.f &&
                 cv::norm(p10 - p01) < 14.f)
-                body.tris.push_back(Tri{p00, p10, p01});
+                body.tris.push_back(Tri{p00, p10, p01, tone3(gy, gx, gy, gx + 1, gy + 1, gx)});
             if (b && d && c0 && cv::norm(p10 - p11) < 14.f && cv::norm(p10 - p01) < 14.f &&
                 cv::norm(p11 - p01) < 14.f)
-                body.tris.push_back(Tri{p10, p11, p01});
+                body.tris.push_back(Tri{p10, p11, p01, tone3(gy, gx + 1, gy + 1, gx + 1, gy + 1, gx)});
         }
     }
     return body;
@@ -1917,6 +1955,7 @@ static void fuse_shell(fox_live *L, const BodyView &body) {
         fresh.insert(ck);
         fox_live::TriRef ref;
         ref.bin = bin_of(mid[0] - L->axis0[0], mid[2] - L->axis0[2]);
+        ref.tone = src.tone;
         for (int i = 0; i < 3; i++) {
             ref.k[i] = key_of_point(w[i]);
             ref.p[i] = w[i];
@@ -1929,7 +1968,7 @@ static void fuse_shell(fox_live *L, const BodyView &body) {
     for (const fox_live::TriRef &ref : L->refs) {
         if (ref.bin < 0 || ref.bin >= kBins) continue;
         if (cv::norm(ref.p[0] - ref.p[1]) > 14.f || cv::norm(ref.p[0] - ref.p[2]) > 14.f) continue;
-        L->wedge[(size_t)ref.bin].tris.push_back(Tri{ref.p[0], ref.p[1], ref.p[2]});
+        L->wedge[(size_t)ref.bin].tris.push_back(Tri{ref.p[0], ref.p[1], ref.p[2], ref.tone});
         L->wedge[(size_t)ref.bin].filled = 1;
     }
     L->cloud.clear();
@@ -2000,29 +2039,19 @@ static void render_model(fox_live *L, cv::Mat &out) {
     float dist = L->dist;
     float yaw = L->yaw;
     float pitch = L->pitch;
-    /* The real camera looks toward +Z, so the scanned face points back at
-     * the origin. Sit the view on that side of the object. */
-    cv::Vec3f eye = c + cv::Vec3f(std::sin(yaw) * std::cos(pitch), std::sin(pitch),
-                                  -std::cos(yaw) * std::cos(pitch)) *
-                            dist;
-    cv::Vec3f forward = c - eye;
-    float fl = std::sqrt(forward.dot(forward));
-    if (fl < 1e-4f) return;
-    forward /= fl;
-    cv::Vec3f world_up(0, 1, 0);
-    cv::Vec3f right = forward.cross(world_up);
-    float rl = std::sqrt(right.dot(right));
-    if (rl < 1e-4f) right = cv::Vec3f(1, 0, 0);
-    else right /= rl;
-    cv::Vec3f cam_up = right.cross(forward);
-    float focal = std::min(h * 1.35f, h * 1.05f * (extent / std::max(height, 1.f)));
+    float scale = 1.05f * (float)h / std::max(dist, 1.f);
+    float cyaw = std::cos(yaw), syaw = std::sin(yaw);
+    float cp = std::cos(pitch), sp = std::sin(pitch);
     std::vector<float> zbuf((size_t)w * h, 1e9f);
 
     auto project = [&](const cv::Vec3f &p, float &sx, float &sy, float &zc) {
-        cv::Vec3f d = p - eye;
-        zc = d.dot(forward);
-        sx = w * 0.50f + focal * d.dot(right) / std::max(zc, 1.f);
-        sy = h * 0.48f - focal * d.dot(cam_up) / std::max(zc, 1.f);
+        cv::Vec3f d = p - c;
+        float x1 = cyaw * d[0] - syaw * d[2];
+        float z1 = syaw * d[0] + cyaw * d[2];
+        float y2 = cp * d[1] - sp * z1;
+        zc = sp * d[1] + cp * z1;
+        sx = w * 0.50f + x1 * scale;
+        sy = h * 0.50f - y2 * scale;
     };
     auto paint_tri = [&](const cv::Vec3f &a, const cv::Vec3f &b, const cv::Vec3f &c0, cv::Vec3b col) {
         float ax, ay, az, bx, by, bz, cx, cy, cz;
@@ -2058,14 +2087,14 @@ static void render_model(fox_live *L, cv::Mat &out) {
             float ln = std::sqrt(n.dot(n));
             if (ln < 1e-6f) continue;
             n /= ln;
-            cv::Vec3f light = eye - t.a;
+            cv::Vec3f light = cv::Vec3f(-syaw, 0.25f, -cyaw);
             float ll = std::sqrt(light.dot(light)) + 1e-6f;
             float lam = n.dot(light) / ll;
             lam = lam * 0.55f + 0.45f;
             if (lam < 0.18f) lam = 0.18f;
-            int g = (int)std::min(255.f, 255.f * lam);
-            paint_tri(t.a, t.b, t.c, cv::Vec3b((uint8_t)(g * 0.78f), (uint8_t)(g * 0.84f),
-                                               (uint8_t)std::min(255, g + 8)));
+            float tone = t.tone > 0.02f ? t.tone : 0.55f;
+            int g = (int)std::min(255.f, 255.f * tone * (0.55f + 0.45f * lam));
+            paint_tri(t.a, t.b, t.c, cv::Vec3b((uint8_t)g, (uint8_t)g, (uint8_t)g));
         }
     }
     draw_coverage_ring(out, L);
@@ -2117,10 +2146,19 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
     }
 
-    /* The Fox sensors are mounted upside down in the housing. */
+    /* Side cameras are the rectified stereo pair when it is available: lens
+     * distortion removed and the two pictures share horizontal rows. */
     cv::Mat show_a, show_b;
-    if (!cam_a.empty()) cv::rotate(cam_a, show_a, cv::ROTATE_180);
-    if (!cam_b.empty()) cv::rotate(cam_b, show_b, cv::ROTATE_180);
+    const cv::Mat &src_a = L->stereo_a.empty() ? cam_a : L->stereo_a;
+    const cv::Mat &src_b = L->stereo_b.empty() ? cam_b : L->stereo_b;
+    if (!src_a.empty()) {
+        if (L->stereo_a.empty()) cv::rotate(src_a, show_a, cv::ROTATE_180);
+        else show_a = src_a;
+    }
+    if (!src_b.empty()) {
+        if (L->stereo_b.empty()) cv::rotate(src_b, show_b, cv::ROTATE_180);
+        else show_b = src_b;
+    }
     cv::Mat a = to_bgr(show_a, side);
     cv::Mat b = to_bgr(show_b, side);
     cv::Mat d = body.side.empty() ? cv::Mat(side, CV_8UC3, cv::Scalar(12, 14, 18))
@@ -2135,8 +2173,8 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
         cv::putText(d, line, cv::Point(12, d.rows / 2 + 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
                     cv::Scalar(160, 160, 170), 1, cv::LINE_AA);
     }
-    label_panel(a, "camera A");
-    label_panel(b, "camera B");
+    label_panel(a, L->stereo_a.empty() ? "camera A" : "stereo A");
+    label_panel(b, L->stereo_b.empty() ? "camera B" : "stereo B");
     label_panel(d, body.side.empty() ? "coverage" : "side");
 
     const int bar = 28;
@@ -2217,19 +2255,43 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     auto t0 = std::chrono::steady_clock::now();
     cv::Mat A(height, width, CV_8UC1, const_cast<uint8_t *>(ya));
     cv::Mat B(height, width, CV_8UC1, const_cast<uint8_t *>(yb));
+    cv::Mat Au, Bu;
+    const cv::Mat *use_a = &A;
+    const cv::Mat *use_b = &B;
+    float bfx = (float)live->calib.cam[1].fx;
+    float bfy = (float)live->calib.cam[1].fy;
+    float bcx = (float)live->calib.cam[1].cx;
+    float bcy = (float)live->calib.cam[1].cy;
+    if (!live->und_bx.empty() && live->und_bx.size() == B.size()) {
+        cv::remap(A, Au, live->und_ax, live->und_ay, cv::INTER_LINEAR);
+        cv::remap(B, Bu, live->und_bx, live->und_by, cv::INTER_LINEAR);
+        use_a = &Au;
+        use_b = &Bu;
+        bfx = (float)live->view_fx;
+        bfy = (float)live->view_fy;
+        bcx = (float)live->view_cx;
+        bcy = (float)live->view_cy;
+    }
     cv::Mat As, Bs;
     cv::resize(A, As, live->size, 0, 0, cv::INTER_AREA);
     cv::resize(B, Bs, live->size, 0, 0, cv::INTER_AREA);
+    if (live->geom.map1x.size() == As.size() && live->geom.map2x.size() == Bs.size()) {
+        cv::Mat ra, rb, ua, ub;
+        cv::remap(As, ra, live->geom.map1x, live->geom.map1y, cv::INTER_LINEAR);
+        cv::remap(Bs, rb, live->geom.map2x, live->geom.map2y, cv::INTER_LINEAR);
+        cv::rotate(ra, ua, cv::ROTATE_180);
+        cv::rotate(rb, ub, cv::ROTATE_180);
+        live->stereo_a = ua;
+        live->stereo_b = ub;
+    }
 
-    /* Camera B is the clean view (no projector dots). Its intrinsics are
-     * calib camera 2. The picture is turned upright inside make_body. */
-    const fox_pinhole &cam = live->calib.cam[1];
+    /* Camera B is the clean view (no projector dots). The picture is
+     * undistorted above and turned upright inside make_body. */
     float yaw_deg = live->yaw * (180.f / 3.14159265f);
     float pitch_deg = live->pitch * (180.f / 3.14159265f);
     int shade_live = live->mode == FOX_MODE_STOP && live->scanned_bins == 0;
-    BodyView body = make_body(B, (float)cam.fx, (float)cam.fy, (float)cam.cx, (float)cam.cy,
-                              yaw_deg, pitch_deg, live->dist, live->user_zoom, shade_live,
-                              live->distance_mm);
+    BodyView body = make_body(*use_b, bfx, bfy, bcx, bcy, yaw_deg, pitch_deg, live->dist, live->user_zoom,
+                              shade_live, live->distance_mm);
     live->locked = 1;
 
     auto t1 = std::chrono::steady_clock::now();
@@ -2281,7 +2343,7 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
                  "%s   %.0f mm away   scanned %d°   not scanned %d°   detail x%d   %d tris%s",
                  mode_name, live->distance_mm, st.scanned_deg, 360 - st.scanned_deg, st.detail,
                  st.points, lost);
-    paint_preview(live, As, Bs, body);
+    paint_preview(live, *use_a, *use_b, body);
     if (status) *status = st;
     return 0;
 }

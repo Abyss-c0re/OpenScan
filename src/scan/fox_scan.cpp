@@ -60,7 +60,7 @@ static cloud_stats match_and_write(const cv::Mat &left, const cv::Mat &right,
 
     cv::Mat R1, R2, P1, P2, Q;
     cv::stereoRectify(K1, D1, K2, D2, size, R, T, R1, R2, P1, P2, Q,
-                      cv::CALIB_ZERO_DISPARITY, 0, size);
+                      cv::CALIB_ZERO_DISPARITY, -1, size);
 
     cv::Mat map1x, map1y, map2x, map2y;
     cv::initUndistortRectifyMap(K1, D1, R1, P1, size, CV_32FC1, map1x, map1y);

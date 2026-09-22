@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fox3d LANGUAGES C CXX)
+project(fox3d VERSION 0.5.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -34,6 +34,7 @@ target_include_directories(fox3d PRIVATE
 
 target_compile_definitions(fox3d PRIVATE
     FOX3D_CALIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/calib"
+    FOX3D_VERSION="${PROJECT_VERSION}"
 )
 
 target_compile_options(fox3d PRIVATE
