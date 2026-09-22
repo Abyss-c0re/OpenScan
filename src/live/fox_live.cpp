@@ -1694,70 +1694,86 @@ static float bin_angle(int b) {
     return -3.14159265f + (b + 0.5f) * (6.2831853f / kBins);
 }
 
-/* Crop centred on the object, high-pass so the turn is the facet texture
- * and not the outline. phaseCorrelate(prev, curr) shift.x is positive when
- * that texture moves right. */
-static cv::Mat front_crop(const BodyView &body, int &side_out) {
-    /* Centre of the body only. The outline does not move when the object
-     * turns, and it would pin the measured shift at zero. */
-    int side = (int)std::lround(body.radius_px * 0.90f);
-    if (side < 96) side = 96;
-    if (side % 2) side++;
-    side_out = side;
-    int half = side / 2;
-    int x0 = (int)std::lround(body.center.x) - half;
-    int y0 = (int)std::lround(body.center.y) - half;
-    cv::Mat crop(side, side, CV_8U, cv::Scalar(0));
+/* Fixed window on the object, high-pass so the outline does not pin the
+ * shift at zero. The window size does not follow the silhouette, so a turn
+ * that makes one side look wider still measures both directions.
+ * phaseCorrelate(prev, curr) shift.x is positive when the texture moves right. */
+static cv::Mat front_crop(const BodyView &body) {
+    const int cw = 360;
+    const int ch = 220;
+    cv::Mat crop(ch, cw, CV_8U, cv::Scalar(0));
+    int x0 = (int)std::lround(body.center.x) - cw / 2;
+    int y0 = (int)std::lround(body.center.y) - ch / 2;
     int src_x = std::max(0, x0);
     int src_y = std::max(0, y0);
     int dst_x = src_x - x0;
     int dst_y = src_y - y0;
-    int w = std::min(body.gray.cols - src_x, side - dst_x);
-    int h = std::min(body.gray.rows - src_y, side - dst_y);
-    if (w < 24 || h < 24) return cv::Mat();
+    int w = std::min(body.gray.cols - src_x, cw - dst_x);
+    int h = std::min(body.gray.rows - src_y, ch - dst_y);
+    if (w < 48 || h < 48) return cv::Mat();
     body.gray(cv::Rect(src_x, src_y, w, h)).copyTo(crop(cv::Rect(dst_x, dst_y, w, h)));
     cv::Mat small, f, blur;
-    cv::resize(crop, small, cv::Size(192, 192), 0, 0, cv::INTER_AREA);
+    cv::resize(crop, small, cv::Size(180, 110), 0, 0, cv::INTER_AREA);
     small.convertTo(f, CV_32F, 1.0 / 255.0);
-    cv::GaussianBlur(f, blur, cv::Size(0, 0), 5.0);
+    cv::GaussianBlur(f, blur, cv::Size(0, 0), 4.0);
     f -= blur;
     return f;
 }
 
-/* 1 = turn applied, 0 = lost (yaw and the reference stay put), -1 = no object. */
+/* 1 = turn applied, 0 = lost (yaw stays put), -1 = no object. */
 static int track_spin(fox_live *L, const BodyView &body, float &response) {
     response = 0.f;
     if (body.gray.empty() || body.radius_px < 30.f || body.P.size() < 80) return -1;
-    int side = 0;
-    cv::Mat f = front_crop(body, side);
+    cv::Mat f = front_crop(body);
     if (f.empty()) return -1;
     if (!L->track_have || L->track_ref.size() != f.size()) {
         L->track_ref = f;
-        L->track_side = side;
         L->track_have = 1;
         response = 1.f;
         return 1;
     }
-    if (std::abs(side - L->track_side) > side / 8) {
+    /* A turn slides the whole face sideways. The left half and the right half
+     * are measured separately so a cheek that leaves the window does not
+     * cancel the other direction. */
+    auto measure = [](const cv::Mat &prev, const cv::Mat &curr, cv::Point2d &shift, double &resp) -> bool {
+        if (prev.empty() || prev.size() != curr.size() || prev.cols < 24 || prev.rows < 24) return false;
+        cv::Mat window;
+        cv::createHanningWindow(window, prev.size(), CV_32F);
+        shift = cv::phaseCorrelate(prev, curr, window, &resp);
+        return std::isfinite(resp) && resp >= 0.04 && std::isfinite(shift.x) && std::isfinite(shift.y);
+    };
+    int mid = f.cols / 2;
+    cv::Point2d shifts[3];
+    double resps[3];
+    bool ok[3];
+    ok[0] = measure(L->track_ref, f, shifts[0], resps[0]);
+    ok[1] = measure(L->track_ref.colRange(0, mid).clone(), f.colRange(0, mid).clone(), shifts[1], resps[1]);
+    ok[2] = measure(L->track_ref.colRange(mid, f.cols).clone(), f.colRange(mid, f.cols).clone(), shifts[2], resps[2]);
+    double sx = 0, sy = 0, wsum = 0;
+    int n_ok = 0;
+    double best_resp = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!ok[i]) continue;
+        sx += shifts[i].x * resps[i];
+        sy += shifts[i].y * resps[i];
+        wsum += resps[i];
+        n_ok++;
+        if (resps[i] > best_resp) best_resp = resps[i];
+    }
+    response = (float)best_resp;
+    if (n_ok == 0 || wsum <= 0) return 0;
+    sx /= wsum;
+    sy /= wsum;
+    float radius_s = body.radius_px * ((float)f.cols / 360.f);
+    if (radius_s < 8.f) radius_s = 8.f;
+    float dtheta = -(float)sx / radius_s;
+    const float kMax = 18.f * 3.14159265f / 180.f;
+    if (!std::isfinite(dtheta) || std::fabs(dtheta) > kMax || std::fabs(sy) > f.rows * 0.35f) {
         L->track_ref = f;
-        L->track_side = side;
         return 0;
     }
-    cv::Mat window;
-    cv::createHanningWindow(window, f.size(), CV_32F);
-    double resp = 0;
-    cv::Point2d shift = cv::phaseCorrelate(L->track_ref, f, window, &resp);
-    response = (float)resp;
-    float radius_s = body.radius_px * ((float)f.cols / (float)side);
-    if (radius_s < 8.f) radius_s = 8.f;
-    float dtheta = -(float)shift.x / radius_s;
-    const float kMax = 18.f * 3.14159265f / 180.f;
-    if (resp < 0.045f || !std::isfinite(dtheta) || std::fabs(dtheta) > kMax ||
-        std::fabs(shift.y) > f.rows * 0.18f)
-        return 0;
     L->object_yaw += dtheta;
     L->track_ref = f;
-    L->track_side = side;
     return 1;
 }
 
@@ -1773,16 +1789,25 @@ static cv::Vec3f world_of(const cv::Vec3f &p, const cv::Matx33f &R, const cv::Ve
     return scale * (R * p) + t;
 }
 
-static void fuse_shell(fox_live *L, const BodyView &body, const cv::Matx33f &R, const cv::Vec3f &t,
-                       float scale) {
+static void fuse_shell(fox_live *L, const BodyView &body) {
     if (L->wedge.size() != (size_t)kBins) L->wedge.assign(kBins, fox_live::Wedge{});
+    /* Positive object_yaw is a turn whose texture moved left. The shell that
+     * is in front of the camera belonged on the other side, so it is swung
+     * the opposite way around the first view's axis. Both signs are used. */
+    cv::Matx33f R = rot_y(-L->object_yaw);
+    cv::Vec3f axis = body.axis;
     if (!L->have_axis) {
-        L->axis0 = world_of(body.axis, R, t, scale);
+        L->axis0 = axis;
         L->have_axis = 1;
         L->radius_mm = std::max(8.f, body.radius_px * body.axis[2] / 2742.f);
         L->span_y0 = 1e9f;
         L->span_y1 = -1e9f;
     }
+    cv::Vec3f t = L->axis0 - R * axis;
+    const float scale = 1.f;
+    L->pose_R = R;
+    L->pose_t = t;
+    L->pose_s = scale;
     const float cell = 0.8f;
     struct Acc {
         cv::Vec3f sum;
@@ -1891,28 +1916,10 @@ static void fuse_shell(fox_live *L, const BodyView &body, const cv::Matx33f &R, 
         L->cloud_n.push_back(cv::Vec3f(0, 0, -1));
     }
     if (cells > 0) centre *= 1.f / (float)cells;
-    cv::Vec3f to_obj = centre - t;
-    float horiz = std::sqrt(to_obj[0] * to_obj[0] + to_obj[2] * to_obj[2]);
-    float el = std::atan2(to_obj[1], horiz);
-    float az = std::atan2(to_obj[0], to_obj[2]);
-    int ia = (int)std::floor((az + 3.14159265f) / (6.2831853f) * 36.f);
-    if (ia < 0) ia = 0;
-    if (ia > 35) ia = 35;
-    for (int k = -8; k <= 8; k++) {
-        int b = (ia + k + 36) % 36;
-        L->seen_dir[b] = 1;
-        L->wedge[(size_t)b].filled = 1;
-    }
-    if (el > 0.45f) {
-        for (int k = -4; k <= 4; k++) {
-            int b = 36 + (ia + k + 36) % 36;
-            L->seen_dir[b] = 1;
-            L->wedge[(size_t)b].filled = 1;
-        }
-    }
+    (void)centre;
     int nbin = 0;
-    for (char h : L->seen_dir)
-        if (h) nbin++;
+    for (const auto &wd : L->wedge)
+        if (!wd.tris.empty()) nbin++;
     L->scanned_bins = nbin;
     L->detail = cells ? std::max(1, (int)(passes / cells)) : 1;
 }
@@ -2193,23 +2200,20 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     st.median_mm = body.median_mm;
 
     if (live->mode == FOX_MODE_SCAN || live->mode == FOX_MODE_PAUSE) {
-        cv::Matx33f R;
-        cv::Vec3f tr;
-        float scale = 1.f;
-        bool locked = body.P.size() >= 80 && track_object(live, body.P, R, tr, scale);
-        live->last_track = body.P.size() < 80 ? -1 : (locked ? 1 : 0);
-        if (!locked) {
-            if (body.P.size() >= 80 && live->mode == FOX_MODE_SCAN) live->lost++;
-            st.tracking = body.P.size() < 80 ? -1 : 0;
+        float response = 0.f;
+        int trk = track_spin(live, body, response);
+        live->last_track = trk;
+        if (trk < 0) {
+            st.tracking = -1;
+        } else if (trk == 0) {
+            if (live->mode == FOX_MODE_SCAN) live->lost++;
+            st.tracking = 0;
+        } else if (live->mode == FOX_MODE_SCAN) {
+            fuse_shell(live, body);
+            live->fused++;
+            live->tracked_frames++;
+            st.tracking = 1;
         } else {
-            live->pose_R = R;
-            live->pose_t = tr;
-            live->pose_s = scale;
-            if (live->mode == FOX_MODE_SCAN) {
-                fuse_shell(live, body, R, tr, scale);
-                live->fused++;
-                live->tracked_frames++;
-            }
             st.tracking = 1;
         }
     } else {
