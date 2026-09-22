@@ -2,6 +2,10 @@
 
 Versions follow [semantic versioning](https://semver.org). The number in the window title, `fox3d --version`, and the git tag `vX.Y.Z` are the same version. Nothing before 0.5.0 was tagged.
 
+## 0.6.3
+
+- Measured no longer trails copies of the surface behind the object. A frame is added only when it sits on the model already scanned. Points a few millimetres off update that surface instead of starting a second skin.
+
 ## 0.6.2
 
 - Measured builds a model. Each new view is aligned to the surface already scanned and the new part is added. A view that does not fit is dropped. The 3D view shows that model.

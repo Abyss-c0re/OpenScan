@@ -2103,21 +2103,20 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
         L->span_y1 = -1e9f;
     }
     cv::Vec3f t = L->axis0 - R * axis;
-    float scale = 1.f;
-    if (measured && L->cloud.size() >= 80) {
-        cv::Matx33f keep_R = L->pose_R;
-        cv::Vec3f keep_t = L->pose_t;
-        float keep_s = L->pose_s;
-        L->pose_R = R;
-        L->pose_t = t;
-        L->pose_s = 1.f;
-        if (!track_object(L, body.P, R, t, scale)) {
-            L->pose_R = keep_R;
-            L->pose_t = keep_t;
-            L->pose_s = keep_s;
-            return 0;
+    /* Measured stays on the turn axis. A free alignment walks the shell
+     * sideways and the export becomes a trail of copies. Scale stays 1. */
+    const float scale = 1.f;
+    if (measured && L->cloud.size() >= 80 && !body.P.empty()) {
+        int near = 0, tested = 0;
+        int stride = std::max(1, (int)body.P.size() / 500);
+        for (size_t i = 0; i < body.P.size(); i += (size_t)stride) {
+            tested++;
+            cv::Vec3f w = world_of(body.P[i], R, t, scale);
+            int id = 0;
+            if (!nearest_model(L, w, id)) continue;
+            if (cv::norm(L->cloud[(size_t)id] - w) < 12.f) near++;
         }
-        L->object_yaw = std::atan2(-R(0, 2), R(0, 0));
+        if (tested < 40 || near * 5 < tested) return 0;
     }
     L->pose_R = R;
     L->pose_t = t;
@@ -2142,12 +2141,32 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
         float ln = std::sqrt(n.dot(n));
         return ln > 1e-6f && n[2] / ln <= -0.35f;
     };
+    /* 0 = already on the model, blend into that cell.
+     * 1 = a few millimetres off, ignore it or it becomes a second skin.
+     * 2 = far from the model, this is new surface. */
+    auto classify = [&](const cv::Vec3f &w, uint64_t &k) -> int {
+        if (L->cloud.size() >= 80) {
+            int id = 0;
+            if (nearest_model(L, w, id)) {
+                float d = cv::norm(L->cloud[(size_t)id] - w);
+                if (d < 8.f) {
+                    k = key_of_point(L->cloud[(size_t)id]);
+                    return 0;
+                }
+                if (d < 14.f) return 1;
+            }
+        }
+        k = key_of_point(w);
+        return 2;
+    };
     for (const Tri &src : body.tris) {
         if (!faces_camera(src)) continue;
         cv::Vec3f corners[3] = {src.a, src.b, src.c};
         for (int i = 0; i < 3; i++) {
             cv::Vec3f w = world_of(corners[i], R, t, scale);
-            Acc &a = frame[key_of_point(w)];
+            uint64_t k = 0;
+            if (classify(w, k) == 1) continue;
+            Acc &a = frame[k];
             a.sum += w;
             a.n++;
             L->span_y0 = std::min(L->span_y0, w[1]);
@@ -2196,8 +2215,9 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
         cv::Vec3f w[3];
         for (int i = 0; i < 3; i++) w[i] = world_of(corners[i], R, t, scale);
         cv::Vec3f mid = (w[0] + w[1] + w[2]) * (1.f / 3.f);
-        uint64_t ck = key_of_point(mid);
-        if (L->seen_cells.count(ck)) continue;
+        uint64_t ck = 0;
+        int kind = classify(mid, ck);
+        if (kind != 2 || L->seen_cells.count(ck)) continue;
         fresh.insert(ck);
         fox_live::TriRef ref;
         ref.bin = bin_of(mid[0] - L->axis0[0], mid[2] - L->axis0[2]);
