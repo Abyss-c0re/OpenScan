@@ -28,6 +28,7 @@ typedef struct fox_live_status {
     int mode;           /* FOX_MODE_STOP, SCAN, or PAUSE */
     int points;         /* triangles in the 3D model */
     int scanned_deg;    /* degrees of the object that have a surface */
+    int detail;         /* average observations on the scanned surface */
 } fox_live_status;
 
 fox_live *fox_live_create(const fox_calib *calib, const fox_scan_opts *opt);
