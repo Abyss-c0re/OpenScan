@@ -546,6 +546,8 @@ void fox_live_reset(fox_live *live) {
     live->last_track = -1;
     live->have_axis = 0;
     live->scanned_bins = 0;
+    live->mode = FOX_MODE_STOP;
+    snprintf(live->line1, sizeof live->line1, "STOPPED   scanned 0°   not scanned 360°   0 tris");
 }
 
 void fox_live_set_mode(fox_live *live, int mode) {

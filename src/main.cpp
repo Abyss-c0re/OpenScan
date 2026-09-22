@@ -26,8 +26,9 @@ static void usage(const char *argv0) {
             "\n"
             "  %s\n"
             "      Open the app. The cameras and 3D view come up idle.\n"
-            "      Start scan when the object is in view. Export STL when\n"
-            "      the model is ready. Closing the window quits.\n"
+            "      Start scan when the object is in view. Reset clears it so\n"
+            "      the next Start is a new scan. Export STL when ready.\n"
+            "      Closing the window quits.\n"
             "\n"
             "Usage:\n"
             "  %s\n"
@@ -442,7 +443,7 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
             key &= 0xff;
             if (key == 'r' || key == 'R') {
                 fox_live_reset(live);
-                printf("\nmodel cleared\n");
+                printf("\nscan cleared — press Start for a new one\n");
             } else if (key == '[') {
                 exp_a = std::max(1, exp_a - std::max(1, exp_a / 6));
                 fox_cam_set_exposure(a, exp_a, gain_a);

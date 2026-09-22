@@ -115,6 +115,7 @@ public:
         start = new QPushButton("Start scan");
         pause = new QPushButton("Pause");
         stop = new QPushButton("Stop");
+        reset = new QPushButton("Reset");
         exp = new QPushButton("Export STL…");
         start->setObjectName("start");
         exp->setObjectName("export");
@@ -125,6 +126,7 @@ public:
         tools->addWidget(start);
         tools->addWidget(pause);
         tools->addWidget(stop);
+        tools->addWidget(reset);
         tools->addStretch(1);
         tools->addWidget(exp);
 
@@ -153,6 +155,12 @@ public:
         });
         connect(stop, &QPushButton::clicked, this, [this] {
             fox_live_set_mode(live, FOX_MODE_STOP);
+            refresh_buttons();
+        });
+        connect(reset, &QPushButton::clicked, this, [this] {
+            fox_live_reset(live);
+            fox_live_set_mode(live, FOX_MODE_STOP);
+            statusBar()->showMessage(serial + "   ready   scan cleared");
             refresh_buttons();
         });
         connect(exp, &QPushButton::clicked, this, [this] { export_stl(); });
@@ -184,6 +192,7 @@ private:
         start->setEnabled(mode != FOX_MODE_SCAN);
         pause->setEnabled(mode == FOX_MODE_SCAN);
         stop->setEnabled(mode != FOX_MODE_STOP);
+        reset->setEnabled(mode != FOX_MODE_STOP || fox_live_points(live) > 0);
     }
 
     void export_stl() {
@@ -247,6 +256,7 @@ private:
     QPushButton *start = nullptr;
     QPushButton *pause = nullptr;
     QPushButton *stop = nullptr;
+    QPushButton *reset = nullptr;
     QPushButton *exp = nullptr;
     QTimer *timer = nullptr;
     bool busy = false;
