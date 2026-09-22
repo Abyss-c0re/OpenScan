@@ -228,11 +228,11 @@ private:
                 const char *mode = st.mode == FOX_MODE_SCAN ? "scanning" :
                                    st.mode == FOX_MODE_PAUSE ? "paused" : "ready";
                 statusBar()->showMessage(
-                    QString("%1   %2   %3 points   depth %4   z %5 mm")
+                    QString("%1   %2   scanned %3°   not scanned %4°   %5 tris")
                         .arg(serial, mode)
-                        .arg(st.points)
-                        .arg(st.valid_pixels)
-                        .arg(st.median_mm, 0, 'f', 0));
+                        .arg(st.scanned_deg)
+                        .arg(360 - st.scanned_deg)
+                        .arg(st.points));
                 refresh_buttons();
             }
         }

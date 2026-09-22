@@ -464,6 +464,22 @@ struct fox_live {
     size_t shell_mark = 0;
     cv::Matx33f shell_R = cv::Matx33f::eye();
     int shell_set = 0;
+    struct Wedge {
+        std::vector<Tri> tris;
+        float quality = 10.f;
+        int filled = 0;
+    };
+    std::vector<Wedge> wedge;
+    float object_yaw = 0.f;
+    cv::Mat track_ref;
+    int track_have = 0;
+    int track_side = 0;
+    int last_track = -1;
+    cv::Vec3f axis0 = cv::Vec3f(0, 0, 0);
+    int have_axis = 0;
+    float radius_mm = 27.f;
+    float span_y0 = 0.f, span_y1 = 0.f;
+    int scanned_bins = 0;
     float yaw = 0.70f;
     float pitch = -0.24f;
     float dist = 160.f;
@@ -491,6 +507,7 @@ fox_live *fox_live_create(const fox_calib *calib, const fox_scan_opts *opt) {
     L->size = cv::Size(sw, sh);
     L->geom = build_geom(&L->calib, L->opt, L->size);
     snprintf(L->line1, sizeof L->line1, "stopped");
+    L->wedge.resize(72);
     snprintf(L->line2, sizeof L->line2, "Start begins the model. Drag it to orbit. Close stays closed.");
     /* The AMD OpenCL path in KinFu fails to build its raycast kernel. */
     cv::ocl::setUseOpenCL(false);
@@ -521,6 +538,14 @@ void fox_live_reset(fox_live *live) {
     live->shell_mark = 0;
     live->shell_R = cv::Matx33f::eye();
     live->shell_set = 0;
+    live->wedge.assign(72, fox_live::Wedge{});
+    live->object_yaw = 0.f;
+    live->track_ref.release();
+    live->track_have = 0;
+    live->track_side = 0;
+    live->last_track = -1;
+    live->have_axis = 0;
+    live->scanned_bins = 0;
 }
 
 void fox_live_set_mode(fox_live *live, int mode) {
@@ -530,7 +555,13 @@ void fox_live_set_mode(fox_live *live, int mode) {
 }
 
 int fox_live_mode(const fox_live *live) { return live ? live->mode : FOX_MODE_STOP; }
-int fox_live_points(const fox_live *live) { return live ? (int)live->cloud.size() : 0; }
+int fox_live_points(const fox_live *live) {
+    if (!live) return 0;
+    int n = 0;
+    for (const auto &w : live->wedge) n += (int)w.tris.size();
+    if (n > 0) return n;
+    return (int)live->cloud.size();
+}
 int fox_live_take_save(fox_live *live) {
     if (!live || !live->save_req) return 0;
     live->save_req = 0;
@@ -1071,6 +1102,10 @@ struct BodyView {
     cv::Mat side;
     std::vector<cv::Vec3f> P, N;
     std::vector<Tri> tris;
+    cv::Mat gray;
+    cv::Point2f center;
+    cv::Vec3f axis;
+    float radius_px = 0;
     float median_mm = 0;
 };
 
@@ -1291,7 +1326,8 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
 }
 
 static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, float cy,
-                          float yaw_deg, float pitch_deg, float &dist, int user_zoom) {
+                          float yaw_deg, float pitch_deg, float &dist, int user_zoom,
+                          int shade_live) {
     BodyView body;
     if (sensor.empty() || fx < 50.f) return body;
     cv::Mat gray;
@@ -1306,6 +1342,24 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
     fill_edge_gaps(right, std::max(24, (int)std::lround(80.f * rel)));
     gaussian_valid(left, std::max(10.f, 46.f * rel));
     gaussian_valid(right, std::max(10.f, 46.f * rel));
+
+    body.gray = gray;
+    const float z0 = 220.f;
+    int nrow = 0;
+    double sx = 0, sy = 0, sr = 0;
+    for (int y = 0; y < gray.rows; y++) {
+        if (left[y] < 0.f || right[y] < 0.f) continue;
+        sx += 0.5 * (left[y] + right[y]);
+        sy += y;
+        sr += 0.5 * (right[y] - left[y]);
+        nrow++;
+    }
+    if (nrow > 0) {
+        body.center = cv::Point2f((float)(sx / nrow), (float)(sy / nrow));
+        body.radius_px = (float)(sr / nrow);
+        body.axis = cv::Vec3f((body.center.x - cxr) * z0 / fx,
+                              -((body.center.y - cyr) * z0 / fy), z0);
+    }
 
     cv::cvtColor(gray, body.camera, cv::COLOR_GRAY2BGR);
     for (int y = 0; y < gray.rows; y++) {
@@ -1325,7 +1379,6 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
     int gh = (gray.rows + ystep - 1) / ystep;
     int gw = std::max(64, gray.cols / 13);
     std::vector<ShadeVert> grid((size_t)gw * gh);
-    const float z0 = 220.f;
     const float th_max = 1.15f;
     const float sin_max = std::sin(th_max);
     for (int iy = 0; iy < gh; iy++) {
@@ -1380,11 +1433,18 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
         if (grid[i].ok) grid[i].bump = sm[i];
 
     const float bump_mm = 1.8f;
-    body.solid.create(gray.rows, gray.cols, CV_8UC3);
-    body.side.create(gray.rows, gray.cols, CV_8UC3);
-    render_body(grid, gw, gh, body.solid, yaw_deg, pitch_deg, bump_mm, &dist, user_zoom);
-    float ignored = 0;
-    render_body(grid, gw, gh, body.side, 78.f, -8.f, bump_mm, &ignored, 0);
+    if (shade_live) {
+        body.solid.create(gray.rows, gray.cols, CV_8UC3);
+        body.side.create(gray.rows, gray.cols, CV_8UC3);
+        render_body(grid, gw, gh, body.solid, yaw_deg, pitch_deg, bump_mm, &dist, user_zoom);
+        float ignored = 0;
+        render_body(grid, gw, gh, body.side, 78.f, -8.f, bump_mm, &ignored, 0);
+    } else {
+        (void)yaw_deg;
+        (void)pitch_deg;
+        (void)dist;
+        (void)user_zoom;
+    }
 
     std::vector<float> zs;
     zs.reserve(grid.size() / 2);
@@ -1438,6 +1498,287 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
     return body;
 }
 
+static const int kBins = 72;
+
+static cv::Matx33f rot_y(float a) {
+    float c = std::cos(a), s = std::sin(a);
+    return cv::Matx33f(c, 0.f, s, 0.f, 1.f, 0.f, -s, 0.f, c);
+}
+
+/* 0 is the side that faced the camera on the first frame. */
+static int bin_of(float x, float z) {
+    float a = std::atan2(x, -z);
+    float u = (a + 3.14159265f) / (6.2831853f);
+    int b = (int)std::floor(u * kBins);
+    if (b < 0) b = 0;
+    if (b >= kBins) b = kBins - 1;
+    return b;
+}
+
+static float bin_angle(int b) {
+    return -3.14159265f + (b + 0.5f) * (6.2831853f / kBins);
+}
+
+/* Crop centred on the object, high-pass so the turn is the facet texture
+ * and not the outline. phaseCorrelate(prev, curr) shift.x is positive when
+ * that texture moves right. */
+static cv::Mat front_crop(const BodyView &body, int &side_out) {
+    /* Centre of the body only. The outline does not move when the object
+     * turns, and it would pin the measured shift at zero. */
+    int side = (int)std::lround(body.radius_px * 0.90f);
+    if (side < 96) side = 96;
+    if (side % 2) side++;
+    side_out = side;
+    int half = side / 2;
+    int x0 = (int)std::lround(body.center.x) - half;
+    int y0 = (int)std::lround(body.center.y) - half;
+    cv::Mat crop(side, side, CV_8U, cv::Scalar(0));
+    int src_x = std::max(0, x0);
+    int src_y = std::max(0, y0);
+    int dst_x = src_x - x0;
+    int dst_y = src_y - y0;
+    int w = std::min(body.gray.cols - src_x, side - dst_x);
+    int h = std::min(body.gray.rows - src_y, side - dst_y);
+    if (w < 24 || h < 24) return cv::Mat();
+    body.gray(cv::Rect(src_x, src_y, w, h)).copyTo(crop(cv::Rect(dst_x, dst_y, w, h)));
+    cv::Mat small, f, blur;
+    cv::resize(crop, small, cv::Size(192, 192), 0, 0, cv::INTER_AREA);
+    small.convertTo(f, CV_32F, 1.0 / 255.0);
+    cv::GaussianBlur(f, blur, cv::Size(0, 0), 5.0);
+    f -= blur;
+    return f;
+}
+
+/* 1 = turn applied, 0 = lost (yaw and the reference stay put), -1 = no object. */
+static int track_spin(fox_live *L, const BodyView &body, float &response) {
+    response = 0.f;
+    if (body.gray.empty() || body.radius_px < 30.f || body.P.size() < 80) return -1;
+    int side = 0;
+    cv::Mat f = front_crop(body, side);
+    if (f.empty()) return -1;
+    if (!L->track_have || L->track_ref.size() != f.size()) {
+        L->track_ref = f;
+        L->track_side = side;
+        L->track_have = 1;
+        response = 1.f;
+        return 1;
+    }
+    if (std::abs(side - L->track_side) > side / 8) {
+        L->track_ref = f;
+        L->track_side = side;
+        return 0;
+    }
+    cv::Mat window;
+    cv::createHanningWindow(window, f.size(), CV_32F);
+    double resp = 0;
+    cv::Point2d shift = cv::phaseCorrelate(L->track_ref, f, window, &resp);
+    response = (float)resp;
+    float radius_s = body.radius_px * ((float)f.cols / (float)side);
+    if (radius_s < 8.f) radius_s = 8.f;
+    float dtheta = -(float)shift.x / radius_s;
+    const float kMax = 18.f * 3.14159265f / 180.f;
+    if (resp < 0.045f || !std::isfinite(dtheta) || std::fabs(dtheta) > kMax ||
+        std::fabs(shift.y) > f.rows * 0.18f)
+        return 0;
+    L->object_yaw += dtheta;
+    L->track_ref = f;
+    L->track_side = side;
+    return 1;
+}
+
+static void fuse_shell(fox_live *L, const BodyView &body, float fx) {
+    if (L->wedge.size() != (size_t)kBins) L->wedge.assign(kBins, fox_live::Wedge{});
+    if (!L->have_axis) {
+        L->axis0 = body.axis;
+        L->have_axis = 1;
+        L->radius_mm = std::max(8.f, body.radius_px * body.axis[2] / std::max(fx, 1.f));
+        L->span_y0 = 1e9f;
+        L->span_y1 = -1e9f;
+    }
+    cv::Matx33f R = rot_y(-L->object_yaw);
+    const float kGraz = 58.f * 3.14159265f / 180.f;
+    std::vector<std::vector<Tri>> add((size_t)kBins);
+    std::vector<float> q((size_t)kBins, 10.f);
+    for (const Tri &src : body.tris) {
+        cv::Vec3f v[3] = {src.a, src.b, src.c};
+        cv::Vec3f midc = (v[0] + v[1] + v[2]) * (1.f / 3.f);
+        cv::Vec3f relc = midc - body.axis;
+        float cam_ang = std::atan2(relc[0], -relc[2]);
+        if (std::fabs(cam_ang) > kGraz) continue;
+        cv::Vec3f w[3];
+        for (int i = 0; i < 3; i++) w[i] = R * (v[i] - body.axis) + L->axis0;
+        cv::Vec3f mid = (w[0] + w[1] + w[2]) * (1.f / 3.f);
+        cv::Vec3f rel = mid - L->axis0;
+        int b = bin_of(rel[0], rel[2]);
+        float qq = std::fabs(cam_ang);
+        add[(size_t)b].push_back(Tri{w[0], w[1], w[2]});
+        q[(size_t)b] = std::min(q[(size_t)b], qq);
+        for (int i = 0; i < 3; i++) {
+            L->span_y0 = std::min(L->span_y0, w[i][1]);
+            L->span_y1 = std::max(L->span_y1, w[i][1]);
+        }
+    }
+    for (int b = 0; b < kBins; b++) {
+        if (add[(size_t)b].size() < 8) continue;
+        fox_live::Wedge &dst = L->wedge[(size_t)b];
+        bool better = !dst.filled || q[(size_t)b] + 0.05f < dst.quality;
+        bool refresh = dst.filled && q[(size_t)b] < 0.40f && dst.quality < 0.55f;
+        if (better || refresh) {
+            dst.tris.swap(add[(size_t)b]);
+            dst.quality = q[(size_t)b];
+            dst.filled = 1;
+        }
+    }
+    int n = 0;
+    for (const auto &w : L->wedge)
+        if (w.filled) n++;
+    L->scanned_bins = n;
+}
+
+static int model_tris(const fox_live *L) {
+    int n = 0;
+    for (const auto &w : L->wedge) n += (int)w.tris.size();
+    return n;
+}
+
+static void draw_coverage_ring(cv::Mat &img, const fox_live *L) {
+    int r = std::max(28, std::min(img.cols, img.rows) / 10);
+    cv::Point c(img.cols - r - 16, img.rows - r - 18);
+    cv::circle(img, c, r, cv::Scalar(28, 28, 32), -1, cv::LINE_AA);
+    cv::circle(img, c, r, cv::Scalar(70, 70, 78), 2, cv::LINE_AA);
+    for (int b = 0; b < kBins; b++) {
+        if (b >= (int)L->wedge.size() || !L->wedge[(size_t)b].filled) continue;
+        float a0 = bin_angle(b) - 0.5f * (6.2831853f / kBins);
+        float a1 = a0 + (6.2831853f / kBins);
+        /* 0° (first side) at the top of the dial. OpenCV angles grow clockwise. */
+        float d0 = 90.f - a0 * 180.f / 3.14159265f;
+        float d1 = 90.f - a1 * 180.f / 3.14159265f;
+        cv::ellipse(img, c, cv::Size(r - 6, r - 6), 0, d1, d0, cv::Scalar(70, 200, 110), 8, cv::LINE_AA);
+    }
+    int deg = (int)std::lround(L->scanned_bins * (360.0 / kBins));
+    char t[32];
+    snprintf(t, sizeof t, "%d°", deg);
+    cv::putText(img, t, cv::Point(c.x - 16, c.y + 5), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                cv::Scalar(240, 240, 240), 1, cv::LINE_AA);
+}
+
+static void render_model(fox_live *L, cv::Mat &out) {
+    out.setTo(cv::Scalar(12, 14, 18));
+    cv::Vec3f c = L->axis0;
+    c[1] = 0.5f * (L->span_y0 + L->span_y1);
+    float height = std::max(10.f, L->span_y1 - L->span_y0);
+    float extent = std::max(height, L->radius_mm * 2.2f);
+    int w = out.cols, h = out.rows;
+    float dist = L->user_zoom && L->dist > 1.f ? L->dist : std::max(extent * 1.65f, 40.f);
+    if (!L->user_zoom) L->dist = dist;
+    float yaw = L->yaw;
+    float pitch = L->pitch;
+    /* The real camera looks toward +Z, so the scanned face points back at
+     * the origin. Sit the view on that side of the object. */
+    cv::Vec3f eye = c + cv::Vec3f(std::sin(yaw) * std::cos(pitch), std::sin(pitch),
+                                  -std::cos(yaw) * std::cos(pitch)) *
+                            dist;
+    cv::Vec3f forward = c - eye;
+    float fl = std::sqrt(forward.dot(forward));
+    if (fl < 1e-4f) return;
+    forward /= fl;
+    cv::Vec3f world_up(0, 1, 0);
+    cv::Vec3f right = forward.cross(world_up);
+    float rl = std::sqrt(right.dot(right));
+    if (rl < 1e-4f) right = cv::Vec3f(1, 0, 0);
+    else right /= rl;
+    cv::Vec3f cam_up = right.cross(forward);
+    float focal = std::min(h * 1.35f, h * 1.05f * (extent / std::max(height, 1.f)));
+    std::vector<float> zbuf((size_t)w * h, 1e9f);
+
+    auto project = [&](const cv::Vec3f &p, float &sx, float &sy, float &zc) {
+        cv::Vec3f d = p - eye;
+        zc = d.dot(forward);
+        sx = w * 0.50f + focal * d.dot(right) / std::max(zc, 1.f);
+        sy = h * 0.48f - focal * d.dot(cam_up) / std::max(zc, 1.f);
+    };
+    auto paint_tri = [&](const cv::Vec3f &a, const cv::Vec3f &b, const cv::Vec3f &c0, cv::Vec3b col) {
+        float ax, ay, az, bx, by, bz, cx, cy, cz;
+        project(a, ax, ay, az);
+        project(b, bx, by, bz);
+        project(c0, cx, cy, cz);
+        int minx = std::max(0, (int)std::floor(std::min(ax, std::min(bx, cx))));
+        int maxx = std::min(w - 1, (int)std::ceil(std::max(ax, std::max(bx, cx))));
+        int miny = std::max(0, (int)std::floor(std::min(ay, std::min(by, cy))));
+        int maxy = std::min(h - 1, (int)std::ceil(std::max(ay, std::max(by, cy))));
+        float area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if (std::fabs(area) < 0.3f) return;
+        for (int py = miny; py <= maxy; py++) {
+            for (int px = minx; px <= maxx; px++) {
+                float w0 = (bx - px) * (cy - py) - (by - py) * (cx - px);
+                float w1 = (cx - px) * (ay - py) - (cy - py) * (ax - px);
+                float w2 = (ax - px) * (by - py) - (ay - py) * (bx - px);
+                if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0))) continue;
+                float zc = (w0 * az + w1 * bz + w2 * cz) / area;
+                float &slot = zbuf[(size_t)py * w + px];
+                if (zc < slot) {
+                    slot = zc;
+                    out.at<cv::Vec3b>(py, px) = col;
+                }
+            }
+        }
+    };
+
+    /* Unscanned sides stay a smooth dark shell, inside the real surface. */
+    if (L->have_axis && L->radius_mm > 1.f && L->span_y1 > L->span_y0) {
+        const int ys = 18;
+        float R = L->radius_mm * 0.97f;
+        float y0 = L->span_y0, y1 = L->span_y1;
+        for (int b = 0; b < kBins; b++) {
+            if (b < (int)L->wedge.size() && L->wedge[(size_t)b].filled) continue;
+            float a0 = bin_angle(b) - 0.5f * (6.2831853f / kBins);
+            float a1 = a0 + (6.2831853f / kBins);
+            float amid = 0.5f * (a0 + a1);
+            cv::Vec3f nrm(std::sin(amid), 0.f, -std::cos(amid));
+            cv::Vec3f pref(L->axis0[0] + R * nrm[0], c[1], L->axis0[2] + R * nrm[2]);
+            cv::Vec3f light = eye - pref;
+            float ll = std::sqrt(light.dot(light)) + 1e-6f;
+            float lam = nrm.dot(light) / ll;
+            lam = std::max(0.12f, lam * 0.5f + 0.5f);
+            int g = (int)(70.f * lam);
+            cv::Vec3b ghost((uint8_t)g, (uint8_t)g, (uint8_t)(g + 4));
+            for (int i = 0; i < ys; i++) {
+                float ya = y0 + (y1 - y0) * (i / (float)ys);
+                float yb = y0 + (y1 - y0) * ((i + 1) / (float)ys);
+                cv::Vec3f p00(L->axis0[0] + R * std::sin(a0), ya, L->axis0[2] - R * std::cos(a0));
+                cv::Vec3f p10(L->axis0[0] + R * std::sin(a1), ya, L->axis0[2] - R * std::cos(a1));
+                cv::Vec3f p01(L->axis0[0] + R * std::sin(a0), yb, L->axis0[2] - R * std::cos(a0));
+                cv::Vec3f p11(L->axis0[0] + R * std::sin(a1), yb, L->axis0[2] - R * std::cos(a1));
+                paint_tri(p00, p10, p01, ghost);
+                paint_tri(p10, p11, p01, ghost);
+            }
+        }
+    }
+
+    for (const auto &wedge : L->wedge) {
+        if (!wedge.filled) continue;
+        for (const Tri &t : wedge.tris) {
+            cv::Vec3f n = (t.b - t.a).cross(t.c - t.a);
+            float ln = std::sqrt(n.dot(n));
+            if (ln < 1e-6f) continue;
+            n /= ln;
+            cv::Vec3f light = eye - t.a;
+            float ll = std::sqrt(light.dot(light)) + 1e-6f;
+            float lam = n.dot(light) / ll;
+            lam = lam * 0.55f + 0.45f;
+            if (lam < 0.18f) lam = 0.18f;
+            int g = (int)std::min(255.f, 255.f * lam);
+            paint_tri(t.a, t.b, t.c, cv::Vec3b((uint8_t)(g * 0.78f), (uint8_t)(g * 0.84f),
+                                               (uint8_t)std::min(255, g + 8)));
+        }
+    }
+    draw_coverage_ring(out, L);
+    if (L->mode == FOX_MODE_SCAN && L->last_track == 0) {
+        cv::putText(out, "tracking lost  —  slow the turn", cv::Point(16, out.rows - 18),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(40, 40, 220), 2, cv::LINE_AA);
+    }
+}
+
 static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_b,
                           const BodyView &body) {
     const int hero_w = L->size.width * 2;
@@ -1447,13 +1788,25 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     cv::Size side(side_w, side_h);
 
     cv::Mat hero(hero_h, hero_w, CV_8UC3, cv::Scalar(12, 12, 12));
-    if (!body.camera.empty() && !body.solid.empty()) {
+    cv::Mat solid = body.solid;
+    cv::Mat model;
+    if (L->scanned_bins > 0) {
+        model.create(hero_h, hero_w / 2, CV_8UC3);
+        render_model(L, model);
+        solid = model;
+    }
+    if (!body.camera.empty() && !solid.empty()) {
         cv::Mat left, right;
         cv::resize(body.camera, left, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_AREA);
-        cv::resize(body.solid, right, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_AREA);
+        if (solid.size() == cv::Size(hero_w / 2, hero_h)) right = solid;
+        else cv::resize(solid, right, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_AREA);
         label_panel(left, "camera");
+        int deg = (int)std::lround(L->scanned_bins * (360.0 / kBins));
         char cap[96];
-        snprintf(cap, sizeof cap, "3D   %d/6 sides", coverage_count(L->covered));
+        if (L->scanned_bins > 0)
+            snprintf(cap, sizeof cap, "3D   scanned %d°   open %d°", deg, 360 - deg);
+        else
+            snprintf(cap, sizeof cap, "3D");
         label_panel(right, cap);
         left.copyTo(hero(cv::Rect(0, 0, hero_w / 2, hero_h)));
         right.copyTo(hero(cv::Rect(hero_w / 2, 0, hero_w / 2, hero_h)));
@@ -1470,9 +1823,19 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     cv::Mat b = to_bgr(show_b, side);
     cv::Mat d = body.side.empty() ? cv::Mat(side, CV_8UC3, cv::Scalar(12, 14, 18))
                                   : to_bgr(body.side, side);
+    if (body.side.empty() && L->scanned_bins > 0) {
+        int deg = (int)std::lround(L->scanned_bins * (360.0 / kBins));
+        char line[64];
+        snprintf(line, sizeof line, "%d° scanned", deg);
+        cv::putText(d, line, cv::Point(12, d.rows / 2 - 8), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(90, 210, 120), 1, cv::LINE_AA);
+        snprintf(line, sizeof line, "%d° not yet", 360 - deg);
+        cv::putText(d, line, cv::Point(12, d.rows / 2 + 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(160, 160, 170), 1, cv::LINE_AA);
+    }
     label_panel(a, "camera A");
     label_panel(b, "camera B");
-    label_panel(d, "side");
+    label_panel(d, body.side.empty() ? "coverage" : "side");
 
     const int bar = 28;
     L->preview.create(bar + hero_h, hero_w + side_w, CV_8UC3);
@@ -1561,8 +1924,9 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     const fox_pinhole &cam = live->calib.cam[1];
     float yaw_deg = live->yaw * (180.f / 3.14159265f);
     float pitch_deg = live->pitch * (180.f / 3.14159265f);
+    int shade_live = live->mode == FOX_MODE_STOP && live->scanned_bins == 0;
     BodyView body = make_body(B, (float)cam.fx, (float)cam.fy, (float)cam.cx, (float)cam.cy,
-                              yaw_deg, pitch_deg, live->dist, live->user_zoom);
+                              yaw_deg, pitch_deg, live->dist, live->user_zoom, shade_live);
     live->locked = 1;
 
     auto t1 = std::chrono::steady_clock::now();
@@ -1570,63 +1934,39 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     st.valid_pixels = (int)body.P.size();
     st.median_mm = body.median_mm;
 
-    if (live->mode == FOX_MODE_SCAN) {
-        cv::Matx33f R;
-        cv::Vec3f t;
-        if (body.P.size() >= 80 && track_object(live, body.P, R, t)) {
-            std::vector<cv::Vec3f> Pm, Nm;
-            Pm.reserve(body.P.size());
-            Nm.reserve(body.N.size());
-            for (size_t i = 0; i < body.P.size(); i++) {
-                Pm.push_back(R * body.P[i] + t);
-                Nm.push_back(R * body.N[i]);
-            }
-            live->pose_R = R;
-            live->pose_t = t;
-            absorb_points(live, Pm, Nm);
-            note_coverage(live, body.N);
-            /* Keep the high-resolution surface. A still object refreshes in
-             * place. A real turn adds another side instead of smearing. */
-            float ang = 0.f;
-            if (live->shell_set) {
-                cv::Matx33f dR = R * live->shell_R.t();
-                float tr = dR(0, 0) + dR(1, 1) + dR(2, 2);
-                float cs = (tr - 1.f) * 0.5f;
-                if (cs > 1.f) cs = 1.f;
-                if (cs < -1.f) cs = -1.f;
-                ang = std::acos(cs);
-            }
-            if (!live->shell_set || ang < 0.22f)
-                live->shell.resize(live->shell_mark);
-            else
-                live->shell_mark = live->shell.size();
-            if (live->shell.size() < 200000) {
-                for (const Tri &src : body.tris) {
-                    live->shell.push_back(Tri{R * src.a + t, R * src.b + t, R * src.c + t});
-                }
-            }
-            live->shell_R = R;
-            live->shell_set = 1;
+    if (live->mode == FOX_MODE_SCAN || live->mode == FOX_MODE_PAUSE) {
+        float response = 0.f;
+        int trk = track_spin(live, body, response);
+        live->last_track = trk;
+        if (trk < 0) {
+            st.tracking = -1;
+        } else if (trk == 0) {
+            if (live->mode == FOX_MODE_SCAN) live->lost++;
+            st.tracking = 0;
+        } else if (live->mode == FOX_MODE_SCAN) {
+            fuse_shell(live, body, (float)cam.fx);
             live->fused++;
             live->tracked_frames++;
             st.tracking = 1;
-        } else if (body.P.size() < 80) {
-            st.tracking = -1;
         } else {
-            live->lost++;
-            st.tracking = 0;
+            st.tracking = 1;
         }
+    } else {
+        live->last_track = -1;
+        st.tracking = body.P.size() >= 80 ? 1 : -1;
     }
 
     st.fused = live->fused;
     st.lost = live->lost;
     st.mode = live->mode;
-    st.points = (int)live->cloud.size();
+    st.points = model_tris(live);
+    st.scanned_deg = (int)std::lround(live->scanned_bins * (360.0 / kBins));
     const char *mode_name = live->mode == FOX_MODE_SCAN ? "SCANNING" :
                             live->mode == FOX_MODE_PAUSE ? "PAUSED" : "STOPPED";
+    const char *lost = (live->mode == FOX_MODE_SCAN && st.tracking == 0) ? "   TRACKING LOST" : "";
     snprintf(live->line1, sizeof live->line1,
-             "%s   model %d pts   scanned %d/6 sides   z %.0f mm",
-             mode_name, st.points, coverage_count(live->covered), st.median_mm);
+             "%s   scanned %d°   not scanned %d°   %d tris%s",
+             mode_name, st.scanned_deg, 360 - st.scanned_deg, st.points, lost);
     paint_preview(live, As, Bs, body);
     if (status) *status = st;
     return 0;
@@ -1641,7 +1981,14 @@ const uint8_t *fox_live_preview_bgr(const fox_live *live, int *width, int *heigh
 
 int fox_live_write(fox_live *live, const char *stl_path, int *triangles_out) {
     std::vector<Tri> tris;
-    if (live && live->shell.size() >= 80) {
+    if (live) {
+        for (const auto &w : live->wedge)
+            tris.insert(tris.end(), w.tris.begin(), w.tris.end());
+    }
+    if (tris.size() >= 80) {
+        fprintf(stderr, "writing %zu scanned triangles, %d° covered\n", tris.size(),
+                live->scanned_bins * 5);
+    } else if (live && live->shell.size() >= 80) {
         fprintf(stderr, "writing %zu shell triangles\n", live->shell.size());
         tris = live->shell;
     } else if (live && live->cloud.size() >= 80) {

@@ -8,8 +8,9 @@
 extern "C" {
 #endif
 
-/* Live orbit scan. The scanner stays put and the object turns. Each stereo
- * frame is fused into one model; the mesh is what has been seen so far. */
+/* Live orbit scan. The scanner stays put and the object turns. Texture on
+ * the object is the turn signal. The mesh is only the sides that have been
+ * seen; the rest stays an unscanned shell. */
 
 typedef struct fox_live fox_live;
 
@@ -25,7 +26,8 @@ typedef struct fox_live_status {
     int tracking;       /* 1 fused, 0 lost, -1 waiting for a surface */
     double match_ms;
     int mode;           /* FOX_MODE_STOP, SCAN, or PAUSE */
-    int points;         /* points in the 3D model */
+    int points;         /* triangles in the 3D model */
+    int scanned_deg;    /* degrees of the object that have a surface */
 } fox_live_status;
 
 fox_live *fox_live_create(const fox_calib *calib, const fox_scan_opts *opt);

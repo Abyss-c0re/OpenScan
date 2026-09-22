@@ -404,8 +404,8 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
         pushed++;
         const char *mode_name = st.mode == FOX_MODE_SCAN ? "scanning" :
                                 st.mode == FOX_MODE_PAUSE ? "paused" : "stopped";
-        printf("\r%-8s  model %5d  depth %6d px  z %5.0f mm  %4.0f ms   ",
-               mode_name, st.points, st.valid_pixels, st.median_mm, st.match_ms);
+        printf("\r%-8s  scanned %3d°  open %3d°  tris %6d  z %5.0f mm  %4.0f ms   ",
+               mode_name, st.scanned_deg, 360 - st.scanned_deg, st.points, st.median_mm, st.match_ms);
         fflush(stdout);
         if (fox_live_take_save(live)) {
             int tris = 0;
