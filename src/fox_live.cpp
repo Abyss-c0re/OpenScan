@@ -455,10 +455,15 @@ struct fox_live {
     char line2[160];
     std::vector<cv::Vec3f> cloud, cloud_n;
     std::unordered_map<uint64_t, uint32_t> vox;
+    cv::Matx33f pose_R = cv::Matx33f::eye();
+    cv::Vec3f pose_t = cv::Vec3f(0, 0, 0);
+    int covered = 0;
+    int tracked_frames = 0;
     float yaw = 0.9f;
     float pitch = -0.35f;
     float dist = 420.f;
     int spin = 1;
+    int user_zoom = 0;
     int dragging = 0;
     int drag_x = 0;
     int drag_y = 0;
@@ -503,6 +508,10 @@ void fox_live_reset(fox_live *live) {
     live->cloud.clear();
     live->cloud_n.clear();
     live->vox.clear();
+    live->pose_R = cv::Matx33f::eye();
+    live->pose_t = cv::Vec3f(0, 0, 0);
+    live->covered = 0;
+    live->tracked_frames = 0;
 }
 
 void fox_live_set_mode(fox_live *live, int mode) {
@@ -559,8 +568,9 @@ void fox_live_mouse(fox_live *live, int event, int x, int y, int flags) {
         live->dragging = 0;
     } else if (event == cv::EVENT_MOUSEWHEEL) {
         int delta = cv::getMouseWheelDelta(flags);
+        live->user_zoom = 1;
         live->dist *= delta > 0 ? 0.9f : 1.1f;
-        if (live->dist < 80.f) live->dist = 80.f;
+        if (live->dist < 30.f) live->dist = 30.f;
         if (live->dist > 2000.f) live->dist = 2000.f;
     }
 }
@@ -614,13 +624,31 @@ static uint64_t voxel_key(int ix, int iy, int iz) {
     return ((uint64_t)bx << 42) | ((uint64_t)by << 21) | bz;
 }
 
-/* Depth is metres, Y down, Z forward. Stored points are millimetres, Y up. */
+static float depth_median_m(const cv::Mat &depth) {
+    std::vector<float> s;
+    s.reserve((size_t)depth.total() / 16);
+    for (int y = 0; y < depth.rows; y += 4) {
+        const float *row = depth.ptr<float>(y);
+        for (int x = 0; x < depth.cols; x += 4) {
+            if (row[x] > 0.f) s.push_back(row[x]);
+        }
+    }
+    if (s.empty()) return 0.f;
+    size_t mid = s.size() / 2;
+    std::nth_element(s.begin(), s.begin() + (ptrdiff_t)mid, s.end());
+    return s[mid];
+}
+
+/* Depth is metres, Y down, Z forward. Stored points are millimetres, Y up.
+ * Only the dominant surface is kept: samples far from the median depth are
+ * the stereo outliers that otherwise draw a streak instead of an object. */
 static void depth_samples(const cv::Mat &depth, float fx, float fy, float cx, float cy,
                           const cv::Affine3f *world_from_cam,
                           std::vector<cv::Vec3f> &P, std::vector<cv::Vec3f> &N) {
     P.clear();
     N.clear();
     if (depth.empty()) return;
+    float med = depth_median_m(depth);
     for (int y = 1; y < depth.rows - 1; y += 2) {
         const float *row = depth.ptr<float>(y);
         const float *dn = depth.ptr<float>(y + 1);
@@ -629,6 +657,8 @@ static void depth_samples(const cv::Mat &depth, float fx, float fy, float cx, fl
             float zx = row[x + 1];
             float zy = dn[x];
             if (z <= 0.f || zx <= 0.f || zy <= 0.f) continue;
+            if (med > 0.f && std::fabs(z - med) > 0.02f) continue;
+            if (std::fabs(zx - z) > 0.008f || std::fabs(zy - z) > 0.008f) continue;
             cv::Point3f pc((x - cx) * z / fx, (y - cy) * z / fy, z);
             cv::Point3f px(((x + 1) - cx) * zx / fx, (y - cy) * zx / fy, zx);
             cv::Point3f py((x - cx) * zy / fx, ((y + 1) - cy) * zy / fy, zy);
@@ -648,6 +678,190 @@ static void depth_samples(const cv::Mat &depth, float fx, float fy, float cx, fl
             N.push_back(n);
         }
     }
+}
+
+struct SurfTri {
+    cv::Vec3f a, b, c, n;
+};
+
+/* One connected surface around the median depth. This is the object. */
+static void object_mask(const cv::Mat &depth, float med, cv::Mat &labels, int &best) {
+    cv::Mat keep(depth.size(), CV_8U, cv::Scalar(0));
+    for (int y = 0; y < depth.rows; y++) {
+        const float *row = depth.ptr<float>(y);
+        uint8_t *k = keep.ptr<uint8_t>(y);
+        for (int x = 0; x < depth.cols; x++) {
+            if (row[x] > 0.f && std::fabs(row[x] - med) <= 0.02f) k[x] = 255;
+        }
+    }
+    cv::Mat stats, centroids;
+    int n = cv::connectedComponentsWithStats(keep, labels, stats, centroids, 8, CV_32S);
+    best = 0;
+    int area = 0;
+    for (int i = 1; i < n; i++) {
+        int a = stats.at<int>(i, cv::CC_STAT_AREA);
+        if (a > area) {
+            area = a;
+            best = i;
+        }
+    }
+}
+
+static cv::Vec3f unproject_mm(int x, int y, float z, float fx, float fy, float cx, float cy) {
+    return cv::Vec3f((x - cx) * z / fx * 1000.f, -((y - cy) * z / fy * 1000.f), z * 1000.f);
+}
+
+static void build_object(const cv::Mat &depth, float fx, float fy, float cx, float cy,
+                         std::vector<cv::Vec3f> &P, std::vector<cv::Vec3f> &N,
+                         std::vector<SurfTri> &tris) {
+    P.clear();
+    N.clear();
+    tris.clear();
+    if (depth.empty()) return;
+    float med = depth_median_m(depth);
+    if (med <= 0.f) return;
+    cv::Mat labels;
+    int best = 0;
+    object_mask(depth, med, labels, best);
+    if (best == 0) return;
+    const int step = 2;
+    cv::Mat used(depth.rows, depth.cols, CV_8U, cv::Scalar(0));
+    auto ok_at = [&](int x, int y, cv::Vec3f &p) -> bool {
+        if (x < 0 || y < 0 || x >= depth.cols || y >= depth.rows) return false;
+        if (labels.at<int>(y, x) != best) return false;
+        float z = depth.at<float>(y, x);
+        if (z <= 0.f || std::fabs(z - med) > 0.02f) return false;
+        p = unproject_mm(x, y, z, fx, fy, cx, cy);
+        return true;
+    };
+    for (int y = 0; y < depth.rows - step; y += step) {
+        for (int x = 0; x < depth.cols - step; x += step) {
+            cv::Vec3f p00, p10, p01, p11;
+            if (!ok_at(x, y, p00) || !ok_at(x + step, y, p10) || !ok_at(x, y + step, p01) ||
+                !ok_at(x + step, y + step, p11))
+                continue;
+            auto edge_ok = [](const cv::Vec3f &a, const cv::Vec3f &b) {
+                return cv::norm(a - b) < 12.f;
+            };
+            if (!edge_ok(p00, p10) || !edge_ok(p00, p01) || !edge_ok(p10, p11) || !edge_ok(p01, p11))
+                continue;
+            cv::Vec3f n = (p10 - p00).cross(p01 - p00);
+            float ln = std::sqrt(n.dot(n));
+            if (ln < 1e-4f) continue;
+            n /= ln;
+            tris.push_back(SurfTri{p00, p10, p01, n});
+            tris.push_back(SurfTri{p10, p11, p01, n});
+            if (!used.at<uint8_t>(y, x)) {
+                used.at<uint8_t>(y, x) = 1;
+                P.push_back(p00);
+                N.push_back(n);
+            }
+        }
+    }
+}
+
+static bool nearest_model(const fox_live *L, const cv::Vec3f &p, int &idx) {
+    const float voxel = 2.5f;
+    int ix = (int)std::floor(p[0] / voxel);
+    int iy = (int)std::floor(p[1] / voxel);
+    int iz = (int)std::floor(p[2] / voxel);
+    float best = 12.f * 12.f;
+    bool found = false;
+    for (int dz = -3; dz <= 3; dz++) {
+        for (int dy = -3; dy <= 3; dy++) {
+            for (int dx = -3; dx <= 3; dx++) {
+                auto it = L->vox.find(voxel_key(ix + dx, iy + dy, iz + dz));
+                if (it == L->vox.end()) continue;
+                cv::Vec3f d = L->cloud[it->second] - p;
+                float dd = d.dot(d);
+                if (dd < best) {
+                    best = dd;
+                    idx = (int)it->second;
+                    found = true;
+                }
+            }
+        }
+    }
+    return found;
+}
+
+/* Sony's scanner keeps a frame only when the new view still matches the
+ * object. Point-to-point alignment against the model is that test. */
+static bool track_object(fox_live *L, const std::vector<cv::Vec3f> &P, cv::Matx33f &R, cv::Vec3f &t) {
+    if (L->cloud.size() < 80) {
+        R = cv::Matx33f::eye();
+        t = cv::Vec3f(0, 0, 0);
+        return P.size() >= 80;
+    }
+    R = L->pose_R;
+    t = L->pose_t;
+    int stride = std::max(1, (int)P.size() / 700);
+    for (int iter = 0; iter < 6; iter++) {
+        std::vector<cv::Vec3f> src, dst;
+        for (size_t i = 0; i < P.size(); i += (size_t)stride) {
+            cv::Vec3f pm = R * P[i] + t;
+            int id = 0;
+            if (!nearest_model(L, pm, id)) continue;
+            src.push_back(P[i]);
+            dst.push_back(L->cloud[(size_t)id]);
+        }
+        if (src.size() < 40) return false;
+        cv::Vec3d cs(0, 0, 0), cd(0, 0, 0);
+        for (size_t i = 0; i < src.size(); i++) {
+            cs += cv::Vec3d(src[i]);
+            cd += cv::Vec3d(dst[i]);
+        }
+        cs *= 1.0 / src.size();
+        cd *= 1.0 / src.size();
+        cv::Mat H = cv::Mat::zeros(3, 3, CV_64F);
+        for (size_t i = 0; i < src.size(); i++) {
+            cv::Vec3d a = cv::Vec3d(src[i]) - cs;
+            cv::Vec3d b = cv::Vec3d(dst[i]) - cd;
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) H.at<double>(r, c) += a[r] * b[c];
+        }
+        cv::SVD svd(H, cv::SVD::FULL_UV);
+        cv::Mat Rm = svd.vt.t() * svd.u.t();
+        if (cv::determinant(Rm) < 0) {
+            cv::Mat vt = svd.vt.clone();
+            vt.row(2) *= -1;
+            Rm = vt.t() * svd.u.t();
+        }
+        R = cv::Matx33f((float)Rm.at<double>(0, 0), (float)Rm.at<double>(0, 1), (float)Rm.at<double>(0, 2),
+                        (float)Rm.at<double>(1, 0), (float)Rm.at<double>(1, 1), (float)Rm.at<double>(1, 2),
+                        (float)Rm.at<double>(2, 0), (float)Rm.at<double>(2, 1), (float)Rm.at<double>(2, 2));
+        cv::Vec3f csf((float)cs[0], (float)cs[1], (float)cs[2]);
+        cv::Vec3f cdf((float)cd[0], (float)cd[1], (float)cd[2]);
+        t = cdf - R * csf;
+    }
+    double res = 0;
+    int n = 0;
+    for (size_t i = 0; i < P.size(); i += (size_t)stride) {
+        cv::Vec3f pm = R * P[i] + t;
+        int id = 0;
+        if (!nearest_model(L, pm, id)) continue;
+        res += cv::norm(pm - L->cloud[(size_t)id]);
+        n++;
+    }
+    return n >= 40 && res / n < 6.0;
+}
+
+static void note_coverage(fox_live *L, const std::vector<cv::Vec3f> &N) {
+    cv::Vec3f s(0, 0, 0);
+    for (const cv::Vec3f &n : N) s += L->pose_R * n;
+    if (s.dot(s) < 1e-6f) return;
+    int axis = 0;
+    float ax = std::fabs(s[0]), ay = std::fabs(s[1]), az = std::fabs(s[2]);
+    if (ay >= ax && ay >= az) axis = 1;
+    else if (az >= ax && az >= ay) axis = 2;
+    int sign = s[axis] >= 0 ? 0 : 1;
+    L->covered |= 1 << (axis * 2 + sign);
+}
+
+static int coverage_count(int mask) {
+    int n = 0;
+    for (int i = 0; i < 6; i++) if (mask & (1 << i)) n++;
+    return n;
 }
 
 static void absorb_points(fox_live *L, const std::vector<cv::Vec3f> &P, const std::vector<cv::Vec3f> &N) {
@@ -684,10 +898,26 @@ static cv::Mat render_orbit(fox_live *L, const std::vector<cv::Vec3f> &P, const 
         cnt++;
     }
     c *= 1.f / std::max(cnt, 1);
+    cv::Vec3f lo = P[0], hi = P[0];
+    cv::Vec3f nmean(0, 0, 0);
+    for (size_t i = 0; i < P.size(); i++) {
+        const cv::Vec3f &p = P[i];
+        lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]); lo[2] = std::min(lo[2], p[2]);
+        hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]); hi[2] = std::max(hi[2], p[2]);
+        if (i < N.size()) nmean += N[i];
+    }
+    float extent = std::max(hi[0] - lo[0], std::max(hi[1] - lo[1], hi[2] - lo[2]));
+    if (!L->user_zoom)
+        L->dist = std::max(40.f, extent * 2.2f);
     float dist = L->dist;
-    cv::Vec3f eye = c + cv::Vec3f(dist * std::cos(L->pitch) * std::sin(L->yaw),
-                                  dist * std::sin(L->pitch),
-                                  dist * std::cos(L->pitch) * std::cos(L->yaw));
+    if (nmean.dot(nmean) < 1e-6f) nmean = cv::Vec3f(0, 0, 1);
+    float nl = std::sqrt(nmean.dot(nmean));
+    nmean /= nl;
+    float cyaw = std::cos(L->yaw * 0.35f), syaw = std::sin(L->yaw * 0.35f);
+    cv::Vec3f faced(nmean[0] * cyaw + nmean[2] * syaw, nmean[1], -nmean[0] * syaw + nmean[2] * cyaw);
+    float flf = std::sqrt(faced.dot(faced));
+    if (flf > 1e-6f) faced /= flf;
+    cv::Vec3f eye = c + faced * dist;
     cv::Vec3f forward = c - eye;
     float fl = std::sqrt(forward.dot(forward));
     if (fl < 1e-3f) return img;
@@ -700,7 +930,9 @@ static cv::Mat render_orbit(fox_live *L, const std::vector<cv::Vec3f> &P, const 
     cv::Vec3f cam_up = right.cross(forward);
     float focal = h * 1.2f;
     std::vector<float> zbuf((size_t)w * h, 1e9f);
-    const int rad = 2;
+    int rad = (int)(focal * 1.8f / std::max(dist, 1.f));
+    if (rad < 2) rad = 2;
+    if (rad > 7) rad = 7;
     for (size_t i = 0; i < P.size(); i++) {
         cv::Vec3f d = P[i] - eye;
         float zc = d.dot(forward);
@@ -729,6 +961,92 @@ static cv::Mat render_orbit(fox_live *L, const std::vector<cv::Vec3f> &P, const 
     return img;
 }
 
+static void draw_solid(fox_live *L, cv::Mat &img, const std::vector<SurfTri> &tris) {
+    if (tris.size() < 20) return;
+    cv::Vec3f c(0, 0, 0);
+    cv::Vec3f lo = tris[0].a, hi = tris[0].a;
+    int cnt = 0;
+    for (size_t i = 0; i < tris.size(); i += 3) {
+        c += tris[i].a;
+        cnt++;
+        for (const cv::Vec3f &p : {tris[i].a, tris[i].b, tris[i].c}) {
+            lo[0] = std::min(lo[0], p[0]); lo[1] = std::min(lo[1], p[1]); lo[2] = std::min(lo[2], p[2]);
+            hi[0] = std::max(hi[0], p[0]); hi[1] = std::max(hi[1], p[1]); hi[2] = std::max(hi[2], p[2]);
+        }
+    }
+    c *= 1.f / std::max(cnt, 1);
+    cv::Vec3f nmean(0, 0, 0);
+    for (const SurfTri &t : tris) nmean += t.n;
+    float extent = std::max(hi[0] - lo[0], std::max(hi[1] - lo[1], hi[2] - lo[2]));
+    if (!L->user_zoom) L->dist = std::max(40.f, extent * 2.4f);
+    float dist = L->dist;
+    if (L->spin && !L->dragging) L->yaw += 0.012f;
+    if (nmean.dot(nmean) < 1e-6f) nmean = cv::Vec3f(0, 0, 1);
+    nmean /= std::sqrt(nmean.dot(nmean));
+    float cyaw = std::cos(L->yaw * 0.35f), syaw = std::sin(L->yaw * 0.35f);
+    cv::Vec3f faced(nmean[0] * cyaw + nmean[2] * syaw, nmean[1], -nmean[0] * syaw + nmean[2] * cyaw);
+    faced /= std::sqrt(faced.dot(faced));
+    cv::Vec3f eye = c + faced * dist;
+    cv::Vec3f forward = c - eye;
+    float fl = std::sqrt(forward.dot(forward));
+    if (fl < 1e-3f) return;
+    forward /= fl;
+    cv::Vec3f up(0, 1, 0);
+    cv::Vec3f right = forward.cross(up);
+    float rl = std::sqrt(right.dot(right));
+    if (rl < 1e-4f) right = cv::Vec3f(1, 0, 0);
+    else right /= rl;
+    cv::Vec3f cam_up = right.cross(forward);
+    int w = img.cols, h = img.rows;
+    float focal = h * 1.15f;
+    std::vector<float> zbuf((size_t)w * h, 1e9f);
+    auto project = [&](const cv::Vec3f &p, float &sx, float &sy, float &zc) -> bool {
+        cv::Vec3f d = p - eye;
+        zc = d.dot(forward);
+        if (zc < 8.f) return false;
+        sx = w * 0.5f + focal * d.dot(right) / zc;
+        sy = h * 0.5f - focal * d.dot(cam_up) / zc;
+        return true;
+    };
+    for (const SurfTri &t : tris) {
+        float ax, ay, az, bx, by, bz, cx, cy, cz;
+        if (!project(t.a, ax, ay, az) || !project(t.b, bx, by, bz) || !project(t.c, cx, cy, cz)) continue;
+        int minx = (int)std::floor(std::min(ax, std::min(bx, cx)));
+        int maxx = (int)std::ceil(std::max(ax, std::max(bx, cx)));
+        int miny = (int)std::floor(std::min(ay, std::min(by, cy)));
+        int maxy = (int)std::ceil(std::max(ay, std::max(by, cy)));
+        if (maxx < 0 || maxy < 0 || minx >= w || miny >= h) continue;
+        minx = std::max(minx, 0);
+        miny = std::max(miny, 0);
+        maxx = std::min(maxx, w - 1);
+        maxy = std::min(maxy, h - 1);
+        float area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if (std::fabs(area) < 1e-3f) continue;
+        cv::Vec3f light = eye - t.a;
+        float ll = std::sqrt(light.dot(light)) + 1e-6f;
+        float nd = t.n.dot(light) / ll;
+        if (nd < 0.f) nd = -nd * 0.35f;
+        int g = (int)(48 + 190 * std::min(nd, 1.f));
+        cv::Vec3b col((uint8_t)(g * 0.7f), (uint8_t)(g * 0.88f), (uint8_t)std::min(255, g + 30));
+        for (int y = miny; y <= maxy; y++) {
+            for (int x = minx; x <= maxx; x++) {
+                float w0 = (bx - x) * (cy - y) - (by - y) * (cx - x);
+                float w1 = (cx - x) * (ay - y) - (cy - y) * (ax - x);
+                float w2 = (ax - x) * (by - y) - (ay - y) * (bx - x);
+                if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
+                    float inv = 1.f / area;
+                    float zc = (w0 * az + w1 * bz + w2 * cz) * inv;
+                    float &slot = zbuf[(size_t)y * w + x];
+                    if (zc < slot) {
+                        slot = zc;
+                        img.at<cv::Vec3b>(y, x) = col;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_b,
                           const cv::Mat &depth_m, int tracking) {
     const int hero_w = L->size.width * 2;
@@ -738,23 +1056,32 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     cv::Size side(side_w, side_h);
 
     std::vector<cv::Vec3f> frame_p, frame_n;
-    const std::vector<cv::Vec3f> *draw_p = &L->cloud;
-    const std::vector<cv::Vec3f> *draw_n = &L->cloud_n;
-    char title[96];
-    if (L->cloud.size() >= 30) {
-        snprintf(title, sizeof title, "3D model   %zu points   drag to orbit", L->cloud.size());
-    } else {
-        depth_samples(depth_m, L->geom.fx, L->geom.fy, L->geom.cx, L->geom.cy, NULL, frame_p, frame_n);
-        draw_p = &frame_p;
-        draw_n = &frame_n;
-        snprintf(title, sizeof title, "3D preview   %zu points   press Start to keep them", frame_p.size());
-    }
-    cv::Mat hero = render_orbit(L, *draw_p, *draw_n, hero_w, hero_h, title);
+    std::vector<SurfTri> frame_tris;
+    build_object(depth_m, L->geom.fx, L->geom.fy, L->geom.cx, L->geom.cy, frame_p, frame_n, frame_tris);
+    char title[140];
+    snprintf(title, sizeof title, "3D object   %zu faces   model %zu pts   scanned %d/6   drag to orbit",
+             frame_tris.size(), L->cloud.size(), coverage_count(L->covered));
+    cv::Mat hero(hero_h, hero_w, CV_8UC3, cv::Scalar(18, 20, 24));
+    if (frame_tris.size() >= 20)
+        draw_solid(L, hero, frame_tris);
+    else if (L->cloud.size() >= 80)
+        render_orbit(L, L->cloud, L->cloud_n, hero_w, hero_h, title).copyTo(hero);
+    else
+        cv::putText(hero, "point the scanner at the object", cv::Point(12, hero_h / 2),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
+    cv::putText(hero, title, cv::Point(10, 24), cv::FONT_HERSHEY_SIMPLEX, 0.48,
+                cv::Scalar(240, 240, 240), 1, cv::LINE_AA);
     (void)tracking;
 
-    cv::Mat a = to_bgr(cam_a, side);
-    cv::Mat b = to_bgr(cam_b, side);
-    cv::Mat d = depth_color(depth_m, L->opt.min_mm, L->opt.max_mm, side);
+    /* The Fox sensors are mounted upside down in the housing. The calibration
+     * and the depth stay in the sensor frame; only the pictures are turned. */
+    cv::Mat show_a, show_b, show_d;
+    if (!cam_a.empty()) cv::rotate(cam_a, show_a, cv::ROTATE_180);
+    if (!cam_b.empty()) cv::rotate(cam_b, show_b, cv::ROTATE_180);
+    if (!depth_m.empty()) cv::rotate(depth_m, show_d, cv::ROTATE_180);
+    cv::Mat a = to_bgr(show_a, side);
+    cv::Mat b = to_bgr(show_b, side);
+    cv::Mat d = depth_color(show_d.empty() ? depth_m : show_d, L->opt.min_mm, L->opt.max_mm, side);
     label_panel(a, "camera A");
     label_panel(b, "camera B");
     label_panel(d, "depth");
@@ -904,38 +1231,32 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     st.valid_pixels = chosen.valid;
     st.median_mm = chosen.median_mm;
 
-    if (live->mode == FOX_MODE_SCAN && live->locked && chosen.valid < 800) {
-        snprintf(live->line1, sizeof live->line1,
-                 "SCANNING   model %zu   surface left the window (%d px)",
-                 live->cloud.size(), chosen.valid);
-        snprintf(live->line2, sizeof live->line2,
-                 "move the object back into range, then keep rotating");
-    } else if (live->mode == FOX_MODE_SCAN && live->locked && chosen.valid >= 800) {
-        if (ensure_kinfu(live) == 0) {
-            bool ok = false;
-            try {
-                ok = live->kf->update(chosen.depth_m);
-            } catch (const cv::Exception &e) {
-                fprintf(stderr, "fusion: %s\n", e.what());
-                if (live->fused == 0) live->kf.release();
+    if (live->mode == FOX_MODE_SCAN && live->locked) {
+        std::vector<cv::Vec3f> P, Nn;
+        std::vector<SurfTri> tris;
+        build_object(chosen.depth_m, live->geom.fx, live->geom.fy, live->geom.cx, live->geom.cy, P, Nn, tris);
+        cv::Matx33f R;
+        cv::Vec3f t;
+        if (P.size() >= 80 && track_object(live, P, R, t)) {
+            std::vector<cv::Vec3f> Pm, Nm;
+            Pm.reserve(P.size());
+            Nm.reserve(Nn.size());
+            for (size_t i = 0; i < P.size(); i++) {
+                Pm.push_back(R * P[i] + t);
+                Nm.push_back(R * Nn[i]);
             }
-            if (ok) {
-                live->fused++;
-                st.tracking = 1;
-                try {
-                    cv::Affine3f cam_from_world(live->kf->getPose());
-                    cv::Affine3f world_from_cam = cam_from_world.inv();
-                    std::vector<cv::Vec3f> P, N;
-                    depth_samples(chosen.depth_m, live->geom.fx, live->geom.fy, live->geom.cx, live->geom.cy,
-                                  &world_from_cam, P, N);
-                    absorb_points(live, P, N);
-                } catch (const cv::Exception &e) {
-                    fprintf(stderr, "model points: %s\n", e.what());
-                }
-            } else {
-                live->lost++;
-                st.tracking = 0;
-            }
+            live->pose_R = R;
+            live->pose_t = t;
+            absorb_points(live, Pm, Nm);
+            note_coverage(live, Nn);
+            live->fused++;
+            live->tracked_frames++;
+            st.tracking = 1;
+        } else if (P.size() < 80) {
+            st.tracking = -1;
+        } else {
+            live->lost++;
+            st.tracking = 0;
         }
     }
 
@@ -946,8 +1267,8 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     const char *mode_name = live->mode == FOX_MODE_SCAN ? "SCANNING" :
                             live->mode == FOX_MODE_PAUSE ? "PAUSED" : "STOPPED";
     snprintf(live->line1, sizeof live->line1,
-             "%s   model %d pts   depth %d   z %.0f mm   %.0f ms",
-             mode_name, st.points, st.valid_pixels, st.median_mm, st.match_ms);
+             "%s   model %d pts   scanned %d/6 sides   z %.0f mm",
+             mode_name, st.points, coverage_count(live->covered), st.median_mm);
     paint_preview(live, As, Bs, chosen.depth_m, st.tracking);
     if (status) *status = st;
     return 0;
