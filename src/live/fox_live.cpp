@@ -8,6 +8,7 @@
 #include <opencv2/rgbd/kinfu.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -513,6 +514,7 @@ struct fox_live {
     std::unordered_map<uint64_t, uint32_t> vox;
     cv::Matx33f pose_R = cv::Matx33f::eye();
     cv::Vec3f pose_t = cv::Vec3f(0, 0, 0);
+    float pose_s = 1.f;
     int covered = 0;
     int tracked_frames = 0;
     std::vector<Tri> shell;
@@ -541,6 +543,7 @@ struct fox_live {
     std::vector<TriRef> refs;
     std::unordered_set<uint64_t> seen_cells;
     int detail = 1;
+    char seen_dir[72] = {};
     float object_yaw = 0.f;
     cv::Mat track_ref;
     int track_have = 0;
@@ -603,6 +606,7 @@ void fox_live_reset(fox_live *live) {
     live->vox.clear();
     live->pose_R = cv::Matx33f::eye();
     live->pose_t = cv::Vec3f(0, 0, 0);
+    live->pose_s = 1.f;
     live->covered = 0;
     live->tracked_frames = 0;
     live->shell.clear();
@@ -614,6 +618,7 @@ void fox_live_reset(fox_live *live) {
     live->refs.clear();
     live->seen_cells.clear();
     live->detail = 1;
+    memset(live->seen_dir, 0, sizeof live->seen_dir);
     live->object_yaw = 0.f;
     live->track_ref.release();
     live->track_have = 0;
@@ -883,11 +888,11 @@ static bool nearest_model(const fox_live *L, const cv::Vec3f &p, int &idx) {
     int ix = (int)std::floor(p[0] / voxel);
     int iy = (int)std::floor(p[1] / voxel);
     int iz = (int)std::floor(p[2] / voxel);
-    float best = 12.f * 12.f;
+    float best = 18.f * 18.f;
     bool found = false;
-    for (int dz = -3; dz <= 3; dz++) {
-        for (int dy = -3; dy <= 3; dy++) {
-            for (int dx = -3; dx <= 3; dx++) {
+    for (int dz = -6; dz <= 6; dz++) {
+        for (int dy = -6; dy <= 6; dy++) {
+            for (int dx = -6; dx <= 6; dx++) {
                 auto it = L->vox.find(voxel_key(ix + dx, iy + dy, iz + dz));
                 if (it == L->vox.end()) continue;
                 cv::Vec3f d = L->cloud[it->second] - p;
@@ -903,27 +908,31 @@ static bool nearest_model(const fox_live *L, const cv::Vec3f &p, int &idx) {
     return found;
 }
 
-/* Sony's scanner keeps a frame only when the new view still matches the
- * object. Point-to-point alignment against the model is that test. */
-static bool track_object(fox_live *L, const std::vector<cv::Vec3f> &P, cv::Matx33f &R, cv::Vec3f &t) {
+/* Align the new object cloud to the model. Scale lets the scanner move
+ * closer or farther. A frame that does not land on this object is rejected,
+ * so the background is not fused. */
+static bool track_object(fox_live *L, const std::vector<cv::Vec3f> &P, cv::Matx33f &R, cv::Vec3f &t,
+                         float &scale) {
     if (L->cloud.size() < 80) {
         R = cv::Matx33f::eye();
         t = cv::Vec3f(0, 0, 0);
+        scale = 1.f;
         return P.size() >= 80;
     }
     R = L->pose_R;
     t = L->pose_t;
-    int stride = std::max(1, (int)P.size() / 700);
-    for (int iter = 0; iter < 6; iter++) {
+    scale = L->pose_s > 0.2f ? L->pose_s : 1.f;
+    int stride = std::max(1, (int)P.size() / 900);
+    for (int iter = 0; iter < 10; iter++) {
         std::vector<cv::Vec3f> src, dst;
         for (size_t i = 0; i < P.size(); i += (size_t)stride) {
-            cv::Vec3f pm = R * P[i] + t;
+            cv::Vec3f pm = scale * (R * P[i]) + t;
             int id = 0;
             if (!nearest_model(L, pm, id)) continue;
             src.push_back(P[i]);
             dst.push_back(L->cloud[(size_t)id]);
         }
-        if (src.size() < 40) return false;
+        if (src.size() < 50) return false;
         cv::Vec3d cs(0, 0, 0), cd(0, 0, 0);
         for (size_t i = 0; i < src.size(); i++) {
             cs += cv::Vec3d(src[i]);
@@ -948,20 +957,43 @@ static bool track_object(fox_live *L, const std::vector<cv::Vec3f> &P, cv::Matx3
         R = cv::Matx33f((float)Rm.at<double>(0, 0), (float)Rm.at<double>(0, 1), (float)Rm.at<double>(0, 2),
                         (float)Rm.at<double>(1, 0), (float)Rm.at<double>(1, 1), (float)Rm.at<double>(1, 2),
                         (float)Rm.at<double>(2, 0), (float)Rm.at<double>(2, 1), (float)Rm.at<double>(2, 2));
+        double denom = 0, numer = 0;
+        for (size_t i = 0; i < src.size(); i++) {
+            cv::Vec3d a = cv::Vec3d(src[i]) - cs;
+            cv::Vec3d b = cv::Vec3d(dst[i]) - cd;
+            cv::Vec3d ra(R(0, 0) * a[0] + R(0, 1) * a[1] + R(0, 2) * a[2],
+                         R(1, 0) * a[0] + R(1, 1) * a[1] + R(1, 2) * a[2],
+                         R(2, 0) * a[0] + R(2, 1) * a[1] + R(2, 2) * a[2]);
+            numer += b.dot(ra);
+            denom += a.dot(a);
+        }
+        float s = denom > 1e-6 ? (float)(numer / denom) : scale;
+        if (s < 0.45f) s = 0.45f;
+        if (s > 2.2f) s = 2.2f;
+        if (L->pose_s > 0.2f) {
+            float lo = L->pose_s * 0.97f, hi = L->pose_s * 1.03f;
+            if (s < lo) s = lo;
+            if (s > hi) s = hi;
+        }
+        scale = s;
         cv::Vec3f csf((float)cs[0], (float)cs[1], (float)cs[2]);
         cv::Vec3f cdf((float)cd[0], (float)cd[1], (float)cd[2]);
-        t = cdf - R * csf;
+        t = cdf - scale * (R * csf);
     }
     double res = 0;
-    int n = 0;
+    int inliers = 0, tested = 0;
     for (size_t i = 0; i < P.size(); i += (size_t)stride) {
-        cv::Vec3f pm = R * P[i] + t;
+        tested++;
+        cv::Vec3f pm = scale * (R * P[i]) + t;
         int id = 0;
         if (!nearest_model(L, pm, id)) continue;
-        res += cv::norm(pm - L->cloud[(size_t)id]);
-        n++;
+        float d = cv::norm(pm - L->cloud[(size_t)id]);
+        if (d > 8.f) continue;
+        res += d;
+        inliers++;
     }
-    return n >= 40 && res / n < 6.0;
+    if (tested < 40 || inliers < 40) return false;
+    return (float)inliers / (float)tested >= 0.42f && res / inliers < 5.5;
 }
 
 static void note_coverage(fox_live *L, const std::vector<cv::Vec3f> &N) {
@@ -1455,8 +1487,10 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
     cv::GaussianBlur(gray, wide, cv::Size(0, 0), std::max(6.f, 26.f * rel));
     int ystep = std::max(2, (int)std::lround(3.f * rel));
     int gh = (gray.rows + ystep - 1) / ystep;
-    int gw = std::max(64, gray.cols / 13);
+    int gw = 112;
     std::vector<ShadeVert> grid((size_t)gw * gh);
+    /* Round body from the outline: nearest on the centre line, farther at
+     * the sides, with the facet shading as a couple of millimetres of relief. */
     const float th_max = 1.15f;
     const float sin_max = std::sin(th_max);
     for (int iy = 0; iy < gh; iy++) {
@@ -1467,18 +1501,16 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
         for (int ix = 0; ix < gw; ix++) {
             ShadeVert v{0, 0, 0, 0, 0, false};
             if (row) {
-                float u = -1.f + 2.f * ix / (float)(gw - 1);
+                float u = -1.f + 2.f * (float)ix / (float)(gw - 1);
                 float th = u * th_max;
-                float s = std::sin(th);
-                float co = std::cos(th);
                 float radius = half * z0 / fx;
-                int x = (int)std::lround(mid_x + half * (s / sin_max));
+                int x = (int)std::lround(mid_x + half * (std::sin(th) / sin_max));
                 x = std::max(0, std::min(gray.cols - 1, x));
                 float hf = (float)gray.at<uint8_t>(y, x) - (float)mid.at<uint8_t>(y, x);
                 float br = (float)mid.at<uint8_t>(y, x) - (float)wide.at<uint8_t>(y, x);
                 float bump = (hf * 0.55f + br * 0.35f) / 22.f;
                 bump = std::max(-1.f, std::min(1.f, bump));
-                float Z = z0 - radius * co;
+                float Z = z0 - radius * std::cos(th);
                 v.x = (x - cxr) * Z / fx;
                 v.y = -((y - cyr) * Z / fy);
                 v.z = Z;
@@ -1565,11 +1597,11 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
             bool b = displaced(gy, gx + 1, p10);
             bool c0 = displaced(gy + 1, gx, p01);
             bool d = displaced(gy + 1, gx + 1, p11);
-            if (a && b && c0 && cv::norm(p00 - p10) < 8.f && cv::norm(p00 - p01) < 8.f &&
-                cv::norm(p10 - p01) < 8.f)
+            if (a && b && c0 && cv::norm(p00 - p10) < 14.f && cv::norm(p00 - p01) < 14.f &&
+                cv::norm(p10 - p01) < 14.f)
                 body.tris.push_back(Tri{p00, p10, p01});
-            if (b && d && c0 && cv::norm(p10 - p11) < 8.f && cv::norm(p10 - p01) < 8.f &&
-                cv::norm(p11 - p01) < 8.f)
+            if (b && d && c0 && cv::norm(p10 - p11) < 14.f && cv::norm(p10 - p01) < 14.f &&
+                cv::norm(p11 - p01) < 14.f)
                 body.tris.push_back(Tri{p10, p11, p01});
         }
     }
@@ -1672,46 +1704,41 @@ static uint64_t cell_key(int ia, int iy) {
  * A frontal view counts for more than a grazing one. Repeat passes raise the
  * weight and pull the point toward the new measurement instead of replacing
  * the patch. */
-static void fuse_shell(fox_live *L, const BodyView &body, float fx) {
+static cv::Vec3f world_of(const cv::Vec3f &p, const cv::Matx33f &R, const cv::Vec3f &t, float scale) {
+    return scale * (R * p) + t;
+}
+
+static void fuse_shell(fox_live *L, const BodyView &body, const cv::Matx33f &R, const cv::Vec3f &t,
+                       float scale) {
     if (L->wedge.size() != (size_t)kBins) L->wedge.assign(kBins, fox_live::Wedge{});
     if (!L->have_axis) {
-        L->axis0 = body.axis;
+        L->axis0 = world_of(body.axis, R, t, scale);
         L->have_axis = 1;
-        L->radius_mm = std::max(8.f, body.radius_px * body.axis[2] / std::max(fx, 1.f));
+        L->radius_mm = std::max(8.f, body.radius_px * body.axis[2] / 2742.f);
         L->span_y0 = 1e9f;
         L->span_y1 = -1e9f;
     }
-    cv::Matx33f R = rot_y(-L->object_yaw);
-    const float kGraz = 58.f * 3.14159265f / 180.f;
-    const float cell = 0.65f;
-    const float Rmm = std::max(8.f, L->radius_mm);
+    const float cell = 0.8f;
     struct Acc {
         cv::Vec3f sum;
         int n = 0;
-        float view = 0.f;
-        int bin = 0;
+        float view = 1.f;
     };
     std::unordered_map<uint64_t, Acc> frame;
     frame.reserve(body.tris.size());
+    auto key_of_point = [&](const cv::Vec3f &w) {
+        int ix = (int)std::lround(w[0] / cell);
+        int iy = (int)std::lround(w[1] / cell);
+        int iz = (int)std::lround(w[2] / cell);
+        return voxel_key(ix, iy, iz);
+    };
     for (const Tri &src : body.tris) {
-        cv::Vec3f v[3] = {src.a, src.b, src.c};
+        cv::Vec3f corners[3] = {src.a, src.b, src.c};
         for (int i = 0; i < 3; i++) {
-            cv::Vec3f rel = v[i] - body.axis;
-            float cam_ang = std::atan2(rel[0], -rel[2]);
-            if (std::fabs(cam_ang) > kGraz) continue;
-            cv::Vec3f w = R * rel + L->axis0;
-            cv::Vec3f from_axis = w - L->axis0;
-            float ang = std::atan2(from_axis[0], -from_axis[2]);
-            int ia = (int)std::lround((ang * Rmm) / cell);
-            int iy = (int)std::lround(w[1] / cell);
-            Acc &a = frame[cell_key(ia, iy)];
+            cv::Vec3f w = world_of(corners[i], R, t, scale);
+            Acc &a = frame[key_of_point(w)];
             a.sum += w;
             a.n++;
-            float view = std::max(0.35f, 1.f - std::fabs(cam_ang) / kGraz);
-            if (view > a.view) {
-                a.view = view;
-                a.bin = bin_of(from_axis[0], from_axis[2]);
-            }
             L->span_y0 = std::min(L->span_y0, w[1]);
             L->span_y1 = std::max(L->span_y1, w[1]);
         }
@@ -1737,48 +1764,33 @@ static void fuse_shell(fox_live *L, const BodyView &body, float fx) {
             s.w = std::min(s.w + a.view, 24.f);
             s.n++;
         }
-        int b = a.bin;
-        if (b >= 0 && b < kBins) {
-            L->wedge[(size_t)b].filled = 1;
-            L->wedge[(size_t)b].quality = std::min(L->wedge[(size_t)b].quality, 1.f - a.view);
-        }
     }
     for (fox_live::TriRef &ref : L->refs) {
         for (int i = 0; i < 3; i++) {
             auto old = before.find(ref.k[i]);
             auto cur = L->cells.find(ref.k[i]);
             if (old == before.end() || cur == L->cells.end()) continue;
-            ref.p[i] += cur->second.p - old->second;
+            cv::Vec3f delta = cur->second.p - old->second;
+            float len = cv::norm(delta);
+            if (len > 0.4f) delta *= 0.4f / len;
+            ref.p[i] += delta;
         }
     }
     /* The first time a spot is seen, keep that triangle. A later pass moves
      * the vertices above. A pass over a gap adds the new triangles. */
-    auto key_of = [&](const cv::Vec3f &w) {
-        cv::Vec3f rel = w - L->axis0;
-        float ang = std::atan2(rel[0], -rel[2]);
-        int ia = (int)std::lround((ang * Rmm) / cell);
-        int iy = (int)std::lround(w[1] / cell);
-        return cell_key(ia, iy);
-    };
     std::unordered_set<uint64_t> fresh;
     for (const Tri &src : body.tris) {
         cv::Vec3f corners[3] = {src.a, src.b, src.c};
         cv::Vec3f w[3];
-        bool graz = false;
-        for (int i = 0; i < 3; i++) {
-            cv::Vec3f rel = corners[i] - body.axis;
-            if (std::fabs(std::atan2(rel[0], -rel[2])) > kGraz) graz = true;
-            w[i] = R * rel + L->axis0;
-        }
-        if (graz) continue;
+        for (int i = 0; i < 3; i++) w[i] = world_of(corners[i], R, t, scale);
         cv::Vec3f mid = (w[0] + w[1] + w[2]) * (1.f / 3.f);
-        uint64_t ck = key_of(mid);
+        uint64_t ck = key_of_point(mid);
         if (L->seen_cells.count(ck)) continue;
         fresh.insert(ck);
         fox_live::TriRef ref;
         ref.bin = bin_of(mid[0] - L->axis0[0], mid[2] - L->axis0[2]);
         for (int i = 0; i < 3; i++) {
-            ref.k[i] = key_of(w[i]);
+            ref.k[i] = key_of_point(w[i]);
             ref.p[i] = w[i];
         }
         L->refs.push_back(ref);
@@ -1788,20 +1800,55 @@ static void fuse_shell(fox_live *L, const BodyView &body, float fx) {
     for (auto &wd : L->wedge) wd.tris.clear();
     for (const fox_live::TriRef &ref : L->refs) {
         if (ref.bin < 0 || ref.bin >= kBins) continue;
-        if (cv::norm(ref.p[0] - ref.p[1]) > 8.f || cv::norm(ref.p[0] - ref.p[2]) > 8.f) continue;
+        if (cv::norm(ref.p[0] - ref.p[1]) > 14.f || cv::norm(ref.p[0] - ref.p[2]) > 14.f) continue;
         L->wedge[(size_t)ref.bin].tris.push_back(Tri{ref.p[0], ref.p[1], ref.p[2]});
         L->wedge[(size_t)ref.bin].filled = 1;
     }
-    int n = 0;
+    L->cloud.clear();
+    L->cloud_n.clear();
+    L->vox.clear();
+    cv::Vec3f centre(0, 0, 0);
     long passes = 0;
     int cells = 0;
-    for (const auto &w : L->wedge)
-        if (w.filled) n++;
     for (const auto &kv : L->cells) {
+        centre += kv.second.p;
         passes += kv.second.n;
         cells++;
+        if (L->cloud.size() >= 80000) continue;
+        const cv::Vec3f &p = kv.second.p;
+        int ix = (int)std::floor(p[0] / 2.5f);
+        int iy = (int)std::floor(p[1] / 2.5f);
+        int iz = (int)std::floor(p[2] / 2.5f);
+        uint64_t k = voxel_key(ix, iy, iz);
+        if (L->vox.find(k) != L->vox.end()) continue;
+        L->vox.emplace(k, (uint32_t)L->cloud.size());
+        L->cloud.push_back(p);
+        L->cloud_n.push_back(cv::Vec3f(0, 0, -1));
     }
-    L->scanned_bins = n;
+    if (cells > 0) centre *= 1.f / (float)cells;
+    cv::Vec3f to_obj = centre - t;
+    float horiz = std::sqrt(to_obj[0] * to_obj[0] + to_obj[2] * to_obj[2]);
+    float el = std::atan2(to_obj[1], horiz);
+    float az = std::atan2(to_obj[0], to_obj[2]);
+    int ia = (int)std::floor((az + 3.14159265f) / (6.2831853f) * 36.f);
+    if (ia < 0) ia = 0;
+    if (ia > 35) ia = 35;
+    for (int k = -8; k <= 8; k++) {
+        int b = (ia + k + 36) % 36;
+        L->seen_dir[b] = 1;
+        L->wedge[(size_t)b].filled = 1;
+    }
+    if (el > 0.45f) {
+        for (int k = -4; k <= 4; k++) {
+            int b = 36 + (ia + k + 36) % 36;
+            L->seen_dir[b] = 1;
+            L->wedge[(size_t)b].filled = 1;
+        }
+    }
+    int nbin = 0;
+    for (char h : L->seen_dir)
+        if (h) nbin++;
+    L->scanned_bins = nbin;
     L->detail = cells ? std::max(1, (int)(passes / cells)) : 1;
 }
 
@@ -1894,37 +1941,6 @@ static void render_model(fox_live *L, cv::Mat &out) {
         }
     };
 
-    /* Unscanned sides stay a smooth dark shell, inside the real surface. */
-    if (L->have_axis && L->radius_mm > 1.f && L->span_y1 > L->span_y0) {
-        const int ys = 18;
-        float R = L->radius_mm * 0.97f;
-        float y0 = L->span_y0, y1 = L->span_y1;
-        for (int b = 0; b < kBins; b++) {
-            if (b < (int)L->wedge.size() && L->wedge[(size_t)b].filled) continue;
-            float a0 = bin_angle(b) - 0.5f * (6.2831853f / kBins);
-            float a1 = a0 + (6.2831853f / kBins);
-            float amid = 0.5f * (a0 + a1);
-            cv::Vec3f nrm(std::sin(amid), 0.f, -std::cos(amid));
-            cv::Vec3f pref(L->axis0[0] + R * nrm[0], c[1], L->axis0[2] + R * nrm[2]);
-            cv::Vec3f light = eye - pref;
-            float ll = std::sqrt(light.dot(light)) + 1e-6f;
-            float lam = nrm.dot(light) / ll;
-            lam = std::max(0.12f, lam * 0.5f + 0.5f);
-            int g = (int)(70.f * lam);
-            cv::Vec3b ghost((uint8_t)g, (uint8_t)g, (uint8_t)(g + 4));
-            for (int i = 0; i < ys; i++) {
-                float ya = y0 + (y1 - y0) * (i / (float)ys);
-                float yb = y0 + (y1 - y0) * ((i + 1) / (float)ys);
-                cv::Vec3f p00(L->axis0[0] + R * std::sin(a0), ya, L->axis0[2] - R * std::cos(a0));
-                cv::Vec3f p10(L->axis0[0] + R * std::sin(a1), ya, L->axis0[2] - R * std::cos(a1));
-                cv::Vec3f p01(L->axis0[0] + R * std::sin(a0), yb, L->axis0[2] - R * std::cos(a0));
-                cv::Vec3f p11(L->axis0[0] + R * std::sin(a1), yb, L->axis0[2] - R * std::cos(a1));
-                paint_tri(p00, p10, p01, ghost);
-                paint_tri(p10, p11, p01, ghost);
-            }
-        }
-    }
-
     for (const auto &wedge : L->wedge) {
         if (!wedge.filled) continue;
         for (const Tri &t : wedge.tris) {
@@ -1944,7 +1960,7 @@ static void render_model(fox_live *L, cv::Mat &out) {
     }
     draw_coverage_ring(out, L);
     if (L->mode == FOX_MODE_SCAN && L->last_track == 0) {
-        cv::putText(out, "tracking lost  —  slow the turn", cv::Point(16, out.rows - 18),
+        cv::putText(out, "tracking lost  —  stay on the object", cv::Point(16, out.rows - 18),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(40, 40, 220), 2, cv::LINE_AA);
     }
 }
@@ -2106,20 +2122,23 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     st.median_mm = body.median_mm;
 
     if (live->mode == FOX_MODE_SCAN || live->mode == FOX_MODE_PAUSE) {
-        float response = 0.f;
-        int trk = track_spin(live, body, response);
-        live->last_track = trk;
-        if (trk < 0) {
-            st.tracking = -1;
-        } else if (trk == 0) {
-            if (live->mode == FOX_MODE_SCAN) live->lost++;
-            st.tracking = 0;
-        } else if (live->mode == FOX_MODE_SCAN) {
-            fuse_shell(live, body, (float)cam.fx);
-            live->fused++;
-            live->tracked_frames++;
-            st.tracking = 1;
+        cv::Matx33f R;
+        cv::Vec3f tr;
+        float scale = 1.f;
+        bool locked = body.P.size() >= 80 && track_object(live, body.P, R, tr, scale);
+        live->last_track = body.P.size() < 80 ? -1 : (locked ? 1 : 0);
+        if (!locked) {
+            if (body.P.size() >= 80 && live->mode == FOX_MODE_SCAN) live->lost++;
+            st.tracking = body.P.size() < 80 ? -1 : 0;
         } else {
+            live->pose_R = R;
+            live->pose_t = tr;
+            live->pose_s = scale;
+            if (live->mode == FOX_MODE_SCAN) {
+                fuse_shell(live, body, R, tr, scale);
+                live->fused++;
+                live->tracked_frames++;
+            }
             st.tracking = 1;
         }
     } else {
