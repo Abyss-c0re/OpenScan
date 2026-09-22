@@ -159,6 +159,7 @@ struct Geom {
     cv::Mat map1x, map1y, map2x, map2y, Q;
     cv::Ptr<cv::StereoSGBM> sgbm;
     float fx = 0, fy = 0, cx = 0, cy = 0;
+    float baseline = 0;
     cv::Size size;
 };
 
@@ -205,8 +206,9 @@ static Geom build_geom(const fox_calib *cal, const fox_scan_opts &opt, cv::Size 
     g.fy = (float)P1.at<double>(1, 1);
     g.cx = (float)P1.at<double>(0, 2);
     g.cy = (float)P1.at<double>(1, 2);
+    g.baseline = (float)std::fabs(1.0 / g.Q.at<double>(3, 2));
 
-    double baseline = std::fabs(1.0 / g.Q.at<double>(3, 2));
+    double baseline = g.baseline;
     double near_mm = std::max(40.0, opt.min_mm * 0.85);
     int block = 7;
     /* SGBM rejects a search that reaches the right edge of the image, and a
@@ -249,8 +251,8 @@ static DepthFrame match_depth(const Geom &g, const cv::Mat &left, const cv::Mat 
     /* Knock the projected dots down to the shading underneath them.
      * Block matching cannot tell one identical dot from the next. */
     cv::Mat left_b, right_b;
-    cv::GaussianBlur(f.rect, left_b, cv::Size(0, 0), 3.2);
-    cv::GaussianBlur(recR, right_b, cv::Size(0, 0), 3.2);
+    cv::GaussianBlur(f.rect, left_b, cv::Size(0, 0), 0.8);
+    cv::GaussianBlur(recR, right_b, cv::Size(0, 0), 0.8);
     cv::Mat disp16;
     g.sgbm->compute(left_b, right_b, disp16);
     cv::Mat disp;
@@ -266,12 +268,10 @@ static DepthFrame match_depth(const Geom &g, const cv::Mat &left, const cv::Mat 
         const float *drow = disp.ptr<float>(y);
         float *out = f.depth_m.ptr<float>(y);
         for (int x = 0; x < xyz.cols; x++) {
-            float d = drow[x];
-            float z = row[x][2];
-            /* stereoRectify's Q puts the scene at negative Z when the baseline
-             * Tx is positive. Depth is the distance in front of the camera. */
-            if (std::isfinite(z) && z < 0.f) z = -z;
-            if (std::fabs(d) <= 1.f || !std::isfinite(z)) continue;
+            float d = std::fabs(drow[x]);
+            if (d < 2.f) continue;
+            float z = g.fx * g.baseline / d;
+            if (!std::isfinite(z)) continue;
             if (z < min_mm || z > max_mm) continue;
             out[x] = z * 0.001f;
             f.valid++;
@@ -445,6 +445,7 @@ struct fox_live {
     int save_req = 0;
     cv::Ptr<cv::kinfu::KinFu> kf;
     cv::Mat last_model;
+    cv::Mat align_gray;
     cv::Mat preview;
     int preview_w = 0;
     int preview_h = 0;
@@ -691,7 +692,7 @@ static void object_mask(const cv::Mat &depth, float med, cv::Mat &labels, int &b
         const float *row = depth.ptr<float>(y);
         uint8_t *k = keep.ptr<uint8_t>(y);
         for (int x = 0; x < depth.cols; x++) {
-            if (row[x] > 0.f && std::fabs(row[x] - med) <= 0.02f) k[x] = 255;
+            if (row[x] > 0.f && std::fabs(row[x] - med) <= 0.04f) k[x] = 255;
         }
     }
     cv::Mat stats, centroids;
@@ -730,7 +731,7 @@ static void build_object(const cv::Mat &depth, float fx, float fy, float cx, flo
         if (x < 0 || y < 0 || x >= depth.cols || y >= depth.rows) return false;
         if (labels.at<int>(y, x) != best) return false;
         float z = depth.at<float>(y, x);
-        if (z <= 0.f || std::fabs(z - med) > 0.02f) return false;
+        if (z <= 0.f || std::fabs(z - med) > 0.04f) return false;
         p = unproject_mm(x, y, z, fx, fy, cx, cy);
         return true;
     };
@@ -1055,22 +1056,71 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     const int side_h = hero_h / 3;
     cv::Size side(side_w, side_h);
 
-    std::vector<cv::Vec3f> frame_p, frame_n;
-    std::vector<SurfTri> frame_tris;
-    build_object(depth_m, L->geom.fx, L->geom.fy, L->geom.cx, L->geom.cy, frame_p, frame_n, frame_tris);
-    char title[140];
-    snprintf(title, sizeof title, "3D object   %zu faces   model %zu pts   scanned %d/6   drag to orbit",
-             frame_tris.size(), L->cloud.size(), coverage_count(L->covered));
-    cv::Mat hero(hero_h, hero_w, CV_8UC3, cv::Scalar(18, 20, 24));
-    if (frame_tris.size() >= 20)
-        draw_solid(L, hero, frame_tris);
-    else if (L->cloud.size() >= 80)
-        render_orbit(L, L->cloud, L->cloud_n, hero_w, hero_h, title).copyTo(hero);
-    else
-        cv::putText(hero, "point the scanner at the object", cv::Point(12, hero_h / 2),
+    /* Depth is on the rectified left camera. Scatter it back through the
+     * rectify map so it lands on that camera's picture. */
+    const cv::Mat &sensor = (L->locked == 2 && !cam_b.empty()) ? cam_b : cam_a;
+    const char *which = (L->locked == 2) ? "camera B" : "camera A";
+    cv::Mat camera_view, relief;
+    if (!sensor.empty() && !depth_m.empty() && !L->geom.map1x.empty() &&
+        depth_m.size() == L->geom.map1x.size()) {
+        float med = depth_median_m(depth_m);
+        cv::Mat labels;
+        int best = 0;
+        object_mask(depth_m, med, labels, best);
+        cv::Mat cam_s, rel_s(sensor.size(), CV_8UC3, cv::Scalar(16, 16, 18));
+        cv::cvtColor(sensor, cam_s, cv::COLOR_GRAY2BGR);
+        cv::Mat sil(sensor.size(), CV_8U, cv::Scalar(0));
+        for (int y = 1; y < depth_m.rows - 1; y++) {
+            const float *row = depth_m.ptr<float>(y);
+            const float *up = depth_m.ptr<float>(y - 1);
+            const float *dn = depth_m.ptr<float>(y + 1);
+            const float *mx = L->geom.map1x.ptr<float>(y);
+            const float *my = L->geom.map1y.ptr<float>(y);
+            for (int x = 1; x < depth_m.cols - 1; x++) {
+                if (best == 0 || labels.at<int>(y, x) != best) continue;
+                float z = row[x];
+                if (z <= 0.f || up[x] <= 0.f || dn[x] <= 0.f || row[x - 1] <= 0.f || row[x + 1] <= 0.f)
+                    continue;
+                int iu = (int)std::lround(mx[x]);
+                int iv = (int)std::lround(my[x]);
+                if (iu < 1 || iv < 1 || iu >= sensor.cols - 1 || iv >= sensor.rows - 1) continue;
+                sil.at<uint8_t>(iv, iu) = 255;
+                float dx = (row[x + 1] - row[x - 1]) * 0.5f;
+                float dy = (dn[x] - up[x]) * 0.5f;
+                float nx = -L->geom.fx * dx / z;
+                float ny = -L->geom.fy * dy / z;
+                float nz = 1.f;
+                float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+                int shade = (int)(255.f * std::max(0.15f, nz / len));
+                int tex = sensor.at<uint8_t>(iv, iu);
+                rel_s.at<cv::Vec3b>(iv, iu) = cv::Vec3b((uint8_t)(shade * 0.45f + tex * 0.15f),
+                                                       (uint8_t)(shade * 0.55f + tex * 0.25f),
+                                                       (uint8_t)(shade * 0.75f + tex * 0.35f));
+            }
+        }
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(sil, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+        cv::drawContours(cam_s, contours, -1, cv::Scalar(60, 220, 80), 2, cv::LINE_AA);
+        cv::rotate(cam_s, camera_view, cv::ROTATE_180);
+        cv::rotate(rel_s, relief, cv::ROTATE_180);
+        cv::putText(camera_view, which, cv::Point(8, 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(240, 240, 240), 1, cv::LINE_AA);
+        char cap[96];
+        snprintf(cap, sizeof cap, "3D  same view   %d/6 sides", coverage_count(L->covered));
+        cv::putText(relief, cap, cv::Point(8, 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(240, 240, 240), 1, cv::LINE_AA);
+    }
+    cv::Mat hero(hero_h, hero_w, CV_8UC3, cv::Scalar(12, 12, 12));
+    if (!camera_view.empty() && !relief.empty()) {
+        cv::Mat left, right;
+        cv::resize(camera_view, left, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_NEAREST);
+        cv::resize(relief, right, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_NEAREST);
+        left.copyTo(hero(cv::Rect(0, 0, hero_w / 2, hero_h)));
+        right.copyTo(hero(cv::Rect(hero_w / 2, 0, hero_w / 2, hero_h)));
+    } else {
+        cv::putText(hero, "waiting for a frame", cv::Point(12, hero_h / 2),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
-    cv::putText(hero, title, cv::Point(10, 24), cv::FONT_HERSHEY_SIMPLEX, 0.48,
-                cv::Scalar(240, 240, 240), 1, cv::LINE_AA);
+    }
     (void)tracking;
 
     /* The Fox sensors are mounted upside down in the housing. The calibration
@@ -1168,63 +1218,10 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     cv::resize(A, As, live->size, 0, 0, cv::INTER_AREA);
     cv::resize(B, Bs, live->size, 0, 0, cv::INTER_AREA);
 
-    DepthFrame chosen;
-    if (!live->locked) {
-        DepthFrame fa = match_depth(live->geom, As, Bs, live->opt.min_mm, live->opt.max_mm);
-        DepthFrame fb = match_depth(live->geom, Bs, As, live->opt.min_mm, live->opt.max_mm);
-        int prefer_a = fa.valid >= fb.valid;
-        int best = prefer_a ? fa.valid : fb.valid;
-        int other = prefer_a ? fb.valid : fa.valid;
-        if (best >= 1500 && (best > other * 1.12 || best > 6000)) {
-            live->locked = prefer_a ? 1 : 2;
-            live->hist_n = 0;
-            fprintf(stderr, "cameras locked: %s is calib camera 1 (%d vs %d in-range pixels)\n",
-                    prefer_a ? "A" : "B", best, other);
-            chosen = prefer_a ? fa : fb;
-        } else {
-            chosen = prefer_a ? fa : fb;
-            snprintf(live->line1, sizeof live->line1,
-                     "searching  A-as-left %d px   B-as-left %d px   need a surface at %.0f-%.0f mm",
-                     fa.valid, fb.valid, live->opt.min_mm, live->opt.max_mm);
-        }
-    } else {
-        if (live->locked == 1) chosen = match_depth(live->geom, As, Bs, live->opt.min_mm, live->opt.max_mm);
-        else chosen = match_depth(live->geom, Bs, As, live->opt.min_mm, live->opt.max_mm);
-    }
-
-    if (live->locked) {
-        live->depth_hist[live->hist_i] = chosen.depth_m.clone();
-        live->hist_i = (live->hist_i + 1) % 3;
-        if (live->hist_n < 3) live->hist_n++;
-        if (live->hist_n == 3) {
-            cv::Mat steady = cv::Mat::zeros(chosen.depth_m.size(), CV_32F);
-            int valid = 0;
-            std::vector<float> samples;
-            for (int y = 0; y < steady.rows; y++) {
-                const float *a = live->depth_hist[0].ptr<float>(y);
-                const float *b = live->depth_hist[1].ptr<float>(y);
-                const float *c = live->depth_hist[2].ptr<float>(y);
-                float *o = steady.ptr<float>(y);
-                for (int x = 0; x < steady.cols; x++) {
-                    float v0 = a[x], v1 = b[x], v2 = c[x];
-                    if (v0 <= 0.f || v1 <= 0.f || v2 <= 0.f) continue;
-                    float lo = std::min(v0, std::min(v1, v2));
-                    float hi = std::max(v0, std::max(v1, v2));
-                    if (hi - lo > 0.008f) continue;
-                    o[x] = v0 + v1 + v2 - lo - hi;
-                    valid++;
-                    if (((y * steady.cols + x) & 15) == 0) samples.push_back(o[x] * 1000.f);
-                }
-            }
-            chosen.depth_m = steady;
-            chosen.valid = valid;
-            if (!samples.empty()) {
-                size_t mid = samples.size() / 2;
-                std::nth_element(samples.begin(), samples.begin() + (ptrdiff_t)mid, samples.end());
-                chosen.median_mm = samples[mid];
-            }
-        }
-    }
+    /* Camera A is the calibrated reference. Swapping in B produces a
+     * dense-looking depth map that only covers a strip of the object. */
+    live->locked = 1;
+    DepthFrame chosen = match_depth(live->geom, As, Bs, live->opt.min_mm, live->opt.max_mm);
 
     auto t1 = std::chrono::steady_clock::now();
     st.match_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1269,6 +1266,7 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     snprintf(live->line1, sizeof live->line1,
              "%s   model %d pts   scanned %d/6 sides   z %.0f mm",
              mode_name, st.points, coverage_count(live->covered), st.median_mm);
+    live->align_gray = chosen.rect;
     paint_preview(live, As, Bs, chosen.depth_m, st.tracking);
     if (status) *status = st;
     return 0;

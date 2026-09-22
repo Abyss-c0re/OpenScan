@@ -525,7 +525,7 @@ int fox_app_main(int argc, char **argv, const char *calib,
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        return fox_app_main(argc, argv, nullptr, 18, 4, 12, 4, 0.4, 80, 550);
+        return fox_app_main(argc, argv, nullptr, 18, 4, 12, 4, 0.5, 80, 550);
     }
     const char *cmd = argv[1];
     if (!strcmp(cmd, "mesh-test")) return fox_mesh_self_test();
@@ -600,7 +600,7 @@ int main(int argc, char **argv) {
         return cmd_snap(out, calib, frames, base_exp, base_gain, scale, min_mm, max_mm);
     }
     if (!strcmp(cmd, "scan")) {
-        if (!scale_set) scale = 0.4;
+        if (!scale_set) scale = 0.5;
         if (no_window) {
             if (!out) {
                 fprintf(stderr, "scan --no-window needs -o FILE.stl\n");
