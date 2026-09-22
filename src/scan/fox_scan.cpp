@@ -1,4 +1,4 @@
-#include "fox_scan.h"
+#include "fox/fox_scan.h"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>

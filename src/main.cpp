@@ -1,7 +1,8 @@
-#include "fox_calib.h"
-#include "fox_live.h"
-#include "fox_scan.h"
-#include "fox_v4l2.h"
+#include "fox/fox_app.h"
+#include "fox/fox_calib.h"
+#include "fox/fox_live.h"
+#include "fox/fox_scan.h"
+#include "fox/fox_v4l2.h"
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -47,7 +48,7 @@ static void usage(const char *argv0) {
             "\n"
             "exposure is UVC absolute exposure in units of 100 microseconds.\n"
             "scan adjusts it per camera unless --no-ae is set. gain is 0..100.\n"
-            "Calibration is read from calib/<serial>.txt .\n",
+            "Calibration is calib/<serial>.txt, or downloaded for the device serial.\n",
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
@@ -201,31 +202,17 @@ static int cmd_grab(const char *dir, int exp_a, int gain_a, int exp_b, int gain_
 }
 
 static int load_calib_for(const char *serial, const char *explicit_path, fox_calib *cal) {
-    if (explicit_path) {
-        if (fox_calib_load(explicit_path, cal) == 0) {
-            printf("calib %s  %dx%d  baseline %.2f mm  date %s\n",
-                   explicit_path, cal->width, cal->height, cal->cam[1].tvec[0], cal->date);
-            return 0;
-        }
-        fprintf(stderr, "cannot read calib %s\n", explicit_path);
+    char used[512];
+    if (fox_calib_ensure(serial, explicit_path, cal, used, sizeof used) != 0) {
+        if (explicit_path)
+            fprintf(stderr, "cannot read calib %s\n", explicit_path);
+        else
+            fprintf(stderr, "no calibration for %s on disk or from the factory server\n", serial);
         return -1;
     }
-    char path[512];
-    const char *cands[] = {
-        "calib/%s.txt",
-        "fox3d/calib/%s.txt",
-        "/home/voldemar/Dev/lab/Fox3DScan/fox3d/calib/%s.txt",
-    };
-    for (const char *fmt : cands) {
-        snprintf(path, sizeof path, fmt, serial);
-        if (fox_calib_load(path, cal) == 0) {
-            printf("calib %s  %dx%d  baseline %.2f mm  date %s\n",
-                   path, cal->width, cal->height, cal->cam[1].tvec[0], cal->date);
-            return 0;
-        }
-    }
-    fprintf(stderr, "no calib for %s. Pass --calib, or place calib/%s.txt\n", serial, serial);
-    return -1;
+    printf("calib %s  %dx%d  baseline %.2f mm  date %s\n",
+           used, cal->width, cal->height, cal->cam[1].tvec[0], cal->date);
+    return 0;
 }
 
 static void nudge_exposure(int *exp, int *gain, double mean) {
@@ -519,10 +506,6 @@ static int cmd_asic(const char *hexaddr) {
     fox_cam_close(b);
     return (ra || rb) ? 1 : 0;
 }
-
-int fox_app_main(int argc, char **argv, const char *calib,
-                 int exp_a, int gain_a, int exp_b, int gain_b,
-                 double scale, double min_mm, double max_mm);
 
 int main(int argc, char **argv) {
     if (argc < 2) {

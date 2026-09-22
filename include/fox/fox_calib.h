@@ -1,6 +1,8 @@
 #ifndef FOX_CALIB_H
 #define FOX_CALIB_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,6 +37,17 @@ typedef struct fox_calib {
 } fox_calib;
 
 int fox_calib_load(const char *path, fox_calib *out);
+
+/* Download the factory calib.txt for this serial. The request is signed
+ * from the serial alone; no account cookie is sent. Writes dest_path. */
+int fox_calib_fetch(const char *serial, const char *dest_path);
+
+/* Load a local file for this serial, or download one into
+ * $XDG_DATA_HOME/fox3d/calib/<serial>.txt when none is on disk.
+ * explicit_path, when set, is the only file tried and is never downloaded.
+ * used_path may be NULL. */
+int fox_calib_ensure(const char *serial, const char *explicit_path,
+                     fox_calib *out, char *used_path, size_t used_n);
 
 #ifdef __cplusplus
 }

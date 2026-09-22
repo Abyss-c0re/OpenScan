@@ -1,8 +1,8 @@
 #ifndef FOX_LIVE_H
 #define FOX_LIVE_H
 
-#include "fox_calib.h"
-#include "fox_scan.h"
+#include "fox/fox_calib.h"
+#include "fox/fox_scan.h"
 
 #ifdef __cplusplus
 extern "C" {

@@ -1,4 +1,4 @@
-#include "fox_v4l2.h"
+#include "fox/fox_v4l2.h"
 
 #include <dirent.h>
 #include <errno.h>

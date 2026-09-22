@@ -1,6 +1,7 @@
-#include "fox_calib.h"
-#include "fox_live.h"
-#include "fox_v4l2.h"
+#include "fox/fox_app.h"
+#include "fox/fox_calib.h"
+#include "fox/fox_live.h"
+#include "fox/fox_v4l2.h"
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -47,18 +48,9 @@ static int grab_pair(fox_cam *a, fox_cam *b, std::vector<uint8_t> &ya, std::vect
 }
 
 static int load_calib(const char *serial, const char *explicit_path, fox_calib *cal) {
-    if (explicit_path) return fox_calib_load(explicit_path, cal);
-    char path[512];
-    const char *fmts[] = {
-        "calib/%s.txt",
-        "fox3d/calib/%s.txt",
-        "/home/voldemar/Dev/lab/Fox3DScan/fox3d/calib/%s.txt",
-    };
-    for (const char *fmt : fmts) {
-        snprintf(path, sizeof path, fmt, serial);
-        if (fox_calib_load(path, cal) == 0) return 0;
-    }
-    return -1;
+    char used[512];
+    if (fox_calib_ensure(serial, explicit_path, cal, used, sizeof used) != 0) return -1;
+    return 0;
 }
 
 /* The picture is the 3D view plus the camera column. Mouse events on the
@@ -294,8 +286,10 @@ int fox_app_main(int argc, char **argv, const char *calib_path,
     fox_calib cal;
     if (load_calib(serial, calib_path, &cal) != 0) {
         QMessageBox::critical(nullptr, "Fox 3D",
-                              QString("No calibration file for %1.\n\n"
-                                      "Place calib/%1.txt next to the program.")
+                              QString("No calibration for %1.\n\n"
+                                      "The scanner serial is read from the device and the "
+                                      "factory file is downloaded when it is not already on disk. "
+                                      "That download failed.")
                                   .arg(serial));
         return 1;
     }

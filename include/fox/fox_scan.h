@@ -1,7 +1,7 @@
 #ifndef FOX_SCAN_H
 #define FOX_SCAN_H
 
-#include "fox_calib.h"
+#include "fox/fox_calib.h"
 
 #include <stddef.h>
 #include <stdint.h>

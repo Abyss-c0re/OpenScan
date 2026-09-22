@@ -1,4 +1,4 @@
-#include "fox_calib.h"
+#include "fox/fox_calib.h"
 
 #include <ctype.h>
 #include <stdio.h>
