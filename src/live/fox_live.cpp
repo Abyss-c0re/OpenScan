@@ -1534,7 +1534,7 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
                 cv::Vec3f pa(t[0]->x, t[0]->y, t[0]->z - bump_mm * t[0]->bump);
                 cv::Vec3f pb(t[1]->x, t[1]->y, t[1]->z - bump_mm * t[1]->bump);
                 cv::Vec3f pc(t[2]->x, t[2]->y, t[2]->z - bump_mm * t[2]->bump);
-                if (cv::norm(pa - pb) > 16.f || cv::norm(pa - pc) > 16.f || cv::norm(pb - pc) > 16.f)
+                if (cv::norm(pa - pb) > 28.f || cv::norm(pa - pc) > 28.f || cv::norm(pb - pc) > 28.f)
                     continue;
                 cv::Vec3f nrm = (pb - pa).cross(pc - pa);
                 float ln = std::sqrt(nrm.dot(nrm));
@@ -1838,7 +1838,7 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
                 hi = std::max(hi, row[xx]);
             }
         }
-        if (n < 2 || hi - lo > 12.f) return false;
+        if (n < 1) return false;
         z = acc / (float)n;
         return true;
     };
@@ -1861,6 +1861,41 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
                 nok++;
             }
             grid[(size_t)iy * gw + ix] = v;
+        }
+    }
+    for (int pass = 0; pass < 8; pass++) {
+        std::vector<ShadeVert> prev = grid;
+        for (int iy = 1; iy < gh - 1; iy++) {
+            int y = std::min(gray.rows - 1, iy * ystep);
+            for (int ix = 1; ix < gw - 1; ix++) {
+                size_t id = (size_t)iy * gw + ix;
+                if (prev[id].ok) continue;
+                int x = std::min(gray.cols - 1, ix * xstep);
+                if (!mask.at<uint8_t>(y, x)) continue;
+                float acc = 0.f, lo = 1e9f, hi = -1e9f;
+                int n = 0;
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        const ShadeVert &nb = prev[(size_t)(iy + dy) * gw + (ix + dx)];
+                        if (!nb.ok) continue;
+                        acc += nb.z;
+                        lo = std::min(lo, nb.z);
+                        hi = std::max(hi, nb.z);
+                        n++;
+                    }
+                }
+                if (n < 3 || hi - lo > 30.f) continue;
+                float z = acc / (float)n;
+                ShadeVert v{0, 0, 0, 0, 0, false};
+                v.x = (x - cxr) * z / fx;
+                v.y = -((y - cyr) * z / fy);
+                v.z = z;
+                v.albedo = gray.at<uint8_t>(y, x) / 255.f;
+                v.ok = true;
+                grid[id] = v;
+                if (z > z_far) z_far = z;
+                nok++;
+            }
         }
     }
     /* Stripe noise becomes spikes when the surface is seen from the side.
@@ -2221,6 +2256,10 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
      * 1 = a few millimetres off, ignore it or it becomes a second skin.
      * 2 = far from the model, this is new surface. */
     auto classify = [&](const cv::Vec3f &w, uint64_t &k) -> int {
+        if (!measured) {
+            k = key_of_point(w);
+            return 2;
+        }
         if (L->cloud.size() >= 80) {
             int id = 0;
             if (nearest_model(L, w, id)) {
@@ -2292,7 +2331,8 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
         cv::Vec3f mid = (w[0] + w[1] + w[2]) * (1.f / 3.f);
         uint64_t ck = 0;
         int kind = classify(mid, ck);
-        if (kind != 2 || L->seen_cells.count(ck)) continue;
+        if (L->seen_cells.count(ck)) continue;
+        if (measured && kind != 2) continue;
         fresh.insert(ck);
         fox_live::TriRef ref;
         ref.bin = bin_of(mid[0] - L->axis0[0], mid[2] - L->axis0[2]);
@@ -2308,7 +2348,7 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
     for (auto &wd : L->wedge) wd.tris.clear();
     for (const fox_live::TriRef &ref : L->refs) {
         if (ref.bin < 0 || ref.bin >= kBins) continue;
-        if (cv::norm(ref.p[0] - ref.p[1]) > 14.f || cv::norm(ref.p[0] - ref.p[2]) > 14.f) continue;
+        if (cv::norm(ref.p[0] - ref.p[1]) > 28.f || cv::norm(ref.p[0] - ref.p[2]) > 28.f) continue;
         L->wedge[(size_t)ref.bin].tris.push_back(Tri{ref.p[0], ref.p[1], ref.p[2], ref.tone});
         L->wedge[(size_t)ref.bin].filled = 1;
     }
@@ -2633,7 +2673,7 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     float yaw_deg = live->yaw * (180.f / 3.14159265f);
     float pitch_deg = live->pitch * (180.f / 3.14159265f);
     int measured = live->shape == FOX_SHAPE_MEASURED;
-    int shade_live = measured || (live->mode == FOX_MODE_STOP && live->scanned_bins == 0);
+    int shade_live = 1;
     BodyView body = make_body(*use_b, A, &live->calib, bfx, bfy, bcx, bcy, yaw_deg, pitch_deg,
                               live->dist, live->user_zoom, shade_live, live->distance_mm, live->shape);
     live->locked = 1;
@@ -2652,6 +2692,12 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
         } else if (trk == 0) {
             if (live->mode == FOX_MODE_SCAN) live->lost++;
             st.tracking = 0;
+            /* Mold still keeps the solid of this frame. Measured waits until
+             * the turn is known, so a lost frame is not pasted on the wrong side. */
+            if (!measured && live->mode == FOX_MODE_SCAN) {
+                fuse_shell(live, body, 0);
+                live->fused++;
+            }
         } else if (live->mode == FOX_MODE_SCAN) {
             /* Measured aligns this depth surface to the model and adds the
              * new part. A view that does not land is dropped. Mold always

@@ -2,6 +2,11 @@
 
 Versions follow [semantic versioning](https://semver.org). The number in the window title, `fox3d --version`, and the git tag `vX.Y.Z` are the same version. Nothing before 0.5.0 was tagged.
 
+## 0.6.5
+
+- Mold builds the solid again, including when a turn is not measured on that frame. Orbiting the view shows one skull-shaped object.
+- Measured closes the holes in the nose and cheek and keeps the eyes, nose, and teeth. The 3D view stays on screen.
+
 ## 0.6.4
 
 - A turn is measured from the depth of the surface and from several patches of the picture. One failed patch no longer drops the frame, and the window stays on the object.
