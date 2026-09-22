@@ -2,6 +2,11 @@
 
 Versions follow [semantic versioning](https://semver.org). The number in the window title, `fox3d --version`, and the git tag `vX.Y.Z` are the same version. Nothing before 0.5.0 was tagged.
 
+## 0.6.1
+
+- Mold and Measured are separate scan modes, chosen on the toolbar. Mold is the solid body and is the default. Measured is the stripe surface facing the camera.
+- Measured no longer spins each new frame around the object. That pile of sheets was the mess when the model was rotated. Mold still turns as one solid.
+
 ## 0.6.0
 
 - The live surface is the projector's light planes from the factory calibration. Each stripe is intersected with its plane. The outline is no longer revolved into a cylinder.

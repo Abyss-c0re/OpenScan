@@ -520,6 +520,7 @@ struct fox_live {
     cv::Vec3f pose_t = cv::Vec3f(0, 0, 0);
     float pose_s = 1.f;
     float distance_mm = 220.f;
+    int shape = FOX_SHAPE_MOLD;
     int covered = 0;
     int tracked_frames = 0;
     std::vector<Tri> shell;
@@ -670,14 +671,71 @@ void fox_live_set_mode(fox_live *live, int mode) {
     live->mode = mode;
 }
 
+void fox_live_set_shape(fox_live *live, int shape) {
+    if (!live) return;
+    if (shape != FOX_SHAPE_MEASURED) shape = FOX_SHAPE_MOLD;
+    if (live->shape == shape) return;
+    int mode = live->mode;
+    float dist_mm = live->distance_mm;
+    float yaw = live->yaw;
+    float pitch = live->pitch;
+    float dist = live->dist;
+    int zoom = live->user_zoom;
+    fox_live_reset(live);
+    live->shape = shape;
+    live->mode = mode;
+    live->distance_mm = dist_mm;
+    live->yaw = yaw;
+    live->pitch = pitch;
+    live->dist = dist;
+    live->user_zoom = zoom;
+}
+
+int fox_live_shape(const fox_live *live) {
+    return live ? live->shape : FOX_SHAPE_MOLD;
+}
+
+static uint64_t voxel_key(int ix, int iy, int iz);
+
 void fox_live_set_distance_mm(fox_live *live, float mm) {
     if (!live) return;
     if (mm < 80.f) mm = 80.f;
     if (mm > 500.f) mm = 500.f;
-    /* The stripes are identified at this range. The surface itself is
-     * measured, so the slider does not rescale a model that already exists.
-     * Reset and scan again after changing it. */
+    float old = live->distance_mm > 1.f ? live->distance_mm : mm;
+    float k = old > 1.f ? mm / old : 1.f;
     live->distance_mm = mm;
+    /* Measured depth is already in millimetres. Scaling it would lie.
+     * Mold size is the working distance, so the solid grows with the slider. */
+    if (live->shape != FOX_SHAPE_MOLD) return;
+    if (k < 0.995f || k > 1.005f) {
+        auto scale_p = [k](cv::Vec3f &p) { p *= k; };
+        if (live->have_axis) scale_p(live->axis0);
+        live->radius_mm *= k;
+        if (live->span_y0 < 1e8f && live->span_y1 > live->span_y0) {
+            live->span_y0 *= k;
+            live->span_y1 *= k;
+        }
+        for (auto &kv : live->cells) scale_p(kv.second.p);
+        for (auto &ref : live->refs)
+            for (int i = 0; i < 3; i++) scale_p(ref.p[i]);
+        for (auto &wd : live->wedge)
+            for (Tri &t : wd.tris) {
+                scale_p(t.a);
+                scale_p(t.b);
+                scale_p(t.c);
+            }
+        for (cv::Vec3f &p : live->cloud) scale_p(p);
+        scale_p(live->pose_t);
+        live->vox.clear();
+        const float voxel = 2.5f;
+        for (size_t i = 0; i < live->cloud.size(); i++) {
+            const cv::Vec3f &p = live->cloud[i];
+            int ix = (int)std::floor(p[0] / voxel);
+            int iy = (int)std::floor(p[1] / voxel);
+            int iz = (int)std::floor(p[2] / voxel);
+            live->vox.emplace(voxel_key(ix, iy, iz), (uint32_t)i);
+        }
+    }
 }
 
 float fox_live_distance_mm(const fox_live *live) {
@@ -690,6 +748,7 @@ int fox_live_points(const fox_live *live) {
     int n = 0;
     for (const auto &w : live->wedge) n += (int)w.tris.size();
     if (n > 0) return n;
+    if (live->shell.size() >= 80) return (int)live->shell.size();
     return (int)live->cloud.size();
 }
 int fox_live_take_save(fox_live *live) {
@@ -1511,7 +1570,7 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
 
 static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const fox_calib *cal,
                           float fx, float fy, float cx, float cy, float yaw_deg, float pitch_deg,
-                          float &dist, int user_zoom, int shade_live, float z_mm) {
+                          float &dist, int user_zoom, int shade_live, float z_mm, int shape) {
     BodyView body;
     if (sensor.empty() || fx < 50.f) return body;
     cv::Mat gray;
@@ -1557,6 +1616,87 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
             body.camera.at<cv::Vec3b>(y, x1) = cv::Vec3b(70, 220, 90);
     }
 
+    int gw = 2;
+    int gh = 2;
+    std::vector<ShadeVert> grid;
+    if (shape != FOX_SHAPE_MEASURED) {
+        cv::Mat mid, wide;
+        cv::GaussianBlur(gray, mid, cv::Size(0, 0), std::max(2.f, 7.f * rel));
+        cv::GaussianBlur(gray, wide, cv::Size(0, 0), std::max(6.f, 26.f * rel));
+        int ystep = std::max(2, (int)std::lround(3.f * rel));
+        gh = (gray.rows + ystep - 1) / ystep;
+        gw = 112;
+        grid.assign((size_t)gw * gh, ShadeVert{});
+        const float th_max = 1.40f;
+        const float sin_max = std::sin(th_max);
+        for (int iy = 0; iy < gh; iy++) {
+            int y = std::min(gray.rows - 1, iy * ystep);
+            float half = 0.5f * (right[y] - left[y]);
+            float mid_x = 0.5f * (right[y] + left[y]);
+            bool row = left[y] >= 0.f && right[y] >= 0.f && half > 8.f;
+            for (int ix = 0; ix < gw; ix++) {
+                ShadeVert v{0, 0, 0, 0, 0, false};
+                if (row) {
+                    float u = -1.f + 2.f * (float)ix / (float)(gw - 1);
+                    float th = u * th_max;
+                    float x_geom = mid_x + half * (std::sin(th) / sin_max);
+                    int x = (int)std::lround(x_geom);
+                    x = std::max(0, std::min(gray.cols - 1, x));
+                    float hf = (float)gray.at<uint8_t>(y, x) - (float)mid.at<uint8_t>(y, x);
+                    float br = (float)mid.at<uint8_t>(y, x) - (float)wide.at<uint8_t>(y, x);
+                    float bump = (hf * 0.55f + br * 0.35f) / 22.f;
+                    bump = std::max(-1.f, std::min(1.f, bump));
+                    float radius = half * z0 / fx;
+                    v.x = (x_geom - cxr) * z0 / fx;
+                    v.y = -((y - cyr) * z0 / fy);
+                    v.z = z0 - radius * std::cos(th);
+                    v.bump = bump;
+                    v.albedo = gray.at<uint8_t>(y, x) / 255.f;
+                    v.ok = true;
+                }
+                grid[(size_t)iy * gw + ix] = v;
+            }
+        }
+        std::vector<float> sm(grid.size(), 0.f);
+        for (int y = 0; y < gh; y++) {
+            for (int x = 0; x < gw; x++) {
+                float s = 0, w = 0;
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dx = -2; dx <= 2; dx++) {
+                        int yy = y + dy, xx = x + dx;
+                        if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
+                        const ShadeVert &nb = grid[(size_t)yy * gw + xx];
+                        if (!nb.ok) continue;
+                        float wt = std::exp(-(dx * dx + dy * dy) / 3.f);
+                        s += wt * nb.bump;
+                        w += wt;
+                    }
+                }
+                sm[(size_t)y * gw + x] = w > 0.f ? s / w : 0.f;
+            }
+        }
+        for (size_t i = 0; i < grid.size(); i++)
+            if (grid[i].ok) grid[i].bump = sm[i];
+        std::vector<float> zcopy(grid.size());
+        for (size_t i = 0; i < grid.size(); i++) zcopy[i] = grid[i].z;
+        for (int iy = 0; iy < gh; iy++) {
+            for (int ix = 0; ix < gw; ix++) {
+                ShadeVert &v = grid[(size_t)iy * gw + ix];
+                if (!v.ok) continue;
+                float s = 0, w = 0;
+                for (int dy = -5; dy <= 5; dy++) {
+                    int yy = iy + dy;
+                    if (yy < 0 || yy >= gh) continue;
+                    const ShadeVert &nb = grid[(size_t)yy * gw + ix];
+                    if (!nb.ok) continue;
+                    float wt = std::exp(-(float)(dy * dy) / 10.f);
+                    s += wt * zcopy[(size_t)yy * gw + ix];
+                    w += wt;
+                }
+                if (w > 0.f) v.z = s / w;
+            }
+        }
+    } else {
     cv::Mat depth(gray.rows, gray.cols, CV_32F, cv::Scalar(0));
     cv::Mat depth_n(gray.rows, gray.cols, CV_32F, cv::Scalar(0));
     if (cal && cal->nplanes >= 8 && !pattern.empty() && pattern.type() == CV_8UC1 &&
@@ -1655,9 +1795,9 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
 
     int xstep = std::max(4, (int)std::lround(5.f * rel));
     int ystep = std::max(3, (int)std::lround(4.f * rel));
-    int gw = std::max(2, (gray.cols + xstep - 1) / xstep);
-    int gh = std::max(2, (gray.rows + ystep - 1) / ystep);
-    std::vector<ShadeVert> grid((size_t)gw * gh);
+    gw = std::max(2, (gray.cols + xstep - 1) / xstep);
+    gh = std::max(2, (gray.rows + ystep - 1) / ystep);
+    grid.assign((size_t)gw * gh, ShadeVert{});
     double sx3 = 0, sy3 = 0;
     float z_far = 0.f;
     int nok = 0;
@@ -1712,11 +1852,42 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
             grid[(size_t)iy * gw + ix] = v;
         }
     }
+    /* Stripe noise becomes spikes when the surface is seen from the side.
+     * Smooth depth, and keep each point on its camera ray. */
+    {
+        std::vector<float> zcopy(grid.size());
+        for (size_t i = 0; i < grid.size(); i++) zcopy[i] = grid[i].z;
+        for (int iy = 0; iy < gh; iy++) {
+            for (int ix = 0; ix < gw; ix++) {
+                ShadeVert &v = grid[(size_t)iy * gw + ix];
+                if (!v.ok || v.z < 40.f) continue;
+                float s = 0.f, w = 0.f;
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dx = -2; dx <= 2; dx++) {
+                        int yy = iy + dy, xx = ix + dx;
+                        if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
+                        const ShadeVert &nb = grid[(size_t)yy * gw + xx];
+                        if (!nb.ok) continue;
+                        float wt = std::exp(-(dx * dx + dy * dy) / 2.5f);
+                        s += wt * zcopy[(size_t)yy * gw + xx];
+                        w += wt;
+                    }
+                }
+                if (w <= 0.f) continue;
+                float z = s / w;
+                float scale = z / v.z;
+                v.x *= scale;
+                v.y *= scale;
+                v.z = z;
+            }
+        }
+    }
     if (nok > 40) {
         /* The turn axis sits just behind the measured shell. Putting it in
          * the surface makes the front and back of a few millimetres of relief
          * count as opposite sides of the object. */
         body.axis = cv::Vec3f((float)(sx3 / nok), (float)(sy3 / nok), z_far + 8.f);
+    }
     }
 
     const float bump_mm = 1.8f;
@@ -1725,7 +1896,8 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
         body.side.create(gray.rows, gray.cols, CV_8UC3);
         render_body(grid, gw, gh, body.solid, yaw_deg, pitch_deg, bump_mm, &dist, user_zoom);
         float ignored = 0;
-        render_body(grid, gw, gh, body.side, 78.f, -8.f, bump_mm, &ignored, 0);
+        float side_yaw = shape == FOX_SHAPE_MEASURED ? 32.f : 78.f;
+        render_body(grid, gw, gh, body.side, side_yaw, -8.f, bump_mm, &ignored, 0);
     } else {
         (void)yaw_deg;
         (void)pitch_deg;
@@ -2169,7 +2341,7 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     cv::Mat hero(hero_h, hero_w, CV_8UC3, cv::Scalar(12, 12, 12));
     cv::Mat solid = body.solid;
     cv::Mat model;
-    if (L->scanned_bins > 0) {
+    if (L->shape != FOX_SHAPE_MEASURED && L->scanned_bins > 0) {
         model.create(view_h, view_w, CV_8UC3);
         render_model(L, model);
         solid = model;
@@ -2338,9 +2510,10 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
      * undistorted above and turned upright inside make_body. */
     float yaw_deg = live->yaw * (180.f / 3.14159265f);
     float pitch_deg = live->pitch * (180.f / 3.14159265f);
-    int shade_live = live->mode == FOX_MODE_STOP && live->scanned_bins == 0;
+    int measured = live->shape == FOX_SHAPE_MEASURED;
+    int shade_live = measured || (live->mode == FOX_MODE_STOP && live->scanned_bins == 0);
     BodyView body = make_body(*use_b, A, &live->calib, bfx, bfy, bcx, bcy, yaw_deg, pitch_deg,
-                              live->dist, live->user_zoom, shade_live, live->distance_mm);
+                              live->dist, live->user_zoom, shade_live, live->distance_mm, live->shape);
     live->locked = 1;
 
     auto t1 = std::chrono::steady_clock::now();
@@ -2348,7 +2521,14 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     st.valid_pixels = (int)body.P.size();
     st.median_mm = body.median_mm;
 
-    if (live->mode == FOX_MODE_SCAN || live->mode == FOX_MODE_PAUSE) {
+    if (measured) {
+        /* A measured face is one surface. Spinning each new frame around Y
+         * stacks sheets through each other, which is the mess when it turns. */
+        live->shell = body.tris;
+        live->last_track = body.P.size() >= 80 ? 1 : -1;
+        st.tracking = live->last_track;
+        if (live->mode == FOX_MODE_SCAN && body.tris.size() >= 80) live->fused = 1;
+    } else if (live->mode == FOX_MODE_SCAN || live->mode == FOX_MODE_PAUSE) {
         float response = 0.f;
         int trk = track_spin(live, body, response);
         live->last_track = trk;
@@ -2373,25 +2553,30 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     st.fused = live->fused;
     st.lost = live->lost;
     st.mode = live->mode;
-    st.points = model_tris(live);
-    st.scanned_deg = (int)std::lround(live->scanned_bins * (360.0 / kBins));
+    st.points = measured ? (int)live->shell.size() : model_tris(live);
+    st.scanned_deg = measured ? 0 : (int)std::lround(live->scanned_bins * (360.0 / kBins));
     st.detail = std::max(1, live->detail);
     const char *mode_name = live->mode == FOX_MODE_SCAN ? "SCANNING" :
                             live->mode == FOX_MODE_PAUSE ? "PAUSED" : "STOPPED";
+    const char *shape_name = measured ? "MEASURED" : "MOLD";
     const char *lost = (live->mode == FOX_MODE_SCAN && st.tracking == 0) ? "   TRACKING LOST" : "";
     float height_mm = (live->span_y1 > live->span_y0 && live->span_y0 < 1e8f)
                           ? live->span_y1 - live->span_y0 : 0.f;
     float width_mm = live->have_axis ? live->radius_mm * 2.f : 0.f;
     if (width_mm > 1.f && height_mm > 1.f)
         snprintf(live->line1, sizeof live->line1,
-                 "%s   %.0f mm away   model %.0f x %.0f mm   scanned %d°   detail x%d   %d tris%s",
-                 mode_name, live->distance_mm, width_mm, height_mm, st.scanned_deg, st.detail,
-                 st.points, lost);
+                 "%s   %s   %.0f mm away   model %.0f x %.0f mm   scanned %d°   detail x%d   %d tris%s",
+                 shape_name, mode_name, live->distance_mm, width_mm, height_mm, st.scanned_deg,
+                 st.detail, st.points, lost);
+    else if (measured)
+        snprintf(live->line1, sizeof live->line1,
+                 "%s   %s   %.0f mm away   visible surface   %d tris",
+                 shape_name, mode_name, live->distance_mm, st.points);
     else
         snprintf(live->line1, sizeof live->line1,
-                 "%s   %.0f mm away   scanned %d°   not scanned %d°   detail x%d   %d tris%s",
-                 mode_name, live->distance_mm, st.scanned_deg, 360 - st.scanned_deg, st.detail,
-                 st.points, lost);
+                 "%s   %s   %.0f mm away   scanned %d°   not scanned %d°   detail x%d   %d tris%s",
+                 shape_name, mode_name, live->distance_mm, st.scanned_deg, 360 - st.scanned_deg,
+                 st.detail, st.points, lost);
     paint_preview(live, *use_a, *use_b, body);
     if (status) *status = st;
     return 0;

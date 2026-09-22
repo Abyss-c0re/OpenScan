@@ -34,7 +34,8 @@ The camera and size controls are open under the toolbar when the app starts. **S
 | Camera A gain | Leave this low. High gain washes out the projector dots. |
 | Camera B exposure | Lower it when the clean camera is white. |
 | Camera B gain | Usually a little lower than camera A. |
-| Distance | How far the scanner is from the object, 100–500 mm. This identifies which projector stripe is which. The surface is measured in millimetres from those stripes. Reset and scan again after changing it. The Fox is meant to work around 200–400 mm. |
+| Mold / Measured | Mold is the solid body, and the mode that opens. Measured is the stripe surface facing the camera. Switching clears the model. |
+| Distance | How far the scanner is from the object, 100–500 mm. Mold uses it as the size of the solid. Measured uses it to identify the stripes. Reset and scan again after changing it. The Fox is meant to work around 200–400 mm. |
 | Defaults | Camera A 22 / gain 6, camera B 16 / gain 4, distance 220 mm. |
 
 A starting point that has shown the object clearly is A 22 / gain 6 and B 16 / gain 4, at about 220 mm. Keep the whole object in the camera, including the top. A part that leaves the frame is missing from the model.

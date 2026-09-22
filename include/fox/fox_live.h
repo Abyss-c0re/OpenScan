@@ -18,6 +18,11 @@ typedef struct fox_live fox_live;
 #define FOX_MODE_SCAN  1
 #define FOX_MODE_PAUSE 2
 
+/* Mold is the solid body that stays one object when it is turned.
+ * Measured is the stripe surface facing the camera, and only that surface. */
+#define FOX_SHAPE_MOLD     0
+#define FOX_SHAPE_MEASURED 1
+
 typedef struct fox_live_status {
     int fused;          /* frames integrated into the model */
     int lost;           /* frames where tracking did not lock */
@@ -48,8 +53,12 @@ void fox_live_reset(fox_live *live);
 void fox_live_set_mode(fox_live *live, int mode);
 int fox_live_mode(const fox_live *live);
 
-/* Working distance in millimetres. This identifies the projector stripes.
- * Reset and scan again after changing it. The mesh is the measured surface. */
+/* FOX_SHAPE_MOLD or FOX_SHAPE_MEASURED. Switching clears the current model. */
+void fox_live_set_shape(fox_live *live, int shape);
+int fox_live_shape(const fox_live *live);
+
+/* Working distance in millimetres. In Mold this is the size of the model.
+ * In Measured it identifies the projector stripes. Reset after changing it. */
 void fox_live_set_distance_mm(fox_live *live, float mm);
 float fox_live_distance_mm(const fox_live *live);
 int fox_live_points(const fox_live *live);

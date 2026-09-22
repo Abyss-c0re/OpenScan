@@ -115,12 +115,26 @@ public:
         stop = new QPushButton("Stop");
         reset = new QPushButton("Reset");
         settings_btn = new QPushButton("Settings");
+        mold_btn = new QPushButton("Mold");
+        measured_btn = new QPushButton("Measured");
         exp = new QPushButton("Export…");
         start->setObjectName("start");
         settings_btn->setObjectName("settings");
         settings_btn->setCheckable(true);
         settings_btn->setChecked(true);
+        mold_btn->setObjectName("shape");
+        measured_btn->setObjectName("shape");
+        mold_btn->setCheckable(true);
+        measured_btn->setCheckable(true);
         exp->setObjectName("export");
+        int saved_shape = QSettings("fox3d", "fox3d").value("shape", FOX_SHAPE_MOLD).toInt();
+        if (saved_shape != FOX_SHAPE_MEASURED) saved_shape = FOX_SHAPE_MOLD;
+        fox_live_set_shape(live, saved_shape);
+        mold_btn->setChecked(saved_shape == FOX_SHAPE_MOLD);
+        measured_btn->setChecked(saved_shape == FOX_SHAPE_MEASURED);
+        mold_btn->setToolTip("Solid molding model. It stays one object when you turn it or orbit the view.");
+        measured_btn->setToolTip("The surface the stripes measured on the side facing the camera. "
+                                 "Turning updates that view. It does not spin copies into a pile.");
 
         auto *tools = new QHBoxLayout;
         tools->setContentsMargins(12, 10, 12, 6);
@@ -129,6 +143,8 @@ public:
         tools->addWidget(pause);
         tools->addWidget(stop);
         tools->addWidget(reset);
+        tools->addWidget(mold_btn);
+        tools->addWidget(measured_btn);
         tools->addWidget(settings_btn);
         tools->addStretch(1);
         tools->addWidget(exp);
@@ -174,6 +190,22 @@ public:
         });
         connect(exp, &QPushButton::clicked, this, [this] { export_mesh(); });
         connect(settings_btn, &QPushButton::toggled, settings, &QWidget::setVisible);
+        connect(mold_btn, &QPushButton::clicked, this, [this] {
+            mold_btn->setChecked(true);
+            measured_btn->setChecked(false);
+            if (fox_live_shape(live) == FOX_SHAPE_MOLD) return;
+            fox_live_set_shape(live, FOX_SHAPE_MOLD);
+            QSettings("fox3d", "fox3d").setValue("shape", FOX_SHAPE_MOLD);
+            statusBar()->showMessage(serial + "   mold   model cleared");
+        });
+        connect(measured_btn, &QPushButton::clicked, this, [this] {
+            measured_btn->setChecked(true);
+            mold_btn->setChecked(false);
+            if (fox_live_shape(live) == FOX_SHAPE_MEASURED) return;
+            fox_live_set_shape(live, FOX_SHAPE_MEASURED);
+            QSettings("fox3d", "fox3d").setValue("shape", FOX_SHAPE_MEASURED);
+            statusBar()->showMessage(serial + "   measured   model cleared");
+        });
 
         refresh_buttons();
         timer = new QTimer(this);
@@ -266,9 +298,8 @@ private:
                 "Camera B is the clean view. Lower this if the object is blown out white.");
         add_row(3, "Camera B gain", gb, gb_n, "Amplifies camera B. Usually lower than camera A.");
         add_row(4, "Distance (mm)", dist, dist_n,
-                "How far the scanner is from the object, used to tell the projector stripes apart. "
-                "The surface is then measured in millimetres. Set this near the real distance, "
-                "then Reset and scan again. The Fox works best around 200–400 mm.");
+                "How far the scanner is from the object. Mold uses this as the size of the solid. "
+                "Measured uses it to tell the projector stripes apart. Reset and scan again after changing it.");
         ea_n->setText(exposure_text(ea->value()));
         eb_n->setText(exposure_text(eb->value()));
 
@@ -313,9 +344,8 @@ private:
         dist_n->setText(QString("%1 mm").arg(dist->value()));
 
         auto *hint = new QLabel(
-            "Camera changes apply immediately and are kept for the next launch. "
-            "Distance is how far the object is. It identifies the stripes. "
-            "Reset and scan again after changing it.");
+            "Mold is the solid you can turn. Measured is the stripe surface facing the camera. "
+            "Switching clears the model. Distance is kept for the next launch.");
         hint->setWordWrap(true);
         grid->addWidget(hint, 5, 0, 1, 2);
         auto *defaults = new QPushButton("Defaults");
@@ -404,6 +434,8 @@ private:
     QPushButton *stop = nullptr;
     QPushButton *reset = nullptr;
     QPushButton *settings_btn = nullptr;
+    QPushButton *mold_btn = nullptr;
+    QPushButton *measured_btn = nullptr;
     QPushButton *exp = nullptr;
     QWidget *settings = nullptr;
     int exp_a = 22, gain_a = 6, exp_b = 16, gain_b = 4;
@@ -426,6 +458,7 @@ static void style_app(QApplication &app) {
         "QPushButton#settings { background: #1d4e8a; border-color: #3d7ec8; }"
         "QPushButton#settings:hover { background: #2460a8; }"
         "QPushButton#settings:checked { background: #163a68; border-color: #8eb7e8; }"
+        "QPushButton#shape:checked { background: #1d4e8a; border-color: #8eb7e8; }"
         "QPushButton#quiet { padding: 4px 12px; font-size: 13px; }"
         "QWidget#settingsPanel { background: #262a30; border-bottom: 1px solid #5c636e; }"
         "QStatusBar { background: #14161a; color: #d0d0d0; }"
