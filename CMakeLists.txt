@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fox3d VERSION 0.5.0 LANGUAGES C CXX)
+project(fox3d VERSION 0.6.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -23,6 +23,7 @@ add_executable(fox3d
     src/calib/fox_calib_fetch.c
     src/scan/fox_scan.cpp
     src/live/fox_live.cpp
+    src/live/fox_oneshot.cpp
     src/app/fox_app.cpp
 )
 

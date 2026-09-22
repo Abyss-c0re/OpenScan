@@ -48,8 +48,8 @@ void fox_live_reset(fox_live *live);
 void fox_live_set_mode(fox_live *live, int mode);
 int fox_live_mode(const fox_live *live);
 
-/* Assumed distance to the object, millimetres. This sets the size of the
- * model. Reset the scan after changing it. */
+/* Working distance in millimetres. This identifies the projector stripes.
+ * Reset and scan again after changing it. The mesh is the measured surface. */
 void fox_live_set_distance_mm(fox_live *live, float mm);
 float fox_live_distance_mm(const fox_live *live);
 int fox_live_points(const fox_live *live);

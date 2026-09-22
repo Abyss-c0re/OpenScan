@@ -34,7 +34,7 @@ The camera and size controls are open under the toolbar when the app starts. **S
 | Camera A gain | Leave this low. High gain washes out the projector dots. |
 | Camera B exposure | Lower it when the clean camera is white. |
 | Camera B gain | Usually a little lower than camera A. |
-| Distance | How far the scanner is from the object, 100–500 mm. This sets the size in millimetres. The model grows or shrinks in the view and in the exported file. It does not add detail. The Fox is meant to work around 200–400 mm. |
+| Distance | How far the scanner is from the object, 100–500 mm. This identifies which projector stripe is which. The surface is measured in millimetres from those stripes. Reset and scan again after changing it. The Fox is meant to work around 200–400 mm. |
 | Defaults | Camera A 22 / gain 6, camera B 16 / gain 4, distance 220 mm. |
 
 A starting point that has shown the object clearly is A 22 / gain 6 and B 16 / gain 4, at about 220 mm. Keep the whole object in the camera, including the top. A part that leaves the frame is missing from the model.

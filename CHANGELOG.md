@@ -2,6 +2,11 @@
 
 Versions follow [semantic versioning](https://semver.org). The number in the window title, `fox3d --version`, and the git tag `vX.Y.Z` are the same version. Nothing before 0.5.0 was tagged.
 
+## 0.6.0
+
+- The live surface is the projector's light planes from the factory calibration. Each stripe is intersected with its plane. The outline is no longer revolved into a cylinder.
+- Distance is the range used to identify the stripes. The mesh is the measured surface, in millimetres. Reset and scan again after changing it.
+
 ## 0.5.0
 
 - The pictures are undistorted with the factory calibration. The side panels are the rectified stereo pair, so a feature sits on the same row in both cameras.

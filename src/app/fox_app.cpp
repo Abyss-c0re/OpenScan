@@ -266,9 +266,9 @@ private:
                 "Camera B is the clean view. Lower this if the object is blown out white.");
         add_row(3, "Camera B gain", gb, gb_n, "Amplifies camera B. Usually lower than camera A.");
         add_row(4, "Distance (mm)", dist, dist_n,
-                "How far the scanner is from the object. This is the size of the model in millimetres. "
-                "The object grows or shrinks in the view and in the exported file. "
-                "It does not add surface detail. The Fox works best around 200–400 mm.");
+                "How far the scanner is from the object, used to tell the projector stripes apart. "
+                "The surface is then measured in millimetres. Set this near the real distance, "
+                "then Reset and scan again. The Fox works best around 200–400 mm.");
         ea_n->setText(exposure_text(ea->value()));
         eb_n->setText(exposure_text(eb->value()));
 
@@ -314,8 +314,8 @@ private:
 
         auto *hint = new QLabel(
             "Camera changes apply immediately and are kept for the next launch. "
-            "Distance changes the size in millimetres: the model grows or shrinks in the view and in the file. "
-            "It does not sharpen the surface.");
+            "Distance is how far the object is. It identifies the stripes. "
+            "Reset and scan again after changing it.");
         hint->setWordWrap(true);
         grid->addWidget(hint, 5, 0, 1, 2);
         auto *defaults = new QPushButton("Defaults");

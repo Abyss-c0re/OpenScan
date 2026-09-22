@@ -1,4 +1,5 @@
 #include "fox/fox_live.h"
+#include "fox/fox_oneshot.h"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/ocl.hpp>
@@ -669,44 +670,14 @@ void fox_live_set_mode(fox_live *live, int mode) {
     live->mode = mode;
 }
 
-static uint64_t voxel_key(int ix, int iy, int iz);
-
 void fox_live_set_distance_mm(fox_live *live, float mm) {
     if (!live) return;
     if (mm < 80.f) mm = 80.f;
     if (mm > 500.f) mm = 500.f;
-    float old = live->distance_mm > 1.f ? live->distance_mm : mm;
-    float k = old > 1.f ? mm / old : 1.f;
+    /* The stripes are identified at this range. The surface itself is
+     * measured, so the slider does not rescale a model that already exists.
+     * Reset and scan again after changing it. */
     live->distance_mm = mm;
-    if (k < 0.995f || k > 1.005f) {
-        auto scale_p = [k](cv::Vec3f &p) { p *= k; };
-        if (live->have_axis) scale_p(live->axis0);
-        live->radius_mm *= k;
-        if (live->span_y0 < 1e8f && live->span_y1 > live->span_y0) {
-            live->span_y0 *= k;
-            live->span_y1 *= k;
-        }
-        for (auto &kv : live->cells) scale_p(kv.second.p);
-        for (auto &ref : live->refs)
-            for (int i = 0; i < 3; i++) scale_p(ref.p[i]);
-        for (auto &wd : live->wedge)
-            for (Tri &t : wd.tris) {
-                scale_p(t.a);
-                scale_p(t.b);
-                scale_p(t.c);
-            }
-        for (cv::Vec3f &p : live->cloud) scale_p(p);
-        scale_p(live->pose_t);
-        live->vox.clear();
-        const float voxel = 2.5f;
-        for (size_t i = 0; i < live->cloud.size(); i++) {
-            const cv::Vec3f &p = live->cloud[i];
-            int ix = (int)std::floor(p[0] / voxel);
-            int iy = (int)std::floor(p[1] / voxel);
-            int iz = (int)std::floor(p[2] / voxel);
-            live->vox.emplace(voxel_key(ix, iy, iz), (uint32_t)i);
-        }
-    }
 }
 
 float fox_live_distance_mm(const fox_live *live) {
@@ -1274,10 +1245,8 @@ static void draw_solid(fox_live *L, cv::Mat &img, const std::vector<SurfTri> &tr
     }
 }
 
-/* Stereo on the projector dots saturates at the search limit, so it never
- * becomes the round body the camera already shows. The solid is that
- * silhouette: nearest on the centre, farther toward the outline, with the
- * facet shading as a couple of millimetres of relief. */
+/* The solid is the light-plane surface of the stripes, in millimetres.
+ * A missing stripe stays a hole. Nothing here is revolved into a tube. */
 struct ShadeVert {
     float x, y, z, bump, albedo;
     bool ok;
@@ -1497,7 +1466,7 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
                 cv::Vec3f pa(t[0]->x, t[0]->y, t[0]->z - bump_mm * t[0]->bump);
                 cv::Vec3f pb(t[1]->x, t[1]->y, t[1]->z - bump_mm * t[1]->bump);
                 cv::Vec3f pc(t[2]->x, t[2]->y, t[2]->z - bump_mm * t[2]->bump);
-                if (cv::norm(pa - pb) > 8.f || cv::norm(pa - pc) > 8.f || cv::norm(pb - pc) > 8.f)
+                if (cv::norm(pa - pb) > 16.f || cv::norm(pa - pc) > 16.f || cv::norm(pb - pc) > 16.f)
                     continue;
                 cv::Vec3f nrm = (pb - pa).cross(pc - pa);
                 float ln = std::sqrt(nrm.dot(nrm));
@@ -1540,9 +1509,9 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
     }
 }
 
-static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, float cy,
-                          float yaw_deg, float pitch_deg, float &dist, int user_zoom,
-                          int shade_live, float z_mm) {
+static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const fox_calib *cal,
+                          float fx, float fy, float cx, float cy, float yaw_deg, float pitch_deg,
+                          float &dist, int user_zoom, int shade_live, float z_mm) {
     BodyView body;
     if (sensor.empty() || fx < 50.f) return body;
     cv::Mat gray;
@@ -1588,86 +1557,166 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
             body.camera.at<cv::Vec3b>(y, x1) = cv::Vec3b(70, 220, 90);
     }
 
-    cv::Mat mid, wide;
-    cv::GaussianBlur(gray, mid, cv::Size(0, 0), std::max(2.f, 7.f * rel));
-    cv::GaussianBlur(gray, wide, cv::Size(0, 0), std::max(6.f, 26.f * rel));
-    int ystep = std::max(2, (int)std::lround(3.f * rel));
-    int gh = (gray.rows + ystep - 1) / ystep;
-    int gw = 112;
+    cv::Mat depth(gray.rows, gray.cols, CV_32F, cv::Scalar(0));
+    cv::Mat depth_n(gray.rows, gray.cols, CV_32F, cv::Scalar(0));
+    if (cal && cal->nplanes >= 8 && !pattern.empty() && pattern.type() == CV_8UC1 &&
+        pattern.cols == gray.cols && pattern.rows == gray.rows) {
+        cv::Mat pat = pattern.isContinuous() ? pattern : pattern.clone();
+        std::vector<fox_shot> shots(24000);
+        int nshot = fox_oneshot_points(pat.ptr<uint8_t>(), pat.cols, pat.rows, cal, z0, shots.data(),
+                                       (int)shots.size());
+        if (nshot > 0 && cal->cam[1].fx > 100.0) {
+            cv::Mat R;
+            cv::Rodrigues(cv::Vec3d(cal->cam[1].rvec[0], cal->cam[1].rvec[1], cal->cam[1].rvec[2]), R);
+            cv::Matx33d Rb(R);
+            cv::Vec3d tb(cal->cam[1].tvec[0], cal->cam[1].tvec[1], cal->cam[1].tvec[2]);
+            cv::Mat allow;
+            cv::dilate(mask, allow,
+                       cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(11, 11)));
+            for (int i = 0; i < nshot; i++) {
+                const fox_shot &s = shots[(size_t)i];
+                cv::Vec3d Xb = Rb * cv::Vec3d(s.x, s.y, s.z) + tb;
+                if (Xb[2] < 40.0 || Xb[2] > 900.0) continue;
+                float u = (float)(fx * Xb[0] / Xb[2] + cx);
+                float v = (float)(fy * Xb[1] / Xb[2] + cy);
+                int xu = (int)std::lround((gray.cols - 1) - u);
+                int yu = (int)std::lround((gray.rows - 1) - v);
+                if (xu < 0 || yu < 0 || xu >= gray.cols || yu >= gray.rows) continue;
+                if (!allow.at<uint8_t>(yu, xu)) continue;
+                depth.at<float>(yu, xu) += (float)Xb[2];
+                depth_n.at<float>(yu, xu) += 1.f;
+            }
+        }
+    }
+    for (int y = 0; y < gray.rows; y++) {
+        float *d = depth.ptr<float>(y);
+        const float *c = depth_n.ptr<float>(y);
+        for (int x = 0; x < gray.cols; x++)
+            if (c[x] > 0.f) d[x] /= c[x];
+    }
+    /* Stripes are a few pixels apart. Fill only that gap, and only inside
+     * the object, so the mesh is a surface instead of loose dots. */
+    const int gap_px = 14;
+    const float gap_mm = 28.f;
+    for (int y = 0; y < gray.rows; y++) {
+        float *d = depth.ptr<float>(y);
+        const uint8_t *m = mask.ptr<uint8_t>(y);
+        int x = 0;
+        while (x < gray.cols) {
+            if (d[x] <= 0.f) {
+                x++;
+                continue;
+            }
+            int a = x;
+            int b = a + 1;
+            while (b < gray.cols && d[b] <= 0.f) b++;
+            if (b < gray.cols && b > a + 1 && b - a - 1 <= gap_px && std::fabs(d[a] - d[b]) <= gap_mm) {
+                bool inside = true;
+                for (int k = a + 1; k < b; k++)
+                    if (!m[k]) inside = false;
+                if (inside) {
+                    for (int k = a + 1; k < b; k++) {
+                        float t = (float)(k - a) / (float)(b - a);
+                        d[k] = (1.f - t) * d[a] + t * d[b];
+                    }
+                }
+            }
+            x = b < gray.cols ? b : gray.cols;
+        }
+    }
+    for (int x = 0; x < gray.cols; x++) {
+        int y = 0;
+        while (y < gray.rows) {
+            if (depth.at<float>(y, x) <= 0.f) {
+                y++;
+                continue;
+            }
+            int a = y;
+            int b = a + 1;
+            while (b < gray.rows && depth.at<float>(b, x) <= 0.f) b++;
+            if (b < gray.rows && b > a + 1 && b - a - 1 <= gap_px &&
+                std::fabs(depth.at<float>(a, x) - depth.at<float>(b, x)) <= gap_mm) {
+                bool inside = true;
+                for (int k = a + 1; k < b; k++)
+                    if (!mask.at<uint8_t>(k, x)) inside = false;
+                if (inside) {
+                    float za = depth.at<float>(a, x);
+                    float zb = depth.at<float>(b, x);
+                    for (int k = a + 1; k < b; k++) {
+                        if (depth.at<float>(k, x) > 0.f) continue;
+                        float t = (float)(k - a) / (float)(b - a);
+                        depth.at<float>(k, x) = (1.f - t) * za + t * zb;
+                    }
+                }
+            }
+            y = b < gray.rows ? b : gray.rows;
+        }
+    }
+
+    int xstep = std::max(4, (int)std::lround(5.f * rel));
+    int ystep = std::max(3, (int)std::lround(4.f * rel));
+    int gw = std::max(2, (gray.cols + xstep - 1) / xstep);
+    int gh = std::max(2, (gray.rows + ystep - 1) / ystep);
     std::vector<ShadeVert> grid((size_t)gw * gh);
-    /* X and Y stay on the camera rays at the working distance, so the centre
-     * being nearer does not shrink the width or the crown. Depth is only Z.
-     * The section runs out to the silhouette, so the side turns away instead
-     * of ending as a cut wall. */
-    const float th_max = 1.40f;
-    const float sin_max = std::sin(th_max);
+    double sx3 = 0, sy3 = 0;
+    float z_far = 0.f;
+    int nok = 0;
+    /* Dots do not land on every pixel. A grid point uses the stripes within
+     * a few pixels, and is left empty where those stripes disagree. */
+    auto sample_z = [&](int x, int y, float &z) -> bool {
+        if (!mask.at<uint8_t>(y, x)) return false;
+        if (depth.at<float>(y, x) > 40.f) {
+            z = depth.at<float>(y, x);
+            return true;
+        }
+        const int rad = 11;
+        float sw = 0.f, sz = 0.f, zlo = 1e9f, zhi = -1e9f;
+        int nnear = 0;
+        for (int dy = -rad; dy <= rad; dy++) {
+            int yy = y + dy;
+            if (yy < 0 || yy >= gray.rows) continue;
+            const float *d = depth.ptr<float>(yy);
+            for (int dx = -rad; dx <= rad; dx++) {
+                int xx = x + dx;
+                if (xx < 0 || xx >= gray.cols || d[xx] <= 40.f) continue;
+                float w = 1.f / (1.f + (float)(dx * dx + dy * dy));
+                sw += w;
+                sz += w * d[xx];
+                zlo = std::min(zlo, d[xx]);
+                zhi = std::max(zhi, d[xx]);
+                nnear++;
+            }
+        }
+        if (nnear < 2 || sw <= 0.f || zhi - zlo > 30.f) return false;
+        z = sz / sw;
+        return true;
+    };
     for (int iy = 0; iy < gh; iy++) {
         int y = std::min(gray.rows - 1, iy * ystep);
-        float half = 0.5f * (right[y] - left[y]);
-        float mid_x = 0.5f * (right[y] + left[y]);
-        bool row = left[y] >= 0.f && right[y] >= 0.f && half > 8.f;
         for (int ix = 0; ix < gw; ix++) {
+            int x = std::min(gray.cols - 1, ix * xstep);
+            float z = 0.f;
             ShadeVert v{0, 0, 0, 0, 0, false};
-            if (row) {
-                float u = -1.f + 2.f * (float)ix / (float)(gw - 1);
-                float th = u * th_max;
-                float x_geom = mid_x + half * (std::sin(th) / sin_max);
-                int x = (int)std::lround(x_geom);
-                x = std::max(0, std::min(gray.cols - 1, x));
-                float hf = (float)gray.at<uint8_t>(y, x) - (float)mid.at<uint8_t>(y, x);
-                float br = (float)mid.at<uint8_t>(y, x) - (float)wide.at<uint8_t>(y, x);
-                float bump = (hf * 0.55f + br * 0.35f) / 22.f;
-                bump = std::max(-1.f, std::min(1.f, bump));
-                float radius = half * z0 / fx;
-                v.x = (x_geom - cxr) * z0 / fx;
-                v.y = -((y - cyr) * z0 / fy);
-                v.z = z0 - radius * std::cos(th);
-                v.bump = bump;
+            if (sample_z(x, y, z)) {
+                v.x = (x - cxr) * z / fx;
+                v.y = -((y - cyr) * z / fy);
+                v.z = z;
+                v.bump = 0.f;
                 v.albedo = gray.at<uint8_t>(y, x) / 255.f;
                 v.ok = true;
+                sx3 += v.x;
+                sy3 += v.y;
+                if (v.z > z_far) z_far = v.z;
+                nok++;
             }
             grid[(size_t)iy * gw + ix] = v;
         }
     }
-    std::vector<float> sm(grid.size(), 0.f);
-    for (int y = 0; y < gh; y++) {
-        for (int x = 0; x < gw; x++) {
-            float s = 0, w = 0;
-            for (int dy = -2; dy <= 2; dy++) {
-                for (int dx = -2; dx <= 2; dx++) {
-                    int yy = y + dy, xx = x + dx;
-                    if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
-                    const ShadeVert &nb = grid[(size_t)yy * gw + xx];
-                    if (!nb.ok) continue;
-                    float wt = std::exp(-(dx * dx + dy * dy) / 3.f);
-                    s += wt * nb.bump;
-                    w += wt;
-                }
-            }
-            sm[(size_t)y * gw + x] = w > 0.f ? s / w : 0.f;
-        }
-    }
-    for (size_t i = 0; i < grid.size(); i++)
-        if (grid[i].ok) grid[i].bump = sm[i];
-    /* Row-to-row depth steps read as horizontal ridges. Blur Z down the column. */
-    std::vector<float> zcopy(grid.size());
-    for (size_t i = 0; i < grid.size(); i++) zcopy[i] = grid[i].z;
-    for (int iy = 0; iy < gh; iy++) {
-        for (int ix = 0; ix < gw; ix++) {
-            ShadeVert &v = grid[(size_t)iy * gw + ix];
-            if (!v.ok) continue;
-            float s = 0, w = 0;
-            for (int dy = -5; dy <= 5; dy++) {
-                int yy = iy + dy;
-                if (yy < 0 || yy >= gh) continue;
-                const ShadeVert &nb = grid[(size_t)yy * gw + ix];
-                if (!nb.ok) continue;
-                float wt = std::exp(-(float)(dy * dy) / 10.f);
-                s += wt * zcopy[(size_t)yy * gw + ix];
-                w += wt;
-            }
-            if (w > 0.f) v.z = s / w;
-        }
+    if (nok > 40) {
+        /* The turn axis sits just behind the measured shell. Putting it in
+         * the surface makes the front and back of a few millimetres of relief
+         * count as opposite sides of the object. */
+        body.axis = cv::Vec3f((float)(sx3 / nok), (float)(sy3 / nok), z_far + 8.f);
     }
 
     const float bump_mm = 1.8f;
@@ -2290,8 +2339,8 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     float yaw_deg = live->yaw * (180.f / 3.14159265f);
     float pitch_deg = live->pitch * (180.f / 3.14159265f);
     int shade_live = live->mode == FOX_MODE_STOP && live->scanned_bins == 0;
-    BodyView body = make_body(*use_b, bfx, bfy, bcx, bcy, yaw_deg, pitch_deg, live->dist, live->user_zoom,
-                              shade_live, live->distance_mm);
+    BodyView body = make_body(*use_b, A, &live->calib, bfx, bfy, bcx, bcy, yaw_deg, pitch_deg,
+                              live->dist, live->user_zoom, shade_live, live->distance_mm);
     live->locked = 1;
 
     auto t1 = std::chrono::steady_clock::now();

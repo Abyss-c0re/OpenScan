@@ -29,11 +29,23 @@ typedef struct fox_pinhole {
     double tvec[3]; /* millimetres, camera-2 and projector only */
 } fox_pinhole;
 
+/* A projector stripe. In the projector image it is the line
+ * u = slope * v + offset. OneShot turns that line into a 3D plane. */
+typedef struct fox_plane {
+    int index;
+    double slope;
+    double offset;
+} fox_plane;
+
+#define FOX_MAX_PLANES 160
+
 typedef struct fox_calib {
     int width, height;
     char serial[64];
     char date[64];
-    fox_pinhole cam[3]; /* 0 left/reference, 1 right, 2 projector */
+    fox_pinhole cam[3]; /* 0 pattern camera, 1 clean camera, 2 projector */
+    int nplanes;
+    fox_plane plane[FOX_MAX_PLANES];
 } fox_calib;
 
 int fox_calib_load(const char *path, fox_calib *out);

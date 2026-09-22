@@ -36,6 +36,26 @@ int fox_calib_load(const char *path, fox_calib *out) {
         p->tvec[0] = v[12]; p->tvec[1] = v[13]; p->tvec[2] = v[14];
     }
 
+    /* 130 light planes, then the spatial-code table. Planes are what OneShot
+     * intersects with each decoded stripe. The code table is not needed to
+     * cut the plane. */
+    int np = 0;
+    if (fscanf(f, "%d", &np) == 1 && np > 0) {
+        if (np > FOX_MAX_PLANES) np = FOX_MAX_PLANES;
+        for (int i = 0; i < np; i++) {
+            int index = 0;
+            double slope = 0, offset = 0;
+            if (fscanf(f, "%d %lf %lf", &index, &slope, &offset) != 3) {
+                np = i;
+                break;
+            }
+            out->plane[i].index = index;
+            out->plane[i].slope = slope;
+            out->plane[i].offset = offset;
+        }
+        out->nplanes = np;
+    }
+
     char line[512];
     while (fgets(line, sizeof line, f)) {
         char *dev = strstr(line, "DevID:");
