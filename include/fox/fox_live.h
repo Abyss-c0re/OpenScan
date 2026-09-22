@@ -8,9 +8,9 @@
 extern "C" {
 #endif
 
-/* Live orbit scan. The scanner stays put and the object turns. Texture on
- * the object is the turn signal. The mesh is only the sides that have been
- * seen; the rest stays an unscanned shell. */
+/* Live scan of one object. The scanner may move around it, closer, or
+ * above. The object cloud is the only thing tracked; a view that does not
+ * match that object is dropped. */
 
 typedef struct fox_live fox_live;
 
@@ -47,6 +47,11 @@ void fox_live_reset(fox_live *live);
  * until the user presses Start. */
 void fox_live_set_mode(fox_live *live, int mode);
 int fox_live_mode(const fox_live *live);
+
+/* Assumed distance to the object, millimetres. This sets the size of the
+ * model. Reset the scan after changing it. */
+void fox_live_set_distance_mm(fox_live *live, float mm);
+float fox_live_distance_mm(const fox_live *live);
 int fox_live_points(const fox_live *live);
 
 /* Mouse events use the OpenCV highgui event and flag values. */

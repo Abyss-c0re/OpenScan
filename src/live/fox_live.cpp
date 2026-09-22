@@ -515,6 +515,7 @@ struct fox_live {
     cv::Matx33f pose_R = cv::Matx33f::eye();
     cv::Vec3f pose_t = cv::Vec3f(0, 0, 0);
     float pose_s = 1.f;
+    float distance_mm = 220.f;
     int covered = 0;
     int tracked_frames = 0;
     std::vector<Tri> shell;
@@ -554,8 +555,8 @@ struct fox_live {
     float radius_mm = 27.f;
     float span_y0 = 0.f, span_y1 = 0.f;
     int scanned_bins = 0;
-    float yaw = 0.70f;
-    float pitch = -0.24f;
+    float yaw = 0.42f;
+    float pitch = -0.10f;
     float dist = 160.f;
     int spin = 0;
     int user_zoom = 0;
@@ -635,6 +636,17 @@ void fox_live_set_mode(fox_live *live, int mode) {
     if (!live) return;
     if (mode != FOX_MODE_SCAN && mode != FOX_MODE_PAUSE) mode = FOX_MODE_STOP;
     live->mode = mode;
+}
+
+void fox_live_set_distance_mm(fox_live *live, float mm) {
+    if (!live) return;
+    if (mm < 80.f) mm = 80.f;
+    if (mm > 500.f) mm = 500.f;
+    live->distance_mm = mm;
+}
+
+float fox_live_distance_mm(const fox_live *live) {
+    return live ? live->distance_mm : 220.f;
 }
 
 int fox_live_mode(const fox_live *live) { return live ? live->mode : FOX_MODE_STOP; }
@@ -1246,6 +1258,36 @@ static void longest_runs(const cv::Mat &mask, std::vector<float> &left, std::vec
     }
 }
 
+/* A run that ends on the picture edge is the frame, not the object. Mirror
+ * the in-frame side about the axis of the rows that are fully visible so the
+ * head is not sheared into that border. */
+static void repair_clipped_sides(std::vector<float> &left, std::vector<float> &right, int cols) {
+    const float border = 2.f;
+    double sum = 0;
+    int n = 0;
+    for (int y = 0; y < (int)left.size(); y++) {
+        if (left[y] < 0.f || right[y] < 0.f) continue;
+        if (left[y] > border && right[y] < (float)cols - 1.f - border) {
+            sum += 0.5 * (left[y] + right[y]);
+            n++;
+        }
+    }
+    if (n < 24) return;
+    float axis = (float)(sum / n);
+    for (int y = 0; y < (int)left.size(); y++) {
+        if (left[y] < 0.f || right[y] < 0.f) continue;
+        bool clip_l = left[y] <= border;
+        bool clip_r = right[y] >= (float)cols - 1.f - border;
+        if (clip_r && !clip_l) {
+            float half = axis - left[y];
+            if (half > 8.f) right[y] = axis + half;
+        } else if (clip_l && !clip_r) {
+            float half = right[y] - axis;
+            if (half > 8.f) left[y] = axis - half;
+        }
+    }
+}
+
 static void gaussian_valid(std::vector<float> &v, float sigma) {
     int rad = (int)std::ceil(sigma * 3.f);
     std::vector<float> o(v.size(), -1.f);
@@ -1437,7 +1479,7 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
 
 static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, float cy,
                           float yaw_deg, float pitch_deg, float &dist, int user_zoom,
-                          int shade_live) {
+                          int shade_live, float z_mm) {
     BodyView body;
     if (sensor.empty() || fx < 50.f) return body;
     cv::Mat gray;
@@ -1450,11 +1492,12 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
     longest_runs(mask, left, right);
     fill_edge_gaps(left, std::max(24, (int)std::lround(80.f * rel)));
     fill_edge_gaps(right, std::max(24, (int)std::lround(80.f * rel)));
-    gaussian_valid(left, std::max(10.f, 46.f * rel));
-    gaussian_valid(right, std::max(10.f, 46.f * rel));
+    repair_clipped_sides(left, right, gray.cols);
+    gaussian_valid(left, std::max(8.f, 18.f * rel));
+    gaussian_valid(right, std::max(8.f, 18.f * rel));
 
     body.gray = gray;
-    const float z0 = 220.f;
+    const float z0 = z_mm > 80.f ? z_mm : 220.f;
     int nrow = 0;
     double sx = 0, sy = 0, sr = 0;
     for (int y = 0; y < gray.rows; y++) {
@@ -1489,9 +1532,11 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
     int gh = (gray.rows + ystep - 1) / ystep;
     int gw = 112;
     std::vector<ShadeVert> grid((size_t)gw * gh);
-    /* Round body from the outline: nearest on the centre line, farther at
-     * the sides, with the facet shading as a couple of millimetres of relief. */
-    const float th_max = 1.15f;
+    /* X and Y stay on the camera rays at the working distance, so the centre
+     * being nearer does not shrink the width or the crown. Depth is only Z.
+     * The section runs out to the silhouette, so the side turns away instead
+     * of ending as a cut wall. */
+    const float th_max = 1.40f;
     const float sin_max = std::sin(th_max);
     for (int iy = 0; iy < gh; iy++) {
         int y = std::min(gray.rows - 1, iy * ystep);
@@ -1503,17 +1548,17 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
             if (row) {
                 float u = -1.f + 2.f * (float)ix / (float)(gw - 1);
                 float th = u * th_max;
-                float radius = half * z0 / fx;
-                int x = (int)std::lround(mid_x + half * (std::sin(th) / sin_max));
+                float x_geom = mid_x + half * (std::sin(th) / sin_max);
+                int x = (int)std::lround(x_geom);
                 x = std::max(0, std::min(gray.cols - 1, x));
                 float hf = (float)gray.at<uint8_t>(y, x) - (float)mid.at<uint8_t>(y, x);
                 float br = (float)mid.at<uint8_t>(y, x) - (float)wide.at<uint8_t>(y, x);
                 float bump = (hf * 0.55f + br * 0.35f) / 22.f;
                 bump = std::max(-1.f, std::min(1.f, bump));
-                float Z = z0 - radius * std::cos(th);
-                v.x = (x - cxr) * Z / fx;
-                v.y = -((y - cyr) * Z / fy);
-                v.z = Z;
+                float radius = half * z0 / fx;
+                v.x = (x_geom - cxr) * z0 / fx;
+                v.y = -((y - cyr) * z0 / fy);
+                v.z = z0 - radius * std::cos(th);
                 v.bump = bump;
                 v.albedo = gray.at<uint8_t>(y, x) / 255.f;
                 v.ok = true;
@@ -1541,6 +1586,26 @@ static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, f
     }
     for (size_t i = 0; i < grid.size(); i++)
         if (grid[i].ok) grid[i].bump = sm[i];
+    /* Row-to-row depth steps read as horizontal ridges. Blur Z down the column. */
+    std::vector<float> zcopy(grid.size());
+    for (size_t i = 0; i < grid.size(); i++) zcopy[i] = grid[i].z;
+    for (int iy = 0; iy < gh; iy++) {
+        for (int ix = 0; ix < gw; ix++) {
+            ShadeVert &v = grid[(size_t)iy * gw + ix];
+            if (!v.ok) continue;
+            float s = 0, w = 0;
+            for (int dy = -5; dy <= 5; dy++) {
+                int yy = iy + dy;
+                if (yy < 0 || yy >= gh) continue;
+                const ShadeVert &nb = grid[(size_t)yy * gw + ix];
+                if (!nb.ok) continue;
+                float wt = std::exp(-(float)(dy * dy) / 10.f);
+                s += wt * zcopy[(size_t)yy * gw + ix];
+                w += wt;
+            }
+            if (w > 0.f) v.z = s / w;
+        }
+    }
 
     const float bump_mm = 1.8f;
     if (shade_live) {
@@ -1967,25 +2032,30 @@ static void render_model(fox_live *L, cv::Mat &out) {
 
 static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_b,
                           const BodyView &body) {
-    const int hero_w = L->size.width * 2;
-    const int hero_h = L->size.height * 2;
-    const int side_w = hero_w / 3;
-    const int side_h = hero_h / 3;
+    /* Keep the sensor aspect. A 1280x720 frame drawn into a tall half-panel
+     * is squeezed to half its width, and a round crown looks smallest. */
+    const int view_w = std::max(320, L->size.width);
+    const int view_h = std::max(180, L->size.height);
+    const int hero_w = view_w * 2;
+    const int hero_h = view_h;
+    const int side_h = std::max(1, hero_h / 3);
+    const int side_w = std::max(1, side_h * view_w / view_h);
     cv::Size side(side_w, side_h);
+    cv::Size view(view_w, view_h);
 
     cv::Mat hero(hero_h, hero_w, CV_8UC3, cv::Scalar(12, 12, 12));
     cv::Mat solid = body.solid;
     cv::Mat model;
     if (L->scanned_bins > 0) {
-        model.create(hero_h, hero_w / 2, CV_8UC3);
+        model.create(view_h, view_w, CV_8UC3);
         render_model(L, model);
         solid = model;
     }
     if (!body.camera.empty() && !solid.empty()) {
         cv::Mat left, right;
-        cv::resize(body.camera, left, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_AREA);
-        if (solid.size() == cv::Size(hero_w / 2, hero_h)) right = solid;
-        else cv::resize(solid, right, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_AREA);
+        cv::resize(body.camera, left, view, 0, 0, cv::INTER_AREA);
+        if (solid.size() == view) right = solid;
+        else cv::resize(solid, right, view, 0, 0, cv::INTER_AREA);
         label_panel(left, "camera");
         int deg = (int)std::lround(L->scanned_bins * (360.0 / kBins));
         char cap[96];
@@ -2113,7 +2183,8 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     float pitch_deg = live->pitch * (180.f / 3.14159265f);
     int shade_live = live->mode == FOX_MODE_STOP && live->scanned_bins == 0;
     BodyView body = make_body(B, (float)cam.fx, (float)cam.fy, (float)cam.cx, (float)cam.cy,
-                              yaw_deg, pitch_deg, live->dist, live->user_zoom, shade_live);
+                              yaw_deg, pitch_deg, live->dist, live->user_zoom, shade_live,
+                              live->distance_mm);
     live->locked = 1;
 
     auto t1 = std::chrono::steady_clock::now();

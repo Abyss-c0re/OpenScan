@@ -6,18 +6,21 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 
-#include <algorithm>
 #include <cstdio>
 
 #include <QApplication>
 #include <QCloseEvent>
 #include <QFileDialog>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPushButton>
+#include <QSettings>
+#include <QSizePolicy>
+#include <QSlider>
 #include <QStatusBar>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -100,17 +103,21 @@ protected:
 
 class FoxWindow : public QMainWindow {
 public:
-    FoxWindow(fox_cam *cam_a, fox_cam *cam_b, fox_live *model, QString serial_text)
-        : a(cam_a), b(cam_b), live(model), serial(std::move(serial_text)) {
+    FoxWindow(fox_cam *cam_a, fox_cam *cam_b, fox_live *model, QString serial_text,
+              int exposure_a, int gain_a_init, int exposure_b, int gain_b_init)
+        : a(cam_a), b(cam_b), live(model), serial(std::move(serial_text)),
+          exp_a(exposure_a), gain_a(gain_a_init), exp_b(exposure_b), gain_b(gain_b_init) {
         setWindowTitle("Fox 3D");
-        resize(1280, 800);
+        resize(1280, 860);
 
         start = new QPushButton("Start scan");
         pause = new QPushButton("Pause");
         stop = new QPushButton("Stop");
         reset = new QPushButton("Reset");
+        settings_btn = new QPushButton("Settings");
         exp = new QPushButton("Export…");
         start->setObjectName("start");
+        settings_btn->setCheckable(true);
         exp->setObjectName("export");
 
         auto *tools = new QHBoxLayout;
@@ -121,9 +128,14 @@ public:
         tools->addWidget(stop);
         tools->addWidget(reset);
         tools->addStretch(1);
+        tools->addWidget(settings_btn);
         tools->addWidget(exp);
 
+        settings = build_settings();
+        settings->setVisible(false);
+
         stage = new Stage;
+        stage->setObjectName("stage");
         stage->live = live;
         stage->setAlignment(Qt::AlignCenter);
         stage->setMinimumSize(960, 540);
@@ -134,6 +146,7 @@ public:
         col->setContentsMargins(0, 0, 0, 0);
         col->setSpacing(0);
         col->addLayout(tools);
+        col->addWidget(settings);
         col->addWidget(stage, 1);
         setCentralWidget(page);
         statusBar()->showMessage(serial + "   ready");
@@ -157,6 +170,7 @@ public:
             refresh_buttons();
         });
         connect(exp, &QPushButton::clicked, this, [this] { export_mesh(); });
+        connect(settings_btn, &QPushButton::toggled, settings, &QWidget::setVisible);
 
         refresh_buttons();
         timer = new QTimer(this);
@@ -186,6 +200,132 @@ private:
         pause->setEnabled(mode == FOX_MODE_SCAN);
         stop->setEnabled(mode != FOX_MODE_STOP);
         reset->setEnabled(mode != FOX_MODE_STOP || fox_live_points(live) > 0);
+    }
+
+    QSlider *slider(int min, int max, int value) {
+        auto *s = new QSlider(Qt::Horizontal);
+        s->setRange(min, max);
+        s->setValue(value);
+        s->setMinimumWidth(180);
+        s->setSingleStep(1);
+        s->setPageStep(5);
+        return s;
+    }
+
+    static int clamp_int(int v, int lo, int hi) {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    }
+
+    static QString exposure_text(int v) {
+        return QString("%1  ·  %2 ms").arg(v).arg(v * 0.1, 0, 'f', 1);
+    }
+
+    QWidget *build_settings() {
+        QSettings saved("fox3d", "fox3d");
+        int distance = clamp_int(saved.value("distance-mm", (int)fox_live_distance_mm(live)).toInt(), 100, 500);
+        fox_live_set_distance_mm(live, (float)distance);
+
+        auto *panel = new QWidget;
+        auto *grid = new QGridLayout(panel);
+        grid->setContentsMargins(16, 4, 16, 10);
+        grid->setHorizontalSpacing(12);
+        grid->setVerticalSpacing(6);
+        grid->setColumnStretch(1, 1);
+
+        auto add_row = [&](int row, const char *name, QSlider *s, QLabel *value, const char *tip) {
+            auto *lab = new QLabel(name);
+            lab->setToolTip(tip);
+            s->setToolTip(tip);
+            value->setMinimumWidth(108);
+            value->setText(QString::number(s->value()));
+            grid->addWidget(lab, row, 0);
+            grid->addWidget(s, row, 1);
+            grid->addWidget(value, row, 2);
+        };
+
+        auto *ea = slider(1, 200, exp_a);
+        auto *ga = slider(0, 100, gain_a);
+        auto *eb = slider(1, 200, exp_b);
+        auto *gb = slider(0, 100, gain_b);
+        auto *dist = slider(100, 500, distance);
+        auto *ea_n = new QLabel;
+        auto *ga_n = new QLabel;
+        auto *eb_n = new QLabel;
+        auto *gb_n = new QLabel;
+        auto *dist_n = new QLabel;
+        add_row(0, "Camera A exposure", ea, ea_n,
+                "How long camera A collects light. 1 is 0.1 ms, 200 is 20 ms. Raise it if A is too dark.");
+        add_row(1, "Camera A gain", ga, ga_n,
+                "Amplifies camera A after the exposure. Keep this low so the dots stay sharp.");
+        add_row(2, "Camera B exposure", eb, eb_n,
+                "Camera B is the clean view. Lower this if the object is blown out white.");
+        add_row(3, "Camera B gain", gb, gb_n, "Amplifies camera B. Usually lower than camera A.");
+        add_row(4, "Distance (mm)", dist, dist_n,
+                "Distance to the object. This sets the size of the model in millimetres. "
+                "The Fox works best around 200–400 mm. Reset the scan after changing it.");
+        ea_n->setText(exposure_text(ea->value()));
+        eb_n->setText(exposure_text(eb->value()));
+
+        auto remember = [this] {
+            QSettings s("fox3d", "fox3d");
+            s.setValue("exposure-a", exp_a);
+            s.setValue("gain-a", gain_a);
+            s.setValue("exposure-b", exp_b);
+            s.setValue("gain-b", gain_b);
+            s.setValue("distance-mm", (int)std::lround(fox_live_distance_mm(live)));
+        };
+        auto apply_cam = [this, remember] {
+            fox_cam_set_exposure(a, exp_a, gain_a);
+            fox_cam_set_exposure(b, exp_b, gain_b);
+            remember();
+        };
+        connect(ea, &QSlider::valueChanged, this, [this, ea_n, apply_cam](int v) {
+            exp_a = v;
+            ea_n->setText(exposure_text(v));
+            apply_cam();
+        });
+        connect(ga, &QSlider::valueChanged, this, [this, ga_n, apply_cam](int v) {
+            gain_a = v;
+            ga_n->setText(QString::number(v));
+            apply_cam();
+        });
+        connect(eb, &QSlider::valueChanged, this, [this, eb_n, apply_cam](int v) {
+            exp_b = v;
+            eb_n->setText(exposure_text(v));
+            apply_cam();
+        });
+        connect(gb, &QSlider::valueChanged, this, [this, gb_n, apply_cam](int v) {
+            gain_b = v;
+            gb_n->setText(QString::number(v));
+            apply_cam();
+        });
+        connect(dist, &QSlider::valueChanged, this, [this, dist_n, remember](int v) {
+            fox_live_set_distance_mm(live, (float)v);
+            dist_n->setText(QString("%1 mm").arg(v));
+            remember();
+        });
+        dist_n->setText(QString("%1 mm").arg(dist->value()));
+
+        auto *hint = new QLabel(
+            "Camera changes apply immediately and are kept for the next launch. "
+            "Reset the scan after changing distance, then keep the whole object in frame, including the top.");
+        hint->setWordWrap(true);
+        grid->addWidget(hint, 5, 0, 1, 2);
+        auto *defaults = new QPushButton("Defaults");
+        defaults->setObjectName("quiet");
+        defaults->setToolTip("Camera A 22 / 6, camera B 16 / 4, distance 220 mm");
+        grid->addWidget(defaults, 5, 2, Qt::AlignRight);
+        connect(defaults, &QPushButton::clicked, this, [ea, ga, eb, gb, dist] {
+            ea->setValue(22);
+            ga->setValue(6);
+            eb->setValue(16);
+            gb->setValue(4);
+            dist->setValue(220);
+        });
+        remember();
+        return panel;
     }
 
     void export_mesh() {
@@ -258,7 +398,10 @@ private:
     QPushButton *pause = nullptr;
     QPushButton *stop = nullptr;
     QPushButton *reset = nullptr;
+    QPushButton *settings_btn = nullptr;
     QPushButton *exp = nullptr;
+    QWidget *settings = nullptr;
+    int exp_a = 22, gain_a = 6, exp_b = 16, gain_b = 4;
     QTimer *timer = nullptr;
     bool busy = false;
     std::vector<uint8_t> ya, yb;
@@ -275,15 +418,33 @@ static void style_app(QApplication &app) {
         "QPushButton#start:hover { background: #238548; }"
         "QPushButton#export { background: #8a5a14; border-color: #c48a2a; }"
         "QPushButton#export:hover { background: #a56b18; }"
+        "QPushButton:checked { background: #3a414b; border-color: #9aa3b2; }"
+        "QPushButton#quiet { padding: 4px 12px; font-size: 13px; }"
         "QStatusBar { background: #14161a; color: #d0d0d0; }"
-        "QLabel { background: #121418; }");
+        "QLabel#stage { background: #121418; }"
+        "QSlider::groove:horizontal { height: 4px; background: #3a414b; border-radius: 2px; }"
+        "QSlider::handle:horizontal { width: 14px; height: 14px; margin: -6px 0;"
+        " background: #e6e6e6; border-radius: 7px; }");
 }
 
 int fox_app_main(int argc, char **argv, const char *calib_path,
                  int exp_a, int gain_a, int exp_b, int gain_b,
                  double scale, double min_mm, double max_mm) {
     QApplication app(argc, argv);
+    app.setOrganizationName("fox3d");
+    app.setApplicationName("fox3d");
     style_app(app);
+    QSettings saved("fox3d", "fox3d");
+    auto pick = [&](int given, const char *key, int fallback, int lo, int hi) {
+        int v = given >= 0 ? given : saved.value(key, fallback).toInt();
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    };
+    exp_a = pick(exp_a, "exposure-a", 22, 1, 200);
+    gain_a = pick(gain_a, "gain-a", 6, 0, 100);
+    exp_b = pick(exp_b, "exposure-b", 16, 1, 200);
+    gain_b = pick(gain_b, "gain-b", 4, 0, 100);
 
     char path_a[256], path_b[256], serial[64];
     if (fox_find_cameras(path_a, path_b, sizeof path_a, serial, sizeof serial) < 0) {
@@ -326,7 +487,7 @@ int fox_app_main(int argc, char **argv, const char *calib_path,
     }
     fox_live_set_mode(live, FOX_MODE_STOP);
 
-    FoxWindow window(a, b, live, QString::fromUtf8(serial));
+    FoxWindow window(a, b, live, QString::fromUtf8(serial), exp_a, gain_a, exp_b, gain_b);
     window.show();
     return app.exec();
 }

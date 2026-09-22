@@ -1,6 +1,6 @@
 # fox3d
 
-Linux program for the 3DMakerpro Fox scanner (JMM8). It shows both cameras, builds a mesh while you turn the object, and exports that mesh.
+Linux program for the 3DMakerpro Fox scanner (JMM8). It shows both cameras, follows one object as you move the scanner around it, and exports that mesh.
 
 The cameras are ordinary USB Video Class devices. The kernel driver is `uvcvideo`. This project is the userspace program. It does not install a kernel module.
 
@@ -89,8 +89,9 @@ The window opens idle.
 | Stop | Stop adding, and keep the model so it can be exported. |
 | Reset | Drop the model and return to idle. The next Start is a new scan. |
 | Export… | Write STL, OBJ, or PLY. The file stays on this computer. |
+| Settings | Camera A and B exposure and gain, and the distance used for the size of the model (100–500 mm). Saved for the next launch. Reset the scan after changing the distance. |
 
-Turn the object steadily. The status line shows how many degrees are scanned, how many are still open, and **detail xN**. Going over a side again raises that count and updates the surface there instead of replacing it. If the line says **TRACKING LOST**, slow the turn. That frame is not added.
+Move around the object, closer, or above it. The tracker follows that object's point cloud and ignores the background. The status line shows how much of it is scanned and **detail xN**. Going over a side again raises that count and updates the surface there. If the line says **TRACKING LOST**, you left the object or moved too fast. That frame is not added.
 
 Closing the window quits. It does not reopen.
 

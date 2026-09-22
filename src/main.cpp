@@ -510,7 +510,8 @@ static int cmd_asic(const char *hexaddr) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        return fox_app_main(argc, argv, nullptr, 22, 6, 16, 4, 0.5, 80, 550);
+        /* Negative camera values mean "use the saved Settings". */
+        return fox_app_main(argc, argv, nullptr, -1, -1, -1, -1, 0.5, 80, 550);
     }
     const char *cmd = argv[1];
     if (!strcmp(cmd, "mesh-test")) return fox_mesh_self_test();
@@ -559,6 +560,12 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Windowed scan keeps saved Settings unless a flag overrides that camera. */
+    int gui_ea = exp_a >= 0 ? exp_a : exposure;
+    int gui_eb = exp_b >= 0 ? exp_b : exposure;
+    int gui_ga = gain_a >= 0 ? gain_a : gain;
+    int gui_gb = gain_b >= 0 ? gain_b : gain;
+
     int base_exp = exposure >= 0 ? exposure : 24;
     int base_gain = gain >= 0 ? gain : 6;
     if (exp_a < 0) exp_a = base_exp;
@@ -594,7 +601,7 @@ int main(int argc, char **argv) {
             return cmd_scan(out, calib, seconds, 1, no_ae, exp_a, gain_a, exp_b, gain_b,
                             scale, min_mm, max_mm);
         }
-        return fox_app_main(argc, argv, calib, exp_a, gain_a, exp_b, gain_b, scale, min_mm, max_mm);
+        return fox_app_main(argc, argv, calib, gui_ea, gui_ga, gui_eb, gui_gb, scale, min_mm, max_mm);
     }
     if (!strcmp(cmd, "asic-read")) return cmd_asic(asic_addr);
     usage(argv[0]);

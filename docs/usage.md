@@ -1,13 +1,13 @@
 # Using fox3d
 
-fox3d scans with the Fox held still and the object turning in front of it. The window starts idle so you can frame the object before anything is kept.
+fox3d scans one object. You can turn the object, or walk the scanner around it, move closer, and come in from above. The window starts idle so you can frame the object before anything is kept.
 
 ## A scan
 
 1. Plug in the scanner. `./build/fox3d devices` should list camera A and camera B and the serial.
 2. Start `./build/fox3d`.
 3. Set the object inside the green outline. The right-hand view is the 3D model.
-4. Press **Start scan** and turn the object.
+4. Press **Start scan**. Move so each new view still sees part of the object you already have.
 5. Press **Stop** when that pass is done. The model stays.
 6. Press **Export…** and choose STL, OBJ, or PLY.
 
@@ -20,9 +20,24 @@ fox3d scans with the Fox held still and the object turning in front of it. The w
 - The ring and the status line count both: `scanned N°` and `not scanned M°`. The first view is the front of the object, about 120°.
 - **detail xN** is how many times the scanned surface has been observed. The first pass is x1. Turning back over the same side raises it. The new view is blended into those points, and gaps in that area gain triangles.
 
-A frame that cannot be followed is dropped. The status line says **TRACKING LOST**. Slow the turn. The model already built is left as it is.
+Only the segmented object is kept. A frame that does not match that point cloud is dropped, so the table and the room are not scanned. The status line says **TRACKING LOST**. Come back to the object more slowly. The model already built is left as it is.
 
 Drag the 3D view to orbit it. The wheel zooms.
+
+## Settings
+
+**Settings** opens the camera and size controls. They are saved and used the next time the app starts.
+
+| Setting | What to do |
+| --- | --- |
+| Camera A exposure | Raise it when A is too dark to see the object. It is in steps of 0.1 ms. |
+| Camera A gain | Leave this low. High gain washes out the projector dots. |
+| Camera B exposure | Lower it when the clean camera is white. |
+| Camera B gain | Usually a little lower than camera A. |
+| Distance | How far the object is, from 100 to 500 mm. This is the size of the model. The Fox is meant to work around 200–400 mm. Press **Reset** after changing it, then start again. |
+| Defaults | Camera A 22 / gain 6, camera B 16 / gain 4, distance 220 mm. |
+
+A starting point that has shown the object clearly is A 22 / gain 6 and B 16 / gain 4, at about 220 mm. Keep the whole object in the camera, including the top. A part that leaves the frame is missing from the model.
 
 ## Export
 
