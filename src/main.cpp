@@ -366,7 +366,7 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
         }
     }
 
-    printf("\nThe large panel is a 3D view. It turns on its own; drag to orbit, wheel to zoom.\n");
+    printf("\nThe large panel is the camera beside a 3/4 view of the same object. Drag to orbit, wheel to zoom.\n");
     printf("Start keeps new surface as you rotate the object. Pause holds it. Stop ends the pass.\n");
     printf("Save writes the STL and leaves the window open. Close, Q, or Esc quits and stays closed.\n");
     printf("Space toggles scan/pause. S saves. r clears the model.\n");
@@ -525,7 +525,7 @@ int fox_app_main(int argc, char **argv, const char *calib,
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        return fox_app_main(argc, argv, nullptr, 18, 4, 12, 4, 0.5, 80, 550);
+        return fox_app_main(argc, argv, nullptr, 22, 6, 16, 4, 0.5, 80, 550);
     }
     const char *cmd = argv[1];
     if (!strcmp(cmd, "mesh-test")) return fox_mesh_self_test();

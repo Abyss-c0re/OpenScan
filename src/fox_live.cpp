@@ -460,10 +460,14 @@ struct fox_live {
     cv::Vec3f pose_t = cv::Vec3f(0, 0, 0);
     int covered = 0;
     int tracked_frames = 0;
-    float yaw = 0.9f;
-    float pitch = -0.35f;
-    float dist = 420.f;
-    int spin = 1;
+    std::vector<Tri> shell;
+    size_t shell_mark = 0;
+    cv::Matx33f shell_R = cv::Matx33f::eye();
+    int shell_set = 0;
+    float yaw = 0.70f;
+    float pitch = -0.24f;
+    float dist = 160.f;
+    int spin = 0;
     int user_zoom = 0;
     int dragging = 0;
     int drag_x = 0;
@@ -513,6 +517,10 @@ void fox_live_reset(fox_live *live) {
     live->pose_t = cv::Vec3f(0, 0, 0);
     live->covered = 0;
     live->tracked_frames = 0;
+    live->shell.clear();
+    live->shell_mark = 0;
+    live->shell_R = cv::Matx33f::eye();
+    live->shell_set = 0;
 }
 
 void fox_live_set_mode(fox_live *live, int mode) {
@@ -1048,93 +1056,423 @@ static void draw_solid(fox_live *L, cv::Mat &img, const std::vector<SurfTri> &tr
     }
 }
 
+/* Stereo on the projector dots saturates at the search limit, so it never
+ * becomes the round body the camera already shows. The solid is that
+ * silhouette: nearest on the centre, farther toward the outline, with the
+ * facet shading as a couple of millimetres of relief. */
+struct ShadeVert {
+    float x, y, z, bump, albedo;
+    bool ok;
+};
+
+struct BodyView {
+    cv::Mat camera;
+    cv::Mat solid;
+    cv::Mat side;
+    std::vector<cv::Vec3f> P, N;
+    std::vector<Tri> tris;
+    float median_mm = 0;
+};
+
+static void longest_runs(const cv::Mat &mask, std::vector<float> &left, std::vector<float> &right) {
+    left.assign(mask.rows, -1.f);
+    right.assign(mask.rows, -1.f);
+    for (int y = 0; y < mask.rows; y++) {
+        const uint8_t *m = mask.ptr<uint8_t>(y);
+        int run_l = -1, best_l = -1, best_r = -1, best = 0;
+        for (int x = 0; x <= mask.cols; x++) {
+            bool on = x < mask.cols && m[x];
+            if (on) {
+                if (run_l < 0) run_l = x;
+            } else if (run_l >= 0) {
+                int len = x - run_l;
+                if (len > best) {
+                    best = len;
+                    best_l = run_l;
+                    best_r = x - 1;
+                }
+                run_l = -1;
+            }
+        }
+        if (best >= 12) {
+            left[y] = (float)best_l;
+            right[y] = (float)best_r;
+        }
+    }
+}
+
+static void gaussian_valid(std::vector<float> &v, float sigma) {
+    int rad = (int)std::ceil(sigma * 3.f);
+    std::vector<float> o(v.size(), -1.f);
+    for (int i = 0; i < (int)v.size(); i++) {
+        if (v[i] < 0.f) continue;
+        float s = 0, wsum = 0;
+        for (int k = -rad; k <= rad; k++) {
+            int j = i + k;
+            if (j < 0 || j >= (int)v.size() || v[j] < 0.f) continue;
+            float w = std::exp(-(float)(k * k) / (2.f * sigma * sigma));
+            s += w * v[j];
+            wsum += w;
+        }
+        if (wsum > 0.f) o[i] = s / wsum;
+    }
+    v.swap(o);
+}
+
+static void fill_edge_gaps(std::vector<float> &v, int max_gap) {
+    int n = (int)v.size();
+    int i = 0;
+    while (i < n) {
+        if (v[i] >= 0.f) {
+            i++;
+            continue;
+        }
+        int a = i - 1;
+        while (i < n && v[i] < 0.f) i++;
+        int b = i;
+        if (a < 0 || b >= n || b - a > max_gap) continue;
+        for (int k = a + 1; k < b; k++) {
+            float t = (float)(k - a) / (float)(b - a);
+            v[k] = v[a] * (1.f - t) + v[b] * t;
+        }
+    }
+}
+
+static cv::Mat foreground_mask(const cv::Mat &gray) {
+    cv::Mat blur;
+    float rel = gray.cols / 1280.f;
+    cv::GaussianBlur(gray, blur, cv::Size(0, 0), std::max(1.2f, 1.4f * rel));
+    cv::Mat tmp;
+    double otsu = cv::threshold(blur, tmp, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    double thr = std::max(14.0, std::min(otsu * 0.45, 28.0));
+    cv::Mat bin;
+    cv::threshold(blur, bin, thr, 255, cv::THRESH_BINARY);
+    int ksz = std::max(5, (int)std::lround(31.f * rel)) | 1;
+    cv::Mat k = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(ksz, ksz));
+    cv::morphologyEx(bin, bin, cv::MORPH_CLOSE, k);
+    int osz = std::max(3, (int)std::lround(5.f * rel)) | 1;
+    cv::morphologyEx(bin, bin, cv::MORPH_OPEN,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(osz, osz)));
+    cv::Mat labels, stats, cent;
+    int n = cv::connectedComponentsWithStats(bin, labels, stats, cent, 8, CV_32S);
+    int best = 0, best_area = 0;
+    int min_area = std::max(800, gray.rows * gray.cols / 80);
+    for (int i = 1; i < n; i++) {
+        int a = stats.at<int>(i, cv::CC_STAT_AREA);
+        int w = stats.at<int>(i, cv::CC_STAT_WIDTH);
+        int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);
+        if (a < min_area || w < 30) continue;
+        /* A lamp in the frame is a thin bright bar. The object is the wide blob. */
+        if (w * 5 < h && w < (int)(90 * rel + 8)) continue;
+        if (a > best_area) {
+            best_area = a;
+            best = i;
+        }
+    }
+    cv::Mat mask(gray.size(), CV_8U, cv::Scalar(0));
+    if (!best) return mask;
+    for (int y = 0; y < gray.rows; y++) {
+        const int *lab = labels.ptr<int>(y);
+        uint8_t *m = mask.ptr<uint8_t>(y);
+        for (int x = 0; x < gray.cols; x++)
+            if (lab[x] == best) m[x] = 255;
+    }
+    return mask;
+}
+
+static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::Mat &out,
+                        float yaw_deg, float pitch_deg, float bump_mm, float *dist, int user_zoom) {
+    out.setTo(cv::Scalar(12, 14, 18));
+    cv::Vec3f c(0, 0, 0);
+    int cnt = 0;
+    cv::Vec3f lo(1e9f, 1e9f, 1e9f), hi(-1e9f, -1e9f, -1e9f);
+    for (const ShadeVert &v : grid) {
+        if (!v.ok) continue;
+        cv::Vec3f p(v.x, v.y, v.z - bump_mm * v.bump);
+        c += p;
+        cnt++;
+        for (int k = 0; k < 3; k++) {
+            lo[k] = std::min(lo[k], p[k]);
+            hi[k] = std::max(hi[k], p[k]);
+        }
+    }
+    if (cnt < 40) {
+        cv::putText(out, "no object in frame", cv::Point(16, out.rows / 2),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(170, 170, 170), 1, cv::LINE_AA);
+        return;
+    }
+    c *= 1.f / cnt;
+    float ext_x = hi[0] - lo[0];
+    float ext_y = hi[1] - lo[1];
+    float extent = std::max(ext_x, ext_y);
+    int w = out.cols, h = out.rows;
+    float auto_dist = std::max(extent * 1.55f, 30.f);
+    float use = (user_zoom && dist && *dist > 1.f) ? *dist : auto_dist;
+    if (dist && !user_zoom) *dist = use;
+    float yaw = yaw_deg * 3.14159265f / 180.f;
+    float pitch = pitch_deg * 3.14159265f / 180.f;
+    cv::Vec3f eye = c + cv::Vec3f(std::sin(yaw) * std::cos(pitch), std::sin(pitch),
+                                  std::cos(yaw) * std::cos(pitch)) *
+                            use;
+    cv::Vec3f forward = c - eye;
+    forward /= std::sqrt(forward.dot(forward));
+    cv::Vec3f world_up(0, 1, 0);
+    cv::Vec3f right = forward.cross(world_up);
+    float rl = std::sqrt(right.dot(right));
+    if (rl < 1e-4f) right = cv::Vec3f(1, 0, 0);
+    else right /= rl;
+    cv::Vec3f cam_up = right.cross(forward);
+    float focal = std::min(h * 1.35f, h * 1.05f * (extent / std::max(ext_y, 1.f)));
+    std::vector<float> zbuf((size_t)w * h, 1e9f);
+    auto proj = [&](const ShadeVert &v, float &sx, float &sy, float &zc) {
+        cv::Vec3f p(v.x, v.y, v.z - bump_mm * v.bump);
+        cv::Vec3f d = p - eye;
+        zc = d.dot(forward);
+        sx = w * 0.50f + focal * d.dot(right) / std::max(zc, 1.f);
+        sy = h * 0.50f - focal * d.dot(cam_up) / std::max(zc, 1.f);
+    };
+    for (int gy = 0; gy < gh - 1; gy++) {
+        for (int gx = 0; gx < gw - 1; gx++) {
+            const ShadeVert &a = grid[(size_t)gy * gw + gx];
+            const ShadeVert &b = grid[(size_t)gy * gw + gx + 1];
+            const ShadeVert &c0 = grid[(size_t)(gy + 1) * gw + gx];
+            const ShadeVert &d = grid[(size_t)(gy + 1) * gw + gx + 1];
+            const ShadeVert *tris[2][3] = {{&a, &b, &c0}, {&b, &d, &c0}};
+            for (auto &t : tris) {
+                if (!t[0]->ok || !t[1]->ok || !t[2]->ok) continue;
+                cv::Vec3f pa(t[0]->x, t[0]->y, t[0]->z - bump_mm * t[0]->bump);
+                cv::Vec3f pb(t[1]->x, t[1]->y, t[1]->z - bump_mm * t[1]->bump);
+                cv::Vec3f pc(t[2]->x, t[2]->y, t[2]->z - bump_mm * t[2]->bump);
+                if (cv::norm(pa - pb) > 8.f || cv::norm(pa - pc) > 8.f || cv::norm(pb - pc) > 8.f)
+                    continue;
+                cv::Vec3f nrm = (pb - pa).cross(pc - pa);
+                float ln = std::sqrt(nrm.dot(nrm));
+                if (ln < 1e-6f) continue;
+                nrm /= ln;
+                cv::Vec3f light = eye - pa;
+                light /= std::sqrt(light.dot(light));
+                cv::Vec3f lamp = cv::normalize(cv::Vec3f(-0.45f, 0.55f, -0.7f));
+                float lam = nrm.dot(light) * 0.55f + 0.45f;
+                if (lam < 0.15f) lam = 0.15f;
+                float lam2 = std::max(0.f, -nrm.dot(lamp));
+                float alb = 0.35f + 0.95f * t[0]->albedo;
+                float shade = alb * (0.28f + 0.40f * lam + 0.34f * lam2);
+                int g = (int)std::min(255.f, 255.f * shade);
+                cv::Vec3b col((uint8_t)(g * 0.80f), (uint8_t)(g * 0.86f),
+                              (uint8_t)std::min(255, g + 6));
+                float ax, ay, az, bx, by, bz, cxp, cyp, cz;
+                proj(*t[0], ax, ay, az);
+                proj(*t[1], bx, by, bz);
+                proj(*t[2], cxp, cyp, cz);
+                int minx = std::max(0, (int)std::floor(std::min(ax, std::min(bx, cxp))) - 1);
+                int maxx = std::min(w - 1, (int)std::ceil(std::max(ax, std::max(bx, cxp))) + 1);
+                int miny = std::max(0, (int)std::floor(std::min(ay, std::min(by, cyp))) - 1);
+                int maxy = std::min(h - 1, (int)std::ceil(std::max(ay, std::max(by, cyp))) + 1);
+                float area = (bx - ax) * (cyp - ay) - (by - ay) * (cxp - ax);
+                if (std::fabs(area) < 0.4f) continue;
+                for (int py = miny; py <= maxy; py++) {
+                    for (int px = minx; px <= maxx; px++) {
+                        float w0 = (bx - px) * (cyp - py) - (by - py) * (cxp - px);
+                        float w1 = (cxp - px) * (ay - py) - (cyp - py) * (ax - px);
+                        float w2 = (ax - px) * (by - py) - (ay - py) * (bx - px);
+                        if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                            continue;
+                        float zc = (w0 * az + w1 * bz + w2 * cz) / area;
+                        float &slot = zbuf[(size_t)py * w + px];
+                        if (zc < slot) {
+                            slot = zc;
+                            out.at<cv::Vec3b>(py, px) = col;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static BodyView make_body(const cv::Mat &sensor, float fx, float fy, float cx, float cy,
+                          float yaw_deg, float pitch_deg, float &dist, int user_zoom) {
+    BodyView body;
+    if (sensor.empty() || fx < 50.f) return body;
+    cv::Mat gray;
+    cv::rotate(sensor, gray, cv::ROTATE_180);
+    float cxr = (gray.cols - 1) - cx;
+    float cyr = (gray.rows - 1) - cy;
+    float rel = gray.cols / 1280.f;
+    cv::Mat mask = foreground_mask(gray);
+    std::vector<float> left, right;
+    longest_runs(mask, left, right);
+    fill_edge_gaps(left, std::max(24, (int)std::lround(80.f * rel)));
+    fill_edge_gaps(right, std::max(24, (int)std::lround(80.f * rel)));
+    gaussian_valid(left, std::max(10.f, 46.f * rel));
+    gaussian_valid(right, std::max(10.f, 46.f * rel));
+
+    cv::cvtColor(gray, body.camera, cv::COLOR_GRAY2BGR);
+    for (int y = 0; y < gray.rows; y++) {
+        if (left[y] < 0.f || right[y] < 0.f) continue;
+        int x0 = (int)std::lround(left[y]);
+        int x1 = (int)std::lround(right[y]);
+        if ((unsigned)x0 < (unsigned)body.camera.cols)
+            body.camera.at<cv::Vec3b>(y, x0) = cv::Vec3b(70, 220, 90);
+        if ((unsigned)x1 < (unsigned)body.camera.cols)
+            body.camera.at<cv::Vec3b>(y, x1) = cv::Vec3b(70, 220, 90);
+    }
+
+    cv::Mat mid, wide;
+    cv::GaussianBlur(gray, mid, cv::Size(0, 0), std::max(2.f, 7.f * rel));
+    cv::GaussianBlur(gray, wide, cv::Size(0, 0), std::max(6.f, 26.f * rel));
+    int ystep = std::max(2, (int)std::lround(3.f * rel));
+    int gh = (gray.rows + ystep - 1) / ystep;
+    int gw = std::max(64, gray.cols / 13);
+    std::vector<ShadeVert> grid((size_t)gw * gh);
+    const float z0 = 220.f;
+    const float th_max = 1.15f;
+    const float sin_max = std::sin(th_max);
+    for (int iy = 0; iy < gh; iy++) {
+        int y = std::min(gray.rows - 1, iy * ystep);
+        float half = 0.5f * (right[y] - left[y]);
+        float mid_x = 0.5f * (right[y] + left[y]);
+        bool row = left[y] >= 0.f && right[y] >= 0.f && half > 8.f;
+        for (int ix = 0; ix < gw; ix++) {
+            ShadeVert v{0, 0, 0, 0, 0, false};
+            if (row) {
+                float u = -1.f + 2.f * ix / (float)(gw - 1);
+                float th = u * th_max;
+                float s = std::sin(th);
+                float co = std::cos(th);
+                float radius = half * z0 / fx;
+                int x = (int)std::lround(mid_x + half * (s / sin_max));
+                x = std::max(0, std::min(gray.cols - 1, x));
+                float hf = (float)gray.at<uint8_t>(y, x) - (float)mid.at<uint8_t>(y, x);
+                float br = (float)mid.at<uint8_t>(y, x) - (float)wide.at<uint8_t>(y, x);
+                float bump = (hf * 0.55f + br * 0.35f) / 22.f;
+                bump = std::max(-1.f, std::min(1.f, bump));
+                float Z = z0 - radius * co;
+                v.x = (x - cxr) * Z / fx;
+                v.y = -((y - cyr) * Z / fy);
+                v.z = Z;
+                v.bump = bump;
+                v.albedo = gray.at<uint8_t>(y, x) / 255.f;
+                v.ok = true;
+            }
+            grid[(size_t)iy * gw + ix] = v;
+        }
+    }
+    std::vector<float> sm(grid.size(), 0.f);
+    for (int y = 0; y < gh; y++) {
+        for (int x = 0; x < gw; x++) {
+            float s = 0, w = 0;
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dx = -2; dx <= 2; dx++) {
+                    int yy = y + dy, xx = x + dx;
+                    if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
+                    const ShadeVert &nb = grid[(size_t)yy * gw + xx];
+                    if (!nb.ok) continue;
+                    float wt = std::exp(-(dx * dx + dy * dy) / 3.f);
+                    s += wt * nb.bump;
+                    w += wt;
+                }
+            }
+            sm[(size_t)y * gw + x] = w > 0.f ? s / w : 0.f;
+        }
+    }
+    for (size_t i = 0; i < grid.size(); i++)
+        if (grid[i].ok) grid[i].bump = sm[i];
+
+    const float bump_mm = 1.8f;
+    body.solid.create(gray.rows, gray.cols, CV_8UC3);
+    body.side.create(gray.rows, gray.cols, CV_8UC3);
+    render_body(grid, gw, gh, body.solid, yaw_deg, pitch_deg, bump_mm, &dist, user_zoom);
+    float ignored = 0;
+    render_body(grid, gw, gh, body.side, 78.f, -8.f, bump_mm, &ignored, 0);
+
+    std::vector<float> zs;
+    zs.reserve(grid.size() / 2);
+    body.P.reserve(grid.size());
+    body.N.reserve(grid.size());
+    auto displaced = [&](int iy, int ix, cv::Vec3f &p) -> bool {
+        if (iy < 0 || ix < 0 || iy >= gh || ix >= gw) return false;
+        const ShadeVert &v = grid[(size_t)iy * gw + ix];
+        if (!v.ok) return false;
+        p = cv::Vec3f(v.x, v.y, v.z - bump_mm * v.bump);
+        return true;
+    };
+    for (int iy = 0; iy < gh; iy++) {
+        for (int ix = 0; ix < gw; ix++) {
+            cv::Vec3f p, pr, pd;
+            if (!displaced(iy, ix, p)) continue;
+            cv::Vec3f nrm(0, 0, -1);
+            if (displaced(iy, ix + 1, pr) && displaced(iy + 1, ix, pd)) {
+                nrm = (pr - p).cross(pd - p);
+                float ln = std::sqrt(nrm.dot(nrm));
+                if (ln > 1e-6f) nrm /= ln;
+                else nrm = cv::Vec3f(0, 0, -1);
+                if (nrm[2] > 0.f) nrm = -nrm;
+            }
+            body.P.push_back(p);
+            body.N.push_back(nrm);
+            if (((iy * gw + ix) & 3) == 0) zs.push_back(p[2]);
+        }
+    }
+    if (!zs.empty()) {
+        size_t mid = zs.size() / 2;
+        std::nth_element(zs.begin(), zs.begin() + (ptrdiff_t)mid, zs.end());
+        body.median_mm = zs[mid];
+    }
+    body.tris.reserve((size_t)gw * gh * 2);
+    for (int gy = 0; gy < gh - 1; gy++) {
+        for (int gx = 0; gx < gw - 1; gx++) {
+            cv::Vec3f p00, p10, p01, p11;
+            bool a = displaced(gy, gx, p00);
+            bool b = displaced(gy, gx + 1, p10);
+            bool c0 = displaced(gy + 1, gx, p01);
+            bool d = displaced(gy + 1, gx + 1, p11);
+            if (a && b && c0 && cv::norm(p00 - p10) < 8.f && cv::norm(p00 - p01) < 8.f &&
+                cv::norm(p10 - p01) < 8.f)
+                body.tris.push_back(Tri{p00, p10, p01});
+            if (b && d && c0 && cv::norm(p10 - p11) < 8.f && cv::norm(p10 - p01) < 8.f &&
+                cv::norm(p11 - p01) < 8.f)
+                body.tris.push_back(Tri{p10, p11, p01});
+        }
+    }
+    return body;
+}
+
 static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_b,
-                          const cv::Mat &depth_m, int tracking) {
+                          const BodyView &body) {
     const int hero_w = L->size.width * 2;
     const int hero_h = L->size.height * 2;
     const int side_w = hero_w / 3;
     const int side_h = hero_h / 3;
     cv::Size side(side_w, side_h);
 
-    /* Depth is on the rectified left camera. Scatter it back through the
-     * rectify map so it lands on that camera's picture. */
-    const cv::Mat &sensor = (L->locked == 2 && !cam_b.empty()) ? cam_b : cam_a;
-    const char *which = (L->locked == 2) ? "camera B" : "camera A";
-    cv::Mat camera_view, relief;
-    if (!sensor.empty() && !depth_m.empty() && !L->geom.map1x.empty() &&
-        depth_m.size() == L->geom.map1x.size()) {
-        float med = depth_median_m(depth_m);
-        cv::Mat labels;
-        int best = 0;
-        object_mask(depth_m, med, labels, best);
-        cv::Mat cam_s, rel_s(sensor.size(), CV_8UC3, cv::Scalar(16, 16, 18));
-        cv::cvtColor(sensor, cam_s, cv::COLOR_GRAY2BGR);
-        cv::Mat sil(sensor.size(), CV_8U, cv::Scalar(0));
-        for (int y = 1; y < depth_m.rows - 1; y++) {
-            const float *row = depth_m.ptr<float>(y);
-            const float *up = depth_m.ptr<float>(y - 1);
-            const float *dn = depth_m.ptr<float>(y + 1);
-            const float *mx = L->geom.map1x.ptr<float>(y);
-            const float *my = L->geom.map1y.ptr<float>(y);
-            for (int x = 1; x < depth_m.cols - 1; x++) {
-                if (best == 0 || labels.at<int>(y, x) != best) continue;
-                float z = row[x];
-                if (z <= 0.f || up[x] <= 0.f || dn[x] <= 0.f || row[x - 1] <= 0.f || row[x + 1] <= 0.f)
-                    continue;
-                int iu = (int)std::lround(mx[x]);
-                int iv = (int)std::lround(my[x]);
-                if (iu < 1 || iv < 1 || iu >= sensor.cols - 1 || iv >= sensor.rows - 1) continue;
-                sil.at<uint8_t>(iv, iu) = 255;
-                float dx = (row[x + 1] - row[x - 1]) * 0.5f;
-                float dy = (dn[x] - up[x]) * 0.5f;
-                float nx = -L->geom.fx * dx / z;
-                float ny = -L->geom.fy * dy / z;
-                float nz = 1.f;
-                float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-                int shade = (int)(255.f * std::max(0.15f, nz / len));
-                int tex = sensor.at<uint8_t>(iv, iu);
-                rel_s.at<cv::Vec3b>(iv, iu) = cv::Vec3b((uint8_t)(shade * 0.45f + tex * 0.15f),
-                                                       (uint8_t)(shade * 0.55f + tex * 0.25f),
-                                                       (uint8_t)(shade * 0.75f + tex * 0.35f));
-            }
-        }
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(sil, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-        cv::drawContours(cam_s, contours, -1, cv::Scalar(60, 220, 80), 2, cv::LINE_AA);
-        cv::rotate(cam_s, camera_view, cv::ROTATE_180);
-        cv::rotate(rel_s, relief, cv::ROTATE_180);
-        cv::putText(camera_view, which, cv::Point(8, 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                    cv::Scalar(240, 240, 240), 1, cv::LINE_AA);
-        char cap[96];
-        snprintf(cap, sizeof cap, "3D  same view   %d/6 sides", coverage_count(L->covered));
-        cv::putText(relief, cap, cv::Point(8, 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                    cv::Scalar(240, 240, 240), 1, cv::LINE_AA);
-    }
     cv::Mat hero(hero_h, hero_w, CV_8UC3, cv::Scalar(12, 12, 12));
-    if (!camera_view.empty() && !relief.empty()) {
+    if (!body.camera.empty() && !body.solid.empty()) {
         cv::Mat left, right;
-        cv::resize(camera_view, left, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_NEAREST);
-        cv::resize(relief, right, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_NEAREST);
+        cv::resize(body.camera, left, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_AREA);
+        cv::resize(body.solid, right, cv::Size(hero_w / 2, hero_h), 0, 0, cv::INTER_AREA);
+        label_panel(left, "camera");
+        char cap[96];
+        snprintf(cap, sizeof cap, "3D   %d/6 sides", coverage_count(L->covered));
+        label_panel(right, cap);
         left.copyTo(hero(cv::Rect(0, 0, hero_w / 2, hero_h)));
         right.copyTo(hero(cv::Rect(hero_w / 2, 0, hero_w / 2, hero_h)));
     } else {
         cv::putText(hero, "waiting for a frame", cv::Point(12, hero_h / 2),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
     }
-    (void)tracking;
 
-    /* The Fox sensors are mounted upside down in the housing. The calibration
-     * and the depth stay in the sensor frame; only the pictures are turned. */
-    cv::Mat show_a, show_b, show_d;
+    /* The Fox sensors are mounted upside down in the housing. */
+    cv::Mat show_a, show_b;
     if (!cam_a.empty()) cv::rotate(cam_a, show_a, cv::ROTATE_180);
     if (!cam_b.empty()) cv::rotate(cam_b, show_b, cv::ROTATE_180);
-    if (!depth_m.empty()) cv::rotate(depth_m, show_d, cv::ROTATE_180);
     cv::Mat a = to_bgr(show_a, side);
     cv::Mat b = to_bgr(show_b, side);
-    cv::Mat d = depth_color(show_d.empty() ? depth_m : show_d, L->opt.min_mm, L->opt.max_mm, side);
+    cv::Mat d = body.side.empty() ? cv::Mat(side, CV_8UC3, cv::Scalar(12, 14, 18))
+                                  : to_bgr(body.side, side);
     label_panel(a, "camera A");
     label_panel(b, "camera B");
-    label_panel(d, "depth");
+    label_panel(d, "side");
 
     const int bar = 28;
     L->preview.create(bar + hero_h, hero_w + side_w, CV_8UC3);
@@ -1218,38 +1556,61 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     cv::resize(A, As, live->size, 0, 0, cv::INTER_AREA);
     cv::resize(B, Bs, live->size, 0, 0, cv::INTER_AREA);
 
-    /* Camera A is the calibrated reference. Swapping in B produces a
-     * dense-looking depth map that only covers a strip of the object. */
+    /* Camera B is the clean view (no projector dots). Its intrinsics are
+     * calib camera 2. The picture is turned upright inside make_body. */
+    const fox_pinhole &cam = live->calib.cam[1];
+    float yaw_deg = live->yaw * (180.f / 3.14159265f);
+    float pitch_deg = live->pitch * (180.f / 3.14159265f);
+    BodyView body = make_body(B, (float)cam.fx, (float)cam.fy, (float)cam.cx, (float)cam.cy,
+                              yaw_deg, pitch_deg, live->dist, live->user_zoom);
     live->locked = 1;
-    DepthFrame chosen = match_depth(live->geom, As, Bs, live->opt.min_mm, live->opt.max_mm);
 
     auto t1 = std::chrono::steady_clock::now();
     st.match_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    st.valid_pixels = chosen.valid;
-    st.median_mm = chosen.median_mm;
+    st.valid_pixels = (int)body.P.size();
+    st.median_mm = body.median_mm;
 
-    if (live->mode == FOX_MODE_SCAN && live->locked) {
-        std::vector<cv::Vec3f> P, Nn;
-        std::vector<SurfTri> tris;
-        build_object(chosen.depth_m, live->geom.fx, live->geom.fy, live->geom.cx, live->geom.cy, P, Nn, tris);
+    if (live->mode == FOX_MODE_SCAN) {
         cv::Matx33f R;
         cv::Vec3f t;
-        if (P.size() >= 80 && track_object(live, P, R, t)) {
+        if (body.P.size() >= 80 && track_object(live, body.P, R, t)) {
             std::vector<cv::Vec3f> Pm, Nm;
-            Pm.reserve(P.size());
-            Nm.reserve(Nn.size());
-            for (size_t i = 0; i < P.size(); i++) {
-                Pm.push_back(R * P[i] + t);
-                Nm.push_back(R * Nn[i]);
+            Pm.reserve(body.P.size());
+            Nm.reserve(body.N.size());
+            for (size_t i = 0; i < body.P.size(); i++) {
+                Pm.push_back(R * body.P[i] + t);
+                Nm.push_back(R * body.N[i]);
             }
             live->pose_R = R;
             live->pose_t = t;
             absorb_points(live, Pm, Nm);
-            note_coverage(live, Nn);
+            note_coverage(live, body.N);
+            /* Keep the high-resolution surface. A still object refreshes in
+             * place. A real turn adds another side instead of smearing. */
+            float ang = 0.f;
+            if (live->shell_set) {
+                cv::Matx33f dR = R * live->shell_R.t();
+                float tr = dR(0, 0) + dR(1, 1) + dR(2, 2);
+                float cs = (tr - 1.f) * 0.5f;
+                if (cs > 1.f) cs = 1.f;
+                if (cs < -1.f) cs = -1.f;
+                ang = std::acos(cs);
+            }
+            if (!live->shell_set || ang < 0.22f)
+                live->shell.resize(live->shell_mark);
+            else
+                live->shell_mark = live->shell.size();
+            if (live->shell.size() < 200000) {
+                for (const Tri &src : body.tris) {
+                    live->shell.push_back(Tri{R * src.a + t, R * src.b + t, R * src.c + t});
+                }
+            }
+            live->shell_R = R;
+            live->shell_set = 1;
             live->fused++;
             live->tracked_frames++;
             st.tracking = 1;
-        } else if (P.size() < 80) {
+        } else if (body.P.size() < 80) {
             st.tracking = -1;
         } else {
             live->lost++;
@@ -1266,8 +1627,7 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     snprintf(live->line1, sizeof live->line1,
              "%s   model %d pts   scanned %d/6 sides   z %.0f mm",
              mode_name, st.points, coverage_count(live->covered), st.median_mm);
-    live->align_gray = chosen.rect;
-    paint_preview(live, As, Bs, chosen.depth_m, st.tracking);
+    paint_preview(live, As, Bs, body);
     if (status) *status = st;
     return 0;
 }
@@ -1281,7 +1641,10 @@ const uint8_t *fox_live_preview_bgr(const fox_live *live, int *width, int *heigh
 
 int fox_live_write(fox_live *live, const char *stl_path, int *triangles_out) {
     std::vector<Tri> tris;
-    if (live && live->cloud.size() >= 80) {
+    if (live && live->shell.size() >= 80) {
+        fprintf(stderr, "writing %zu shell triangles\n", live->shell.size());
+        tris = live->shell;
+    } else if (live && live->cloud.size() >= 80) {
         fprintf(stderr, "meshing %zu model points\n", live->cloud.size());
         mesh_points(live->cloud, live->cloud_n, tris);
     } else if (live && live->kf) {
