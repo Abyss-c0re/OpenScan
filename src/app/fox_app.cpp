@@ -117,7 +117,9 @@ public:
         settings_btn = new QPushButton("Settings");
         exp = new QPushButton("Export…");
         start->setObjectName("start");
+        settings_btn->setObjectName("settings");
         settings_btn->setCheckable(true);
+        settings_btn->setChecked(true);
         exp->setObjectName("export");
 
         auto *tools = new QHBoxLayout;
@@ -127,12 +129,13 @@ public:
         tools->addWidget(pause);
         tools->addWidget(stop);
         tools->addWidget(reset);
-        tools->addStretch(1);
         tools->addWidget(settings_btn);
+        tools->addStretch(1);
         tools->addWidget(exp);
 
         settings = build_settings();
-        settings->setVisible(false);
+        settings->setObjectName("settingsPanel");
+        settings->setVisible(true);
 
         stage = new Stage;
         stage->setObjectName("stage");
@@ -418,8 +421,11 @@ static void style_app(QApplication &app) {
         "QPushButton#start:hover { background: #238548; }"
         "QPushButton#export { background: #8a5a14; border-color: #c48a2a; }"
         "QPushButton#export:hover { background: #a56b18; }"
-        "QPushButton:checked { background: #3a414b; border-color: #9aa3b2; }"
+        "QPushButton#settings { background: #1d4e8a; border-color: #3d7ec8; }"
+        "QPushButton#settings:hover { background: #2460a8; }"
+        "QPushButton#settings:checked { background: #163a68; border-color: #8eb7e8; }"
         "QPushButton#quiet { padding: 4px 12px; font-size: 13px; }"
+        "QWidget#settingsPanel { background: #262a30; border-bottom: 1px solid #5c636e; }"
         "QStatusBar { background: #14161a; color: #d0d0d0; }"
         "QLabel#stage { background: #121418; }"
         "QSlider::groove:horizontal { height: 4px; background: #3a414b; border-radius: 2px; }"

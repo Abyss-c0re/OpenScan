@@ -26,7 +26,7 @@ Drag the 3D view to orbit it. The wheel zooms.
 
 ## Settings
 
-**Settings** opens the camera and size controls. They are saved and used the next time the app starts.
+The camera and size controls are open under the toolbar when the app starts. **Settings** hides or shows that row. The values are saved and used the next time the app starts.
 
 | Setting | What to do |
 | --- | --- |
