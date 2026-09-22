@@ -78,6 +78,8 @@ static int http_get(const char *url, struct Mem *m) {
     CURL *c = curl_easy_init();
     if (!c) return -1;
     curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(c, CURLOPT_UPLOAD, 0L);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 20L);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, mem_write);
@@ -109,7 +111,9 @@ static int lookup_url(const char *serial, char *url_out, size_t url_n) {
         struct Mem m = {0};
         CURL *c = curl_easy_init();
         if (!c) break;
+        /* Lookup only. The calibration file is never uploaded. */
         curl_easy_setopt(c, CURLOPT_URL, kHosts[i]);
+        curl_easy_setopt(c, CURLOPT_UPLOAD, 0L);
         curl_easy_setopt(c, CURLOPT_POST, 1L);
         curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdr);
@@ -149,12 +153,12 @@ int fox_calib_fetch(const char *serial, const char *dest_path) {
     if (!serial || !serial[0] || !dest_path) return -1;
     char url[1024];
     if (lookup_url(serial, url, sizeof url) != 0) {
-        fprintf(stderr, "no factory calibration for %s\n", serial);
+        fprintf(stderr, "no factory calibration on the server\n");
         return -1;
     }
     struct Mem file = {0};
     if (http_get(url, &file) != 0 || !looks_like_calib(file.data)) {
-        fprintf(stderr, "calibration download for %s was not a calib file\n", serial);
+        fprintf(stderr, "calibration download was not a calib file\n");
         free(file.data);
         return -1;
     }
@@ -222,10 +226,10 @@ int fox_calib_ensure(const char *serial, const char *explicit_path,
         return 0;
 
     if (xdg_calib_path(serial, path, sizeof path) != 0) return -1;
-    fprintf(stderr, "fetching calibration for %s\n", serial);
+    fprintf(stderr, "fetching factory calibration\n");
     if (fox_calib_fetch(serial, path) != 0) return -1;
     if (try_load(path, out, used_path, used_n) != 0) return -1;
-    fprintf(stderr, "saved %s\n", path);
+    fprintf(stderr, "saved factory calibration\n");
     return 0;
 }
 

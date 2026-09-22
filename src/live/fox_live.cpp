@@ -13,7 +13,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <strings.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -35,22 +37,25 @@ static const int kCorner[8][3] = {
     {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1},
 };
 
+static cv::Vec3f tri_normal(const Tri &t) {
+    cv::Vec3f n = (t.b - t.a).cross(t.c - t.a);
+    float len = std::sqrt(n.dot(n));
+    if (len < 1e-12f) return cv::Vec3f(0, 0, 1);
+    return n / len;
+}
+
+/* Geometry only. No serial, no calibration text, no device id. */
 static int write_stl(const char *path, const std::vector<Tri> &tris) {
     FILE *fp = fopen(path, "wb");
     if (!fp) return -1;
     char header[80];
     memset(header, 0, sizeof header);
-    snprintf(header, sizeof header, "fox3d fused %zu triangles", tris.size());
+    memcpy(header, "fox3d mesh", 10);
     fwrite(header, 1, 80, fp);
     uint32_t n = (uint32_t)tris.size();
     fwrite(&n, 4, 1, fp);
     for (const Tri &t : tris) {
-        cv::Vec3f u = t.b - t.a;
-        cv::Vec3f v = t.c - t.a;
-        cv::Vec3f nn = u.cross(v);
-        float len = std::sqrt(nn.dot(nn));
-        if (len < 1e-12f) nn = cv::Vec3f(0, 0, 1);
-        else nn /= len;
+        cv::Vec3f nn = tri_normal(t);
         float rec[12] = {
             nn[0], nn[1], nn[2],
             t.a[0], t.a[1], t.a[2],
@@ -63,6 +68,56 @@ static int write_stl(const char *path, const std::vector<Tri> &tris) {
     }
     fclose(fp);
     return 0;
+}
+
+static int write_obj(const char *path, const std::vector<Tri> &tris) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    fprintf(fp, "# fox3d mesh\n");
+    int idx = 1;
+    for (const Tri &t : tris) {
+        cv::Vec3f n = tri_normal(t);
+        const cv::Vec3f *p[3] = {&t.a, &t.b, &t.c};
+        for (int i = 0; i < 3; i++) {
+            fprintf(fp, "v %.6f %.6f %.6f\n", (*p[i])[0], (*p[i])[1], (*p[i])[2]);
+            fprintf(fp, "vn %.6f %.6f %.6f\n", n[0], n[1], n[2]);
+        }
+        fprintf(fp, "f %d//%d %d//%d %d//%d\n", idx, idx, idx + 1, idx + 1, idx + 2, idx + 2);
+        idx += 3;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static int write_ply(const char *path, const std::vector<Tri> &tris) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    fprintf(fp, "ply\nformat ascii 1.0\n");
+    fprintf(fp, "element vertex %zu\n", tris.size() * 3);
+    fprintf(fp, "property float x\nproperty float y\nproperty float z\n");
+    fprintf(fp, "property float nx\nproperty float ny\nproperty float nz\n");
+    fprintf(fp, "element face %zu\n", tris.size());
+    fprintf(fp, "property list uchar int vertex_indices\n");
+    fprintf(fp, "end_header\n");
+    for (const Tri &t : tris) {
+        cv::Vec3f n = tri_normal(t);
+        const cv::Vec3f *p[3] = {&t.a, &t.b, &t.c};
+        for (int i = 0; i < 3; i++)
+            fprintf(fp, "%.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    (*p[i])[0], (*p[i])[1], (*p[i])[2], n[0], n[1], n[2]);
+    }
+    for (size_t i = 0; i < tris.size(); i++)
+        fprintf(fp, "3 %zu %zu %zu\n", i * 3, i * 3 + 1, i * 3 + 2);
+    fclose(fp);
+    return 0;
+}
+
+static int write_mesh(const char *path, const std::vector<Tri> &tris) {
+    const char *dot = strrchr(path, '.');
+    if (dot && !strcasecmp(dot, ".obj")) return write_obj(path, tris);
+    if (dot && !strcasecmp(dot, ".ply")) return write_ply(path, tris);
+    if (!dot || !strcasecmp(dot, ".stl")) return write_stl(path, tris);
+    return -1;
 }
 
 /* sdf < 0 is inside. When weight is non-empty, a corner with weight <= 0 is
@@ -464,12 +519,28 @@ struct fox_live {
     size_t shell_mark = 0;
     cv::Matx33f shell_R = cv::Matx33f::eye();
     int shell_set = 0;
+    struct Sample {
+        cv::Vec3f p;
+        float w = 0.f;
+        int n = 0;
+    };
     struct Wedge {
         std::vector<Tri> tris;
         float quality = 10.f;
         int filled = 0;
     };
     std::vector<Wedge> wedge;
+    /* Cylindrical samples. A repeat pass blends into the same cells and
+     * fills any that were still empty, so the surface gains detail. */
+    std::unordered_map<uint64_t, Sample> cells;
+    struct TriRef {
+        cv::Vec3f p[3];
+        uint64_t k[3];
+        int bin;
+    };
+    std::vector<TriRef> refs;
+    std::unordered_set<uint64_t> seen_cells;
+    int detail = 1;
     float object_yaw = 0.f;
     cv::Mat track_ref;
     int track_have = 0;
@@ -539,6 +610,10 @@ void fox_live_reset(fox_live *live) {
     live->shell_R = cv::Matx33f::eye();
     live->shell_set = 0;
     live->wedge.assign(72, fox_live::Wedge{});
+    live->cells.clear();
+    live->refs.clear();
+    live->seen_cells.clear();
+    live->detail = 1;
     live->object_yaw = 0.f;
     live->track_ref.release();
     live->track_have = 0;
@@ -547,7 +622,8 @@ void fox_live_reset(fox_live *live) {
     live->have_axis = 0;
     live->scanned_bins = 0;
     live->mode = FOX_MODE_STOP;
-    snprintf(live->line1, sizeof live->line1, "STOPPED   scanned 0°   not scanned 360°   0 tris");
+    snprintf(live->line1, sizeof live->line1,
+             "STOPPED   scanned 0°   not scanned 360°   detail x1   0 tris");
 }
 
 void fox_live_set_mode(fox_live *live, int mode) {
@@ -1588,6 +1664,14 @@ static int track_spin(fox_live *L, const BodyView &body, float &response) {
     return 1;
 }
 
+static uint64_t cell_key(int ia, int iy) {
+    return ((uint64_t)(uint32_t)ia << 32) | (uint32_t)iy;
+}
+
+/* One observation per cell this frame, then blended into the running surface.
+ * A frontal view counts for more than a grazing one. Repeat passes raise the
+ * weight and pull the point toward the new measurement instead of replacing
+ * the patch. */
 static void fuse_shell(fox_live *L, const BodyView &body, float fx) {
     if (L->wedge.size() != (size_t)kBins) L->wedge.assign(kBins, fox_live::Wedge{});
     if (!L->have_axis) {
@@ -1599,42 +1683,126 @@ static void fuse_shell(fox_live *L, const BodyView &body, float fx) {
     }
     cv::Matx33f R = rot_y(-L->object_yaw);
     const float kGraz = 58.f * 3.14159265f / 180.f;
-    std::vector<std::vector<Tri>> add((size_t)kBins);
-    std::vector<float> q((size_t)kBins, 10.f);
+    const float cell = 0.65f;
+    const float Rmm = std::max(8.f, L->radius_mm);
+    struct Acc {
+        cv::Vec3f sum;
+        int n = 0;
+        float view = 0.f;
+        int bin = 0;
+    };
+    std::unordered_map<uint64_t, Acc> frame;
+    frame.reserve(body.tris.size());
     for (const Tri &src : body.tris) {
         cv::Vec3f v[3] = {src.a, src.b, src.c};
-        cv::Vec3f midc = (v[0] + v[1] + v[2]) * (1.f / 3.f);
-        cv::Vec3f relc = midc - body.axis;
-        float cam_ang = std::atan2(relc[0], -relc[2]);
-        if (std::fabs(cam_ang) > kGraz) continue;
-        cv::Vec3f w[3];
-        for (int i = 0; i < 3; i++) w[i] = R * (v[i] - body.axis) + L->axis0;
-        cv::Vec3f mid = (w[0] + w[1] + w[2]) * (1.f / 3.f);
-        cv::Vec3f rel = mid - L->axis0;
-        int b = bin_of(rel[0], rel[2]);
-        float qq = std::fabs(cam_ang);
-        add[(size_t)b].push_back(Tri{w[0], w[1], w[2]});
-        q[(size_t)b] = std::min(q[(size_t)b], qq);
         for (int i = 0; i < 3; i++) {
-            L->span_y0 = std::min(L->span_y0, w[i][1]);
-            L->span_y1 = std::max(L->span_y1, w[i][1]);
+            cv::Vec3f rel = v[i] - body.axis;
+            float cam_ang = std::atan2(rel[0], -rel[2]);
+            if (std::fabs(cam_ang) > kGraz) continue;
+            cv::Vec3f w = R * rel + L->axis0;
+            cv::Vec3f from_axis = w - L->axis0;
+            float ang = std::atan2(from_axis[0], -from_axis[2]);
+            int ia = (int)std::lround((ang * Rmm) / cell);
+            int iy = (int)std::lround(w[1] / cell);
+            Acc &a = frame[cell_key(ia, iy)];
+            a.sum += w;
+            a.n++;
+            float view = std::max(0.35f, 1.f - std::fabs(cam_ang) / kGraz);
+            if (view > a.view) {
+                a.view = view;
+                a.bin = bin_of(from_axis[0], from_axis[2]);
+            }
+            L->span_y0 = std::min(L->span_y0, w[1]);
+            L->span_y1 = std::max(L->span_y1, w[1]);
         }
     }
-    for (int b = 0; b < kBins; b++) {
-        if (add[(size_t)b].size() < 8) continue;
-        fox_live::Wedge &dst = L->wedge[(size_t)b];
-        bool better = !dst.filled || q[(size_t)b] + 0.05f < dst.quality;
-        bool refresh = dst.filled && q[(size_t)b] < 0.40f && dst.quality < 0.55f;
-        if (better || refresh) {
-            dst.tris.swap(add[(size_t)b]);
-            dst.quality = q[(size_t)b];
-            dst.filled = 1;
+    if (frame.size() < 30) return;
+    std::unordered_map<uint64_t, cv::Vec3f> before;
+    before.reserve(frame.size());
+    for (const auto &kv : frame) {
+        auto it = L->cells.find(kv.first);
+        if (it != L->cells.end() && it->second.n > 0) before.emplace(kv.first, it->second.p);
+    }
+    for (const auto &kv : frame) {
+        const Acc &a = kv.second;
+        cv::Vec3f p = a.sum * (1.f / (float)a.n);
+        fox_live::Sample &s = L->cells[kv.first];
+        if (s.n <= 0) {
+            s.p = p;
+            s.w = a.view;
+            s.n = 1;
+        } else {
+            float keep = s.w / (s.w + a.view);
+            s.p = s.p * keep + p * (1.f - keep);
+            s.w = std::min(s.w + a.view, 24.f);
+            s.n++;
         }
+        int b = a.bin;
+        if (b >= 0 && b < kBins) {
+            L->wedge[(size_t)b].filled = 1;
+            L->wedge[(size_t)b].quality = std::min(L->wedge[(size_t)b].quality, 1.f - a.view);
+        }
+    }
+    for (fox_live::TriRef &ref : L->refs) {
+        for (int i = 0; i < 3; i++) {
+            auto old = before.find(ref.k[i]);
+            auto cur = L->cells.find(ref.k[i]);
+            if (old == before.end() || cur == L->cells.end()) continue;
+            ref.p[i] += cur->second.p - old->second;
+        }
+    }
+    /* The first time a spot is seen, keep that triangle. A later pass moves
+     * the vertices above. A pass over a gap adds the new triangles. */
+    auto key_of = [&](const cv::Vec3f &w) {
+        cv::Vec3f rel = w - L->axis0;
+        float ang = std::atan2(rel[0], -rel[2]);
+        int ia = (int)std::lround((ang * Rmm) / cell);
+        int iy = (int)std::lround(w[1] / cell);
+        return cell_key(ia, iy);
+    };
+    std::unordered_set<uint64_t> fresh;
+    for (const Tri &src : body.tris) {
+        cv::Vec3f corners[3] = {src.a, src.b, src.c};
+        cv::Vec3f w[3];
+        bool graz = false;
+        for (int i = 0; i < 3; i++) {
+            cv::Vec3f rel = corners[i] - body.axis;
+            if (std::fabs(std::atan2(rel[0], -rel[2])) > kGraz) graz = true;
+            w[i] = R * rel + L->axis0;
+        }
+        if (graz) continue;
+        cv::Vec3f mid = (w[0] + w[1] + w[2]) * (1.f / 3.f);
+        uint64_t ck = key_of(mid);
+        if (L->seen_cells.count(ck)) continue;
+        fresh.insert(ck);
+        fox_live::TriRef ref;
+        ref.bin = bin_of(mid[0] - L->axis0[0], mid[2] - L->axis0[2]);
+        for (int i = 0; i < 3; i++) {
+            ref.k[i] = key_of(w[i]);
+            ref.p[i] = w[i];
+        }
+        L->refs.push_back(ref);
+        if (ref.bin >= 0 && ref.bin < kBins) L->wedge[(size_t)ref.bin].filled = 1;
+    }
+    L->seen_cells.insert(fresh.begin(), fresh.end());
+    for (auto &wd : L->wedge) wd.tris.clear();
+    for (const fox_live::TriRef &ref : L->refs) {
+        if (ref.bin < 0 || ref.bin >= kBins) continue;
+        if (cv::norm(ref.p[0] - ref.p[1]) > 8.f || cv::norm(ref.p[0] - ref.p[2]) > 8.f) continue;
+        L->wedge[(size_t)ref.bin].tris.push_back(Tri{ref.p[0], ref.p[1], ref.p[2]});
+        L->wedge[(size_t)ref.bin].filled = 1;
     }
     int n = 0;
+    long passes = 0;
+    int cells = 0;
     for (const auto &w : L->wedge)
         if (w.filled) n++;
+    for (const auto &kv : L->cells) {
+        passes += kv.second.n;
+        cells++;
+    }
     L->scanned_bins = n;
+    L->detail = cells ? std::max(1, (int)(passes / cells)) : 1;
 }
 
 static int model_tris(const fox_live *L) {
@@ -1806,7 +1974,8 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
         int deg = (int)std::lround(L->scanned_bins * (360.0 / kBins));
         char cap[96];
         if (L->scanned_bins > 0)
-            snprintf(cap, sizeof cap, "3D   scanned %d°   open %d°", deg, 360 - deg);
+            snprintf(cap, sizeof cap, "3D   scanned %d°   open %d°   detail x%d", deg, 360 - deg,
+                     std::max(1, L->detail));
         else
             snprintf(cap, sizeof cap, "3D");
         label_panel(right, cap);
@@ -1963,12 +2132,13 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     st.mode = live->mode;
     st.points = model_tris(live);
     st.scanned_deg = (int)std::lround(live->scanned_bins * (360.0 / kBins));
+    st.detail = std::max(1, live->detail);
     const char *mode_name = live->mode == FOX_MODE_SCAN ? "SCANNING" :
                             live->mode == FOX_MODE_PAUSE ? "PAUSED" : "STOPPED";
     const char *lost = (live->mode == FOX_MODE_SCAN && st.tracking == 0) ? "   TRACKING LOST" : "";
     snprintf(live->line1, sizeof live->line1,
-             "%s   scanned %d°   not scanned %d°   %d tris%s",
-             mode_name, st.scanned_deg, 360 - st.scanned_deg, st.points, lost);
+             "%s   scanned %d°   not scanned %d°   detail x%d   %d tris%s",
+             mode_name, st.scanned_deg, 360 - st.scanned_deg, st.detail, st.points, lost);
     paint_preview(live, As, Bs, body);
     if (status) *status = st;
     return 0;
@@ -2020,7 +2190,7 @@ int fox_live_write(fox_live *live, const char *stl_path, int *triangles_out) {
                     pts.rows, pts.cols, pts.type());
         }
     }
-    if (write_stl(stl_path, tris) < 0) return -1;
+    if (write_mesh(stl_path, tris) < 0) return -1;
     if (triangles_out) *triangles_out = (int)tris.size();
     return 0;
 }
@@ -2056,5 +2226,28 @@ int fox_mesh_self_test(void) {
         }
     }
     fprintf(stderr, "mesh self-test: %zu triangles, max radius error %.3f mm\n", tris.size(), worst);
-    return worst < 1.2 ? 0 : 1;
+    if (worst >= 1.2) return 1;
+
+    Tri one{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
+    std::vector<Tri> one_tri{one};
+    const char *outs[] = {"/tmp/fox3d-export.stl", "/tmp/fox3d-export.obj", "/tmp/fox3d-export.ply"};
+    for (const char *path : outs) {
+        if (write_mesh(path, one_tri) != 0) {
+            fprintf(stderr, "mesh self-test: could not write %s\n", path);
+            return 1;
+        }
+        FILE *fp = fopen(path, "rb");
+        if (!fp) return 1;
+        char buf[4096];
+        size_t n = fread(buf, 1, sizeof buf - 1, fp);
+        fclose(fp);
+        remove(path);
+        buf[n] = 0;
+        if (strstr(buf, "JMM") || strstr(buf, "DevID") || strstr(buf, "serial")) {
+            fprintf(stderr, "mesh self-test: %s contains a device id\n", path);
+            return 1;
+        }
+    }
+    fprintf(stderr, "mesh self-test: stl, obj, and ply written with geometry only\n");
+    return 0;
 }

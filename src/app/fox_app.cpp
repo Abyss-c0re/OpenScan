@@ -6,6 +6,7 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <algorithm>
 #include <cstdio>
 
 #include <QApplication>
@@ -108,7 +109,7 @@ public:
         pause = new QPushButton("Pause");
         stop = new QPushButton("Stop");
         reset = new QPushButton("Reset");
-        exp = new QPushButton("Export STL…");
+        exp = new QPushButton("Export…");
         start->setObjectName("start");
         exp->setObjectName("export");
 
@@ -155,7 +156,7 @@ public:
             statusBar()->showMessage(serial + "   ready   scan cleared");
             refresh_buttons();
         });
-        connect(exp, &QPushButton::clicked, this, [this] { export_stl(); });
+        connect(exp, &QPushButton::clicked, this, [this] { export_mesh(); });
 
         refresh_buttons();
         timer = new QTimer(this);
@@ -187,23 +188,30 @@ private:
         reset->setEnabled(mode != FOX_MODE_STOP || fox_live_points(live) > 0);
     }
 
-    void export_stl() {
+    void export_mesh() {
         if (fox_live_points(live) < 80) {
-            QMessageBox::information(this, "Export STL",
+            QMessageBox::information(this, "Export mesh",
                                      "There is nothing to export yet.\n\n"
                                      "Start a scan, rotate the object until the 3D view fills in, "
                                      "then export.");
             return;
         }
-        QString path = QFileDialog::getSaveFileName(this, "Export STL", "model.stl", "STL model (*.stl)");
+        QString selected;
+        QString path = QFileDialog::getSaveFileName(
+            this, "Export mesh", "model.stl",
+            "STL (*.stl);;Wavefront OBJ (*.obj);;PLY (*.ply)", &selected);
         if (path.isEmpty()) return;
-        if (!path.endsWith(".stl", Qt::CaseInsensitive)) path += ".stl";
+        if (!path.contains('.')) {
+            if (selected.contains("OBJ")) path += ".obj";
+            else if (selected.contains("PLY")) path += ".ply";
+            else path += ".stl";
+        }
         int tris = 0;
         if (fox_live_write(live, path.toUtf8().constData(), &tris) != 0) {
-            QMessageBox::warning(this, "Export STL", "Could not write " + path);
+            QMessageBox::warning(this, "Export mesh", "Could not write " + path);
             return;
         }
-        QMessageBox::information(this, "Export STL",
+        QMessageBox::information(this, "Export mesh",
                                  QString("Saved %1\n%2 triangles.").arg(path).arg(tris));
     }
 
@@ -229,10 +237,11 @@ private:
                 const char *mode = st.mode == FOX_MODE_SCAN ? "scanning" :
                                    st.mode == FOX_MODE_PAUSE ? "paused" : "ready";
                 statusBar()->showMessage(
-                    QString("%1   %2   scanned %3°   not scanned %4°   %5 tris")
+                    QString("%1   %2   scanned %3°   not scanned %4°   detail x%5   %6 tris")
                         .arg(serial, mode)
                         .arg(st.scanned_deg)
                         .arg(360 - st.scanned_deg)
+                        .arg(std::max(1, st.detail))
                         .arg(st.points));
                 refresh_buttons();
             }

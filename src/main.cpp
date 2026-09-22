@@ -28,7 +28,7 @@ static void usage(const char *argv0) {
             "  %s\n"
             "      Open the app. The cameras and 3D view come up idle.\n"
             "      Start scan when the object is in view. Reset clears it so\n"
-            "      the next Start is a new scan. Export STL when ready.\n"
+            "      the next Start is a new scan. Export writes STL, OBJ, or PLY.\n"
             "      Closing the window quits.\n"
             "\n"
             "Usage:\n"
@@ -207,7 +207,7 @@ static int load_calib_for(const char *serial, const char *explicit_path, fox_cal
         if (explicit_path)
             fprintf(stderr, "cannot read calib %s\n", explicit_path);
         else
-            fprintf(stderr, "no calibration for %s on disk or from the factory server\n", serial);
+            fprintf(stderr, "no calibration on disk or from the factory server\n");
         return -1;
     }
     printf("calib %s  %dx%d  baseline %.2f mm  date %s\n",
@@ -392,8 +392,9 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
         pushed++;
         const char *mode_name = st.mode == FOX_MODE_SCAN ? "scanning" :
                                 st.mode == FOX_MODE_PAUSE ? "paused" : "stopped";
-        printf("\r%-8s  scanned %3d°  open %3d°  tris %6d  z %5.0f mm  %4.0f ms   ",
-               mode_name, st.scanned_deg, 360 - st.scanned_deg, st.points, st.median_mm, st.match_ms);
+        printf("\r%-8s  scanned %3d°  open %3d°  detail x%-2d  tris %6d  z %5.0f mm  %4.0f ms   ",
+               mode_name, st.scanned_deg, 360 - st.scanned_deg, st.detail, st.points, st.median_mm,
+               st.match_ms);
         fflush(stdout);
         if (fox_live_take_save(live)) {
             int tris = 0;
