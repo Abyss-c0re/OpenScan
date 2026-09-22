@@ -133,8 +133,8 @@ public:
         mold_btn->setChecked(saved_shape == FOX_SHAPE_MOLD);
         measured_btn->setChecked(saved_shape == FOX_SHAPE_MEASURED);
         mold_btn->setToolTip("Solid molding model. It stays one object when you turn it or orbit the view.");
-        measured_btn->setToolTip("The surface the stripes measured on the side facing the camera. "
-                                 "Turning updates that view. It does not spin copies into a pile.");
+        measured_btn->setToolTip("Builds the model from the projector stripes. Each new view is aligned "
+                                 "to the surface already scanned and added. A view that does not fit is dropped.");
 
         auto *tools = new QHBoxLayout;
         tools->setContentsMargins(12, 10, 12, 6);
@@ -344,8 +344,8 @@ private:
         dist_n->setText(QString("%1 mm").arg(dist->value()));
 
         auto *hint = new QLabel(
-            "Mold is the solid you can turn. Measured is the stripe surface facing the camera. "
-            "Switching clears the model. Distance is kept for the next launch.");
+            "Mold is the solid you can turn. Measured builds a model from the stripes: "
+            "each new view is aligned and added. Switching clears the model.");
         hint->setWordWrap(true);
         grid->addWidget(hint, 5, 0, 1, 2);
         auto *defaults = new QPushButton("Defaults");

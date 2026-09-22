@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fox3d VERSION 0.6.1 LANGUAGES C CXX)
+project(fox3d VERSION 0.6.2 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

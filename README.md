@@ -1,6 +1,6 @@
 # fox3d
 
-Linux program for the 3DMakerpro Fox scanner (JMM8), version 0.6.1. It shows both cameras, follows one object as you move the scanner around it, and exports that mesh.
+Linux program for the 3DMakerpro Fox scanner (JMM8), version 0.6.2. It shows both cameras, follows one object as you move the scanner around it, and exports that mesh.
 
 `fox3d --version` prints the version. Releases are git tags `vX.Y.Z`. The notes are in [CHANGELOG.md](CHANGELOG.md).
 
@@ -92,7 +92,7 @@ The window opens idle.
 | Reset | Drop the model and return to idle. The next Start is a new scan. |
 | Export… | Write STL, OBJ, or PLY. The file stays on this computer. |
 | Mold | Solid molding model. It stays one object when the object turns and when you orbit the view. This is the default. |
-| Measured | The surface the projector stripes measured on the side facing the camera. A turn updates that view. It does not stack rotated copies. |
+| Measured | Builds the model from the projector stripes. Each new view is aligned to what is already scanned and added. A view that does not fit is dropped. |
 | Settings | Shows or hides the camera and distance row. That row is open at launch: camera A and B exposure and gain, and distance (100–500 mm). In Mold, distance is the size of the solid. In Measured, it identifies the stripes. Saved for the next launch. Switching mode clears the model. |
 
 Move around the object, closer, or above it. The tracker follows that object's point cloud and ignores the background. The status line shows how much of it is scanned and **detail xN**. Going over a side again raises that count and updates the surface there. If the line says **TRACKING LOST**, you left the object or moved too fast. That frame is not added.

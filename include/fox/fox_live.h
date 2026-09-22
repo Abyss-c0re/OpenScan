@@ -19,7 +19,8 @@ typedef struct fox_live fox_live;
 #define FOX_MODE_PAUSE 2
 
 /* Mold is the solid body that stays one object when it is turned.
- * Measured is the stripe surface facing the camera, and only that surface. */
+ * Measured decodes the projector stripes and merges each new view into
+ * the model, which is how the original scanner builds a scan. */
 #define FOX_SHAPE_MOLD     0
 #define FOX_SHAPE_MEASURED 1
 

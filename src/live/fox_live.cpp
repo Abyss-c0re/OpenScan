@@ -2086,7 +2086,9 @@ static cv::Vec3f world_of(const cv::Vec3f &p, const cv::Matx33f &R, const cv::Ve
     return scale * (R * p) + t;
 }
 
-static void fuse_shell(fox_live *L, const BodyView &body) {
+/* measured: align this depth surface onto the model, then merge.
+ * Returns 0 when the view does not land on the model. */
+static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
     if (L->wedge.size() != (size_t)kBins) L->wedge.assign(kBins, fox_live::Wedge{});
     /* Positive object_yaw is a turn whose texture moved left. The shell that
      * is in front of the camera belonged on the other side, so it is swung
@@ -2101,11 +2103,26 @@ static void fuse_shell(fox_live *L, const BodyView &body) {
         L->span_y1 = -1e9f;
     }
     cv::Vec3f t = L->axis0 - R * axis;
-    const float scale = 1.f;
+    float scale = 1.f;
+    if (measured && L->cloud.size() >= 80) {
+        cv::Matx33f keep_R = L->pose_R;
+        cv::Vec3f keep_t = L->pose_t;
+        float keep_s = L->pose_s;
+        L->pose_R = R;
+        L->pose_t = t;
+        L->pose_s = 1.f;
+        if (!track_object(L, body.P, R, t, scale)) {
+            L->pose_R = keep_R;
+            L->pose_t = keep_t;
+            L->pose_s = keep_s;
+            return 0;
+        }
+        L->object_yaw = std::atan2(-R(0, 2), R(0, 0));
+    }
     L->pose_R = R;
     L->pose_t = t;
     L->pose_s = scale;
-    const float cell = 0.8f;
+    const float cell = measured ? 1.4f : 0.8f;
     struct Acc {
         cv::Vec3f sum;
         int n = 0;
@@ -2119,7 +2136,14 @@ static void fuse_shell(fox_live *L, const BodyView &body) {
         int iz = (int)std::lround(w[2] / cell);
         return voxel_key(ix, iy, iz);
     };
+    auto faces_camera = [&](const Tri &src) {
+        if (!measured) return true;
+        cv::Vec3f n = (src.b - src.a).cross(src.c - src.a);
+        float ln = std::sqrt(n.dot(n));
+        return ln > 1e-6f && n[2] / ln <= -0.35f;
+    };
     for (const Tri &src : body.tris) {
+        if (!faces_camera(src)) continue;
         cv::Vec3f corners[3] = {src.a, src.b, src.c};
         for (int i = 0; i < 3; i++) {
             cv::Vec3f w = world_of(corners[i], R, t, scale);
@@ -2130,7 +2154,7 @@ static void fuse_shell(fox_live *L, const BodyView &body) {
             L->span_y1 = std::max(L->span_y1, w[1]);
         }
     }
-    if (frame.size() < 30) return;
+    if (frame.size() < 30) return measured ? 0 : 1;
     std::unordered_map<uint64_t, cv::Vec3f> before;
     before.reserve(frame.size());
     for (const auto &kv : frame) {
@@ -2167,6 +2191,7 @@ static void fuse_shell(fox_live *L, const BodyView &body) {
      * the vertices above. A pass over a gap adds the new triangles. */
     std::unordered_set<uint64_t> fresh;
     for (const Tri &src : body.tris) {
+        if (!faces_camera(src)) continue;
         cv::Vec3f corners[3] = {src.a, src.b, src.c};
         cv::Vec3f w[3];
         for (int i = 0; i < 3; i++) w[i] = world_of(corners[i], R, t, scale);
@@ -2220,6 +2245,7 @@ static void fuse_shell(fox_live *L, const BodyView &body) {
         if (!wd.tris.empty()) nbin++;
     L->scanned_bins = nbin;
     L->detail = cells ? std::max(1, (int)(passes / cells)) : 1;
+    return 1;
 }
 
 static int model_tris(const fox_live *L) {
@@ -2341,7 +2367,8 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     cv::Mat hero(hero_h, hero_w, CV_8UC3, cv::Scalar(12, 12, 12));
     cv::Mat solid = body.solid;
     cv::Mat model;
-    if (L->shape != FOX_SHAPE_MEASURED && L->scanned_bins > 0) {
+    if ((L->shape == FOX_SHAPE_MEASURED && L->fused > 0) ||
+        (L->shape != FOX_SHAPE_MEASURED && L->scanned_bins > 0)) {
         model.create(view_h, view_w, CV_8UC3);
         render_model(L, model);
         solid = model;
@@ -2521,14 +2548,7 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     st.valid_pixels = (int)body.P.size();
     st.median_mm = body.median_mm;
 
-    if (measured) {
-        /* A measured face is one surface. Spinning each new frame around Y
-         * stacks sheets through each other, which is the mess when it turns. */
-        live->shell = body.tris;
-        live->last_track = body.P.size() >= 80 ? 1 : -1;
-        st.tracking = live->last_track;
-        if (live->mode == FOX_MODE_SCAN && body.tris.size() >= 80) live->fused = 1;
-    } else if (live->mode == FOX_MODE_SCAN || live->mode == FOX_MODE_PAUSE) {
+    if (live->mode == FOX_MODE_SCAN || live->mode == FOX_MODE_PAUSE) {
         float response = 0.f;
         int trk = track_spin(live, body, response);
         live->last_track = trk;
@@ -2538,23 +2558,32 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
             if (live->mode == FOX_MODE_SCAN) live->lost++;
             st.tracking = 0;
         } else if (live->mode == FOX_MODE_SCAN) {
-            fuse_shell(live, body);
-            live->fused++;
-            live->tracked_frames++;
-            st.tracking = 1;
+            /* Measured aligns this depth surface to the model and adds the
+             * new part. A view that does not land is dropped. Mold always
+             * keeps the turned solid. */
+            int added = fuse_shell(live, body, measured);
+            if (added || !measured) {
+                live->fused++;
+                live->tracked_frames++;
+                st.tracking = 1;
+            } else {
+                live->lost++;
+                st.tracking = 0;
+            }
         } else {
             st.tracking = 1;
         }
     } else {
         live->last_track = -1;
         st.tracking = body.P.size() >= 80 ? 1 : -1;
+        if (measured && live->fused == 0) live->shell = body.tris;
     }
 
     st.fused = live->fused;
     st.lost = live->lost;
     st.mode = live->mode;
-    st.points = measured ? (int)live->shell.size() : model_tris(live);
-    st.scanned_deg = measured ? 0 : (int)std::lround(live->scanned_bins * (360.0 / kBins));
+    st.points = (measured && live->fused == 0) ? (int)live->shell.size() : model_tris(live);
+    st.scanned_deg = (int)std::lround(live->scanned_bins * (360.0 / kBins));
     st.detail = std::max(1, live->detail);
     const char *mode_name = live->mode == FOX_MODE_SCAN ? "SCANNING" :
                             live->mode == FOX_MODE_PAUSE ? "PAUSED" : "STOPPED";
