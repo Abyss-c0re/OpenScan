@@ -1,0 +1,4 @@
+# 3DMakerpro Fox (and the other KYT-bodied scanners that share these IDs).
+# Capture nodes only; the index-1 nodes are UVC metadata.
+SUBSYSTEM=="video4linux", ATTR{index}=="0", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="636a", GROUP="video", MODE="0660", SYMLINK+="fox3d-a"
+SUBSYSTEM=="video4linux", ATTR{index}=="0", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="636b", GROUP="video", MODE="0660", SYMLINK+="fox3d-b"
