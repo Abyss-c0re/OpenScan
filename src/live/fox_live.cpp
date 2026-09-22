@@ -554,7 +554,12 @@ struct fox_live {
     float object_yaw = 0.f;
     cv::Mat track_ref;
     int track_have = 0;
+    int track_miss = 0;
+    float track_cx = 0.f;
+    float track_cy = 0.f;
     int track_side = 0;
+    std::vector<cv::Vec3f> track_pts;
+    cv::Vec3f track_axis = cv::Vec3f(0, 0, 0);
     int last_track = -1;
     cv::Vec3f axis0 = cv::Vec3f(0, 0, 0);
     int have_axis = 0;
@@ -654,6 +659,10 @@ void fox_live_reset(fox_live *live) {
     live->object_yaw = 0.f;
     live->track_ref.release();
     live->track_have = 0;
+    live->track_miss = 0;
+    live->track_cx = 0.f;
+    live->track_cy = 0.f;
+    live->track_pts.clear();
     live->track_side = 0;
     live->last_track = -1;
     live->have_axis = 0;
@@ -1734,10 +1743,11 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
         for (int x = 0; x < gray.cols; x++)
             if (c[x] > 0.f) d[x] /= c[x];
     }
-    /* Stripes are a few pixels apart. Fill only that gap, and only inside
-     * the object, so the mesh is a surface instead of loose dots. */
-    const int gap_px = 14;
-    const float gap_mm = 28.f;
+    /* Stripes are a few pixels apart. Fill that gap inside the object so
+     * the mesh is one surface. A second pass closes the corners. */
+    const int gap_px = 28;
+    const float gap_mm = 16.f;
+    for (int pass = 0; pass < 2; pass++) {
     for (int y = 0; y < gray.rows; y++) {
         float *d = depth.ptr<float>(y);
         const uint8_t *m = mask.ptr<uint8_t>(y);
@@ -1792,8 +1802,9 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
             y = b < gray.rows ? b : gray.rows;
         }
     }
+    }
 
-    int xstep = std::max(4, (int)std::lround(5.f * rel));
+    int xstep = std::max(3, (int)std::lround(4.f * rel));
     int ystep = std::max(3, (int)std::lround(4.f * rel));
     gw = std::max(2, (gray.cols + xstep - 1) / xstep);
     gh = std::max(2, (gray.rows + ystep - 1) / ystep);
@@ -1801,34 +1812,34 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
     double sx3 = 0, sy3 = 0;
     float z_far = 0.f;
     int nok = 0;
-    /* Dots do not land on every pixel. A grid point uses the stripes within
-     * a few pixels, and is left empty where those stripes disagree. */
+    /* Read the filled depth. A stripe that did not land on this pixel
+     * borrows the nearest filled pixel inside a few millimetres. */
     auto sample_z = [&](int x, int y, float &z) -> bool {
+        if (x < 0 || y < 0 || x >= depth.cols || y >= depth.rows) return false;
         if (!mask.at<uint8_t>(y, x)) return false;
-        if (depth.at<float>(y, x) > 40.f) {
-            z = depth.at<float>(y, x);
+        float here = depth.at<float>(y, x);
+        if (here > 40.f) {
+            z = here;
             return true;
         }
-        const int rad = 11;
-        float sw = 0.f, sz = 0.f, zlo = 1e9f, zhi = -1e9f;
-        int nnear = 0;
-        for (int dy = -rad; dy <= rad; dy++) {
+        float acc = 0.f;
+        int n = 0;
+        float lo = 1e9f, hi = -1e9f;
+        for (int dy = -6; dy <= 6; dy += 2) {
             int yy = y + dy;
-            if (yy < 0 || yy >= gray.rows) continue;
-            const float *d = depth.ptr<float>(yy);
-            for (int dx = -rad; dx <= rad; dx++) {
+            if (yy < 0 || yy >= depth.rows) continue;
+            const float *row = depth.ptr<float>(yy);
+            for (int dx = -6; dx <= 6; dx += 2) {
                 int xx = x + dx;
-                if (xx < 0 || xx >= gray.cols || d[xx] <= 40.f) continue;
-                float w = 1.f / (1.f + (float)(dx * dx + dy * dy));
-                sw += w;
-                sz += w * d[xx];
-                zlo = std::min(zlo, d[xx]);
-                zhi = std::max(zhi, d[xx]);
-                nnear++;
+                if (xx < 0 || xx >= depth.cols || row[xx] <= 40.f) continue;
+                acc += row[xx];
+                n++;
+                lo = std::min(lo, row[xx]);
+                hi = std::max(hi, row[xx]);
             }
         }
-        if (nnear < 2 || sw <= 0.f || zhi - zlo > 30.f) return false;
-        z = sz / sw;
+        if (n < 2 || hi - lo > 12.f) return false;
+        z = acc / (float)n;
         return true;
     };
     for (int iy = 0; iy < gh; iy++) {
@@ -1995,12 +2006,12 @@ static float bin_angle(int b) {
  * shift at zero. The window size does not follow the silhouette, so a turn
  * that makes one side look wider still measures both directions.
  * phaseCorrelate(prev, curr) shift.x is positive when the texture moves right. */
-static cv::Mat front_crop(const BodyView &body) {
+static cv::Mat front_crop(const BodyView &body, float cx, float cy) {
     const int cw = 360;
     const int ch = 220;
     cv::Mat crop(ch, cw, CV_8U, cv::Scalar(0));
-    int x0 = (int)std::lround(body.center.x) - cw / 2;
-    int y0 = (int)std::lround(body.center.y) - ch / 2;
+    int x0 = (int)std::lround(cx) - cw / 2;
+    int y0 = (int)std::lround(cy) - ch / 2;
     int src_x = std::max(0, x0);
     int src_y = std::max(0, y0);
     int dst_x = src_x - x0;
@@ -2017,60 +2028,136 @@ static cv::Mat front_crop(const BodyView &body) {
     return f;
 }
 
-/* 1 = turn applied, 0 = lost (yaw stays put), -1 = no object. */
+/* Rotation of prev camera points that lands them on curr. 0 if it cannot tell. */
+static float yaw_from_points(const std::vector<cv::Vec3f> &prev, const std::vector<cv::Vec3f> &curr,
+                             const cv::Vec3f &axis, float &inlier_frac) {
+    inlier_frac = 0.f;
+    if (prev.size() < 40 || curr.size() < 40) return 0.f;
+    const float cell = 4.f;
+    std::unordered_set<uint64_t> occ;
+    occ.reserve(curr.size() * 2);
+    auto key = [&](const cv::Vec3f &p) {
+        int ix = (int)std::lround(p[0] / cell);
+        int iy = (int)std::lround(p[1] / cell);
+        int iz = (int)std::lround(p[2] / cell);
+        return voxel_key(ix, iy, iz);
+    };
+    for (size_t i = 0; i < curr.size(); i += 2) occ.insert(key(curr[i]));
+    int stride = std::max(1, (int)prev.size() / 350);
+    float best_th = 0.f;
+    int best_n = 0;
+    int tested = 0;
+    for (int deg = -20; deg <= 20; deg++) {
+        float th = deg * 3.14159265f / 180.f;
+        cv::Matx33f R = rot_y(th);
+        int n = 0;
+        tested = 0;
+        for (size_t i = 0; i < prev.size(); i += (size_t)stride) {
+            tested++;
+            cv::Vec3f q = axis + R * (prev[i] - axis);
+            if (occ.count(key(q))) n++;
+        }
+        if (n > best_n) {
+            best_n = n;
+            best_th = th;
+        }
+    }
+    if (tested < 20) return 0.f;
+    inlier_frac = (float)best_n / (float)tested;
+    if (inlier_frac < 0.28f) return 0.f;
+    return best_th;
+}
+
+/* 1 = turn applied, 0 = lost (yaw stays put), -1 = no object.
+ * The window stays on the object instead of chasing the silhouette.
+ * A measured turn is taken from the depth itself when that agrees. */
 static int track_spin(fox_live *L, const BodyView &body, float &response) {
     response = 0.f;
     if (body.gray.empty() || body.radius_px < 30.f || body.P.size() < 80) return -1;
-    cv::Mat f = front_crop(body);
+    if (!L->track_have) {
+        L->track_cx = body.center.x;
+        L->track_cy = body.center.y;
+    } else {
+        L->track_cx = 0.8f * L->track_cx + 0.2f * body.center.x;
+        L->track_cy = 0.8f * L->track_cy + 0.2f * body.center.y;
+    }
+    cv::Mat f = front_crop(body, L->track_cx, L->track_cy);
     if (f.empty()) return -1;
     if (!L->track_have || L->track_ref.size() != f.size()) {
         L->track_ref = f;
         L->track_have = 1;
+        L->track_miss = 0;
+        L->track_pts = body.P;
+        L->track_axis = body.axis;
         response = 1.f;
         return 1;
     }
-    /* A turn slides the whole face sideways. The left half and the right half
-     * are measured separately so a cheek that leaves the window does not
-     * cancel the other direction. */
-    auto measure = [](const cv::Mat &prev, const cv::Mat &curr, cv::Point2d &shift, double &resp) -> bool {
-        if (prev.empty() || prev.size() != curr.size() || prev.cols < 24 || prev.rows < 24) return false;
-        cv::Mat window;
-        cv::createHanningWindow(window, prev.size(), CV_32F);
-        shift = cv::phaseCorrelate(prev, curr, window, &resp);
-        return std::isfinite(resp) && resp >= 0.04 && std::isfinite(shift.x) && std::isfinite(shift.y);
-    };
-    int mid = f.cols / 2;
-    cv::Point2d shifts[3];
-    double resps[3];
-    bool ok[3];
-    ok[0] = measure(L->track_ref, f, shifts[0], resps[0]);
-    ok[1] = measure(L->track_ref.colRange(0, mid).clone(), f.colRange(0, mid).clone(), shifts[1], resps[1]);
-    ok[2] = measure(L->track_ref.colRange(mid, f.cols).clone(), f.colRange(mid, f.cols).clone(), shifts[2], resps[2]);
-    double sx = 0, sy = 0, wsum = 0;
-    int n_ok = 0;
-    double best_resp = 0;
-    for (int i = 0; i < 3; i++) {
-        if (!ok[i]) continue;
-        sx += shifts[i].x * resps[i];
-        sy += shifts[i].y * resps[i];
-        wsum += resps[i];
-        n_ok++;
-        if (resps[i] > best_resp) best_resp = resps[i];
+    /* Several tiles. One cheek leaving the window must not cancel the turn,
+     * and one failed tile must not throw the frame away. */
+    const int tiles_x = 4;
+    const int tiles_y = 3;
+    std::vector<float> xs, ys;
+    xs.reserve(12);
+    ys.reserve(12);
+    float best_resp = 0.f;
+    int tw = f.cols / tiles_x;
+    int th = f.rows / tiles_y;
+    for (int ty = 0; ty < tiles_y; ty++) {
+        for (int tx = 0; tx < tiles_x; tx++) {
+            cv::Rect r(tx * tw, ty * th, tw, th);
+            if (r.width < 24 || r.height < 24) continue;
+            cv::Mat window;
+            cv::createHanningWindow(window, r.size(), CV_32F);
+            double resp = 0;
+            cv::Point2d shift = cv::phaseCorrelate(L->track_ref(r), f(r), window, &resp);
+            if (!std::isfinite(resp) || resp < 0.02 || !std::isfinite(shift.x) || !std::isfinite(shift.y))
+                continue;
+            if (std::fabs(shift.y) > r.height * 0.45) continue;
+            xs.push_back((float)shift.x);
+            ys.push_back((float)shift.y);
+            if (resp > best_resp) best_resp = (float)resp;
+        }
     }
-    response = (float)best_resp;
-    if (n_ok == 0 || wsum <= 0) return 0;
-    sx /= wsum;
-    sy /= wsum;
+    response = best_resp;
+    float sx = 0.f, sy = 0.f;
+    bool have_tex = xs.size() >= 3;
+    if (have_tex) {
+        std::nth_element(xs.begin(), xs.begin() + (ptrdiff_t)xs.size() / 2, xs.end());
+        std::nth_element(ys.begin(), ys.begin() + (ptrdiff_t)ys.size() / 2, ys.end());
+        sx = xs[xs.size() / 2];
+        sy = ys[ys.size() / 2];
+    }
     float radius_s = body.radius_px * ((float)f.cols / 360.f);
     if (radius_s < 8.f) radius_s = 8.f;
-    float dtheta = -(float)sx / radius_s;
-    const float kMax = 18.f * 3.14159265f / 180.f;
-    if (!std::isfinite(dtheta) || std::fabs(dtheta) > kMax || std::fabs(sy) > f.rows * 0.35f) {
+    float dtheta = have_tex ? -(sx / radius_s) : 0.f;
+    float frac = 0.f;
+    float th3 = yaw_from_points(L->track_pts, body.P, L->track_axis, frac);
+    /* Depth wins when it sees a real turn. A still surface must not cancel
+     * the texture measurement of a slow turn. */
+    if (frac >= 0.28f && (!have_tex || std::fabs(th3) >= 1.f * 3.14159265f / 180.f)) dtheta = th3;
+    if (!have_tex && frac < 0.28f) {
+        L->track_miss++;
+        if (L->track_miss >= 3) {
+            L->track_ref = f;
+            L->track_pts = body.P;
+            L->track_axis = body.axis;
+            L->track_miss = 0;
+        }
+        return 0;
+    }
+    if (!std::isfinite(dtheta)) dtheta = 0.f;
+    const float kMax = 15.f * 3.14159265f / 180.f;
+    if (dtheta > kMax) dtheta = kMax;
+    if (dtheta < -kMax) dtheta = -kMax;
+    if (have_tex && std::fabs(sy) > f.rows * 0.45f && frac < 0.28f) {
         L->track_ref = f;
         return 0;
     }
     L->object_yaw += dtheta;
     L->track_ref = f;
+    L->track_pts = body.P;
+    L->track_axis = body.axis;
+    L->track_miss = 0;
     return 1;
 }
 
@@ -2104,20 +2191,9 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
     }
     cv::Vec3f t = L->axis0 - R * axis;
     /* Measured stays on the turn axis. A free alignment walks the shell
-     * sideways and the export becomes a trail of copies. Scale stays 1. */
+     * sideways and the export becomes a trail of copies. Scale stays 1.
+     * The turn itself is object_yaw from track_spin; this does not drop it. */
     const float scale = 1.f;
-    if (measured && L->cloud.size() >= 80 && !body.P.empty()) {
-        int near = 0, tested = 0;
-        int stride = std::max(1, (int)body.P.size() / 500);
-        for (size_t i = 0; i < body.P.size(); i += (size_t)stride) {
-            tested++;
-            cv::Vec3f w = world_of(body.P[i], R, t, scale);
-            int id = 0;
-            if (!nearest_model(L, w, id)) continue;
-            if (cv::norm(L->cloud[(size_t)id] - w) < 12.f) near++;
-        }
-        if (tested < 40 || near * 5 < tested) return 0;
-    }
     L->pose_R = R;
     L->pose_t = t;
     L->pose_s = scale;
@@ -2139,7 +2215,7 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
         if (!measured) return true;
         cv::Vec3f n = (src.b - src.a).cross(src.c - src.a);
         float ln = std::sqrt(n.dot(n));
-        return ln > 1e-6f && n[2] / ln <= -0.35f;
+        return ln > 1e-6f && n[2] / ln < 0.25f;
     };
     /* 0 = already on the model, blend into that cell.
      * 1 = a few millimetres off, ignore it or it becomes a second skin.
@@ -2153,7 +2229,6 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
                     k = key_of_point(L->cloud[(size_t)id]);
                     return 0;
                 }
-                if (d < 14.f) return 1;
             }
         }
         k = key_of_point(w);

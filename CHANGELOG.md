@@ -2,6 +2,11 @@
 
 Versions follow [semantic versioning](https://semver.org). The number in the window title, `fox3d --version`, and the git tag `vX.Y.Z` are the same version. Nothing before 0.5.0 was tagged.
 
+## 0.6.4
+
+- A turn is measured from the depth of the surface and from several patches of the picture. One failed patch no longer drops the frame, and the window stays on the object.
+- Measured fills the gaps between projector stripes, so the scan is one surface instead of a sliced mosaic.
+
 ## 0.6.3
 
 - Measured no longer trails copies of the surface behind the object. A frame is added only when it sits on the model already scanned. Points a few millimetres off update that surface instead of starting a second skin.
