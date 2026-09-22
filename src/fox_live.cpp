@@ -462,6 +462,7 @@ struct fox_live {
     int dragging = 0;
     int drag_x = 0;
     int drag_y = 0;
+    int view_x = 0, view_y = 0, view_w = 0, view_h = 0;
     std::vector<FoxButton> buttons;
 };
 
@@ -539,6 +540,10 @@ void fox_live_mouse(fox_live *live, int event, int x, int y, int flags) {
                 return;
             }
         }
+        if (live->view_w > 0 &&
+            (x < live->view_x || x >= live->view_x + live->view_w ||
+             y < live->view_y || y >= live->view_y + live->view_h))
+            return;
         live->dragging = 1;
         live->spin = 0;
         live->drag_x = x;
@@ -754,45 +759,23 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     label_panel(b, "camera B");
     label_panel(d, "depth");
 
-    const int bar = 40;
-    const int btn_h = 46;
-    L->preview.create(bar + hero_h + btn_h, hero_w + side_w, CV_8UC3);
+    const int bar = 28;
+    L->preview.create(bar + hero_h, hero_w + side_w, CV_8UC3);
     L->preview.setTo(cv::Scalar(12, 12, 12));
     hero.copyTo(L->preview(cv::Rect(0, bar, hero_w, hero_h)));
     a.copyTo(L->preview(cv::Rect(hero_w, bar, side_w, side_h)));
     b.copyTo(L->preview(cv::Rect(hero_w, bar + side_h, side_w, side_h)));
     d.copyTo(L->preview(cv::Rect(hero_w, bar + 2 * side_h, side_w, side_h)));
+    L->view_x = 0;
+    L->view_y = bar;
+    L->view_w = hero_w;
+    L->view_h = hero_h;
 
     cv::Scalar col = L->mode == FOX_MODE_SCAN ? cv::Scalar(80, 220, 80)
                     : L->mode == FOX_MODE_PAUSE ? cv::Scalar(80, 210, 230)
                                                 : cv::Scalar(180, 180, 180);
-    cv::putText(L->preview, L->line1, cv::Point(8, 16), cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv::LINE_AA);
-    cv::putText(L->preview, L->line2, cv::Point(8, 34), cv::FONT_HERSHEY_SIMPLEX, 0.45,
-                cv::Scalar(210, 210, 210), 1, cv::LINE_AA);
-
+    cv::putText(L->preview, L->line1, cv::Point(8, 18), cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv::LINE_AA);
     L->buttons.clear();
-    const int by = bar + hero_h + 7;
-    struct { const char *name; int id; } items[] = {
-        {"Start", 1}, {"Pause", 2}, {"Stop", 3}, {"Save", 4}, {"Close", 5},
-    };
-    int x = 12;
-    for (auto item : items) {
-        bool on = (item.id == 1 && L->mode == FOX_MODE_SCAN) ||
-                  (item.id == 2 && L->mode == FOX_MODE_PAUSE) ||
-                  (item.id == 3 && L->mode == FOX_MODE_STOP);
-        cv::Scalar fill(55, 55, 55);
-        if (item.id == 1 && on) fill = cv::Scalar(50, 130, 50);
-        if (item.id == 2 && on) fill = cv::Scalar(40, 140, 170);
-        if (item.id == 4) fill = cv::Scalar(30, 110, 170);
-        if (item.id == 5) fill = cv::Scalar(40, 40, 150);
-        cv::Rect r(x, by, 108, 32);
-        cv::rectangle(L->preview, r, fill, cv::FILLED);
-        cv::rectangle(L->preview, r, cv::Scalar(210, 210, 210), 1);
-        cv::putText(L->preview, item.name, cv::Point(x + 16, by + 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                    cv::Scalar(245, 245, 245), 1, cv::LINE_AA);
-        L->buttons.push_back(FoxButton{r.x, r.y, r.width, r.height, item.id});
-        x += 118;
-    }
     L->preview_w = L->preview.cols;
     L->preview_h = L->preview.rows;
 }
@@ -965,8 +948,6 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     snprintf(live->line1, sizeof live->line1,
              "%s   model %d pts   depth %d   z %.0f mm   %.0f ms",
              mode_name, st.points, st.valid_pixels, st.median_mm, st.match_ms);
-    snprintf(live->line2, sizeof live->line2,
-             "Start keeps new surface. Pause holds. Stop ends the pass. Save writes STL. Close quits.");
     paint_preview(live, As, Bs, chosen.depth_m, st.tracking);
     if (status) *status = st;
     return 0;

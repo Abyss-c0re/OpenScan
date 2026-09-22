@@ -22,24 +22,20 @@ static void on_sigint(int) { g_stop = 1; }
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "fox3d — live scan for the 3DMakerpro Fox (JMM8) on Linux\n"
+            "fox3d — open-source scanner for the 3DMakerpro Fox (JMM8)\n"
             "\n"
-            "The scanner is two Sonix UVC cameras behind one USB 2.0 hub\n"
-            "(0c45:636a and 0c45:636b). The kernel uvcvideo driver enumerates\n"
-            "them. This program streams both at 1280x720 Motion-JPEG, 10 fps,\n"
-            "which is the resolution the factory calibration was built at.\n"
-            "\n"
-            "A scan is a live orbit. Hold the object 20–40 cm in front of the\n"
-            "Fox and rotate it. Each frame is fused into one mesh. Press q in\n"
-            "the preview (or Ctrl+C) to write a binary STL in millimetres.\n"
+            "  %s\n"
+            "      Open the app. The cameras and 3D view come up idle.\n"
+            "      Start scan when the object is in view. Export STL when\n"
+            "      the model is ready. Closing the window quits.\n"
             "\n"
             "Usage:\n"
+            "  %s\n"
             "  %s devices\n"
             "  %s grab  -o DIR [--exposure N] [--gain N]\n"
             "           [--exposure-a N] [--exposure-b N] [--gain-a N] [--gain-b N]\n"
-            "  %s scan  -o FILE.stl [--seconds N] [--no-window] [--no-ae]\n"
-            "           The window has Start, Pause, Stop, Save, and Close.\n"
-            "           Close quits. It does not open the window again.\n"
+            "  %s scan  [--no-window -o FILE.stl --seconds N]\n"
+            "           With no --no-window, scan opens the same app.\n"
             "           [--calib PATH] [--scale S] [--min-mm Z] [--max-mm Z]\n"
             "           [--exposure N] [--gain N]\n"
             "           [--exposure-a N] [--exposure-b N] [--gain-a N] [--gain-b N]\n"
@@ -51,7 +47,7 @@ static void usage(const char *argv0) {
             "exposure is UVC absolute exposure in units of 100 microseconds.\n"
             "scan adjusts it per camera unless --no-ae is set. gain is 0..100.\n"
             "Calibration is read from calib/<serial>.txt .\n",
-            argv0, argv0, argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int arg_int(int argc, char **argv, int *i, int *dst) {
@@ -523,10 +519,13 @@ static int cmd_asic(const char *hexaddr) {
     return (ra || rb) ? 1 : 0;
 }
 
+int fox_app_main(int argc, char **argv, const char *calib,
+                 int exp_a, int gain_a, int exp_b, int gain_b,
+                 double scale, double min_mm, double max_mm);
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        usage(argv[0]);
-        return 2;
+        return fox_app_main(argc, argv, nullptr, 18, 4, 12, 4, 0.4, 80, 550);
     }
     const char *cmd = argv[1];
     if (!strcmp(cmd, "mesh-test")) return fox_mesh_self_test();
@@ -601,13 +600,16 @@ int main(int argc, char **argv) {
         return cmd_snap(out, calib, frames, base_exp, base_gain, scale, min_mm, max_mm);
     }
     if (!strcmp(cmd, "scan")) {
-        if (!out) {
-            fprintf(stderr, "scan needs -o FILE.stl\n");
-            return 2;
-        }
         if (!scale_set) scale = 0.4;
-        return cmd_scan(out, calib, seconds, no_window, no_ae, exp_a, gain_a, exp_b, gain_b,
-                        scale, min_mm, max_mm);
+        if (no_window) {
+            if (!out) {
+                fprintf(stderr, "scan --no-window needs -o FILE.stl\n");
+                return 2;
+            }
+            return cmd_scan(out, calib, seconds, 1, no_ae, exp_a, gain_a, exp_b, gain_b,
+                            scale, min_mm, max_mm);
+        }
+        return fox_app_main(argc, argv, calib, exp_a, gain_a, exp_b, gain_b, scale, min_mm, max_mm);
     }
     if (!strcmp(cmd, "asic-read")) return cmd_asic(asic_addr);
     usage(argv[0]);
