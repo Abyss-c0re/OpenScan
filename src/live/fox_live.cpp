@@ -557,7 +557,7 @@ struct fox_live {
     int scanned_bins = 0;
     float yaw = 0.42f;
     float pitch = -0.10f;
-    float dist = 160.f;
+    float dist = -1.f;
     int spin = 0;
     int user_zoom = 0;
     int dragging = 0;
@@ -627,6 +627,8 @@ void fox_live_reset(fox_live *live) {
     live->last_track = -1;
     live->have_axis = 0;
     live->scanned_bins = 0;
+    live->dist = -1.f;
+    live->user_zoom = 0;
     live->mode = FOX_MODE_STOP;
     snprintf(live->line1, sizeof live->line1,
              "STOPPED   scanned 0°   not scanned 360°   detail x1   0 tris");
@@ -638,11 +640,44 @@ void fox_live_set_mode(fox_live *live, int mode) {
     live->mode = mode;
 }
 
+static uint64_t voxel_key(int ix, int iy, int iz);
+
 void fox_live_set_distance_mm(fox_live *live, float mm) {
     if (!live) return;
     if (mm < 80.f) mm = 80.f;
     if (mm > 500.f) mm = 500.f;
+    float old = live->distance_mm > 1.f ? live->distance_mm : mm;
+    float k = old > 1.f ? mm / old : 1.f;
     live->distance_mm = mm;
+    if (k < 0.995f || k > 1.005f) {
+        auto scale_p = [k](cv::Vec3f &p) { p *= k; };
+        if (live->have_axis) scale_p(live->axis0);
+        live->radius_mm *= k;
+        if (live->span_y0 < 1e8f && live->span_y1 > live->span_y0) {
+            live->span_y0 *= k;
+            live->span_y1 *= k;
+        }
+        for (auto &kv : live->cells) scale_p(kv.second.p);
+        for (auto &ref : live->refs)
+            for (int i = 0; i < 3; i++) scale_p(ref.p[i]);
+        for (auto &wd : live->wedge)
+            for (Tri &t : wd.tris) {
+                scale_p(t.a);
+                scale_p(t.b);
+                scale_p(t.c);
+            }
+        for (cv::Vec3f &p : live->cloud) scale_p(p);
+        scale_p(live->pose_t);
+        live->vox.clear();
+        const float voxel = 2.5f;
+        for (size_t i = 0; i < live->cloud.size(); i++) {
+            const cv::Vec3f &p = live->cloud[i];
+            int ix = (int)std::floor(p[0] / voxel);
+            int iy = (int)std::floor(p[1] / voxel);
+            int iz = (int)std::floor(p[2] / voxel);
+            live->vox.emplace(voxel_key(ix, iy, iz), (uint32_t)i);
+        }
+    }
 }
 
 float fox_live_distance_mm(const fox_live *live) {
@@ -704,6 +739,7 @@ void fox_live_mouse(fox_live *live, int event, int x, int y, int flags) {
     } else if (event == cv::EVENT_MOUSEWHEEL) {
         int delta = cv::getMouseWheelDelta(flags);
         live->user_zoom = 1;
+        if (live->dist < 30.f) live->dist = 160.f;
         live->dist *= delta > 0 ? 0.9f : 1.1f;
         if (live->dist < 30.f) live->dist = 30.f;
         if (live->dist > 2000.f) live->dist = 2000.f;
@@ -1394,8 +1430,10 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
     float extent = std::max(ext_x, ext_y);
     int w = out.cols, h = out.rows;
     float auto_dist = std::max(extent * 1.55f, 30.f);
-    float use = (user_zoom && dist && *dist > 1.f) ? *dist : auto_dist;
-    if (dist && !user_zoom) *dist = use;
+    /* Keep the camera where it is. Refitting every frame hides the distance
+     * slider, because the model and the zoom grow by the same amount. */
+    float use = (dist && *dist > 1.f) ? *dist : auto_dist;
+    if (dist && *dist <= 1.f) *dist = use;
     float yaw = yaw_deg * 3.14159265f / 180.f;
     float pitch = pitch_deg * 3.14159265f / 180.f;
     cv::Vec3f eye = c + cv::Vec3f(std::sin(yaw) * std::cos(pitch), std::sin(pitch),
@@ -1958,8 +1996,8 @@ static void render_model(fox_live *L, cv::Mat &out) {
     float height = std::max(10.f, L->span_y1 - L->span_y0);
     float extent = std::max(height, L->radius_mm * 2.2f);
     int w = out.cols, h = out.rows;
-    float dist = L->user_zoom && L->dist > 1.f ? L->dist : std::max(extent * 1.65f, 40.f);
-    if (!L->user_zoom) L->dist = dist;
+    if (L->dist <= 1.f) L->dist = std::max(extent * 1.65f, 40.f);
+    float dist = L->dist;
     float yaw = L->yaw;
     float pitch = L->pitch;
     /* The real camera looks toward +Z, so the scanned face points back at
@@ -2230,9 +2268,19 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     const char *mode_name = live->mode == FOX_MODE_SCAN ? "SCANNING" :
                             live->mode == FOX_MODE_PAUSE ? "PAUSED" : "STOPPED";
     const char *lost = (live->mode == FOX_MODE_SCAN && st.tracking == 0) ? "   TRACKING LOST" : "";
-    snprintf(live->line1, sizeof live->line1,
-             "%s   scanned %d°   not scanned %d°   detail x%d   %d tris%s",
-             mode_name, st.scanned_deg, 360 - st.scanned_deg, st.detail, st.points, lost);
+    float height_mm = (live->span_y1 > live->span_y0 && live->span_y0 < 1e8f)
+                          ? live->span_y1 - live->span_y0 : 0.f;
+    float width_mm = live->have_axis ? live->radius_mm * 2.f : 0.f;
+    if (width_mm > 1.f && height_mm > 1.f)
+        snprintf(live->line1, sizeof live->line1,
+                 "%s   %.0f mm away   model %.0f x %.0f mm   scanned %d°   detail x%d   %d tris%s",
+                 mode_name, live->distance_mm, width_mm, height_mm, st.scanned_deg, st.detail,
+                 st.points, lost);
+    else
+        snprintf(live->line1, sizeof live->line1,
+                 "%s   %.0f mm away   scanned %d°   not scanned %d°   detail x%d   %d tris%s",
+                 mode_name, live->distance_mm, st.scanned_deg, 360 - st.scanned_deg, st.detail,
+                 st.points, lost);
     paint_preview(live, As, Bs, body);
     if (status) *status = st;
     return 0;
