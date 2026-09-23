@@ -2,6 +2,10 @@
 
 Versions follow [semantic versioning](https://semver.org). The number in the window title, `fox3d --version`, and the git tag `vX.Y.Z` are the same version. Nothing before 0.5.0 was tagged.
 
+## 0.6.8
+
+- A frame that does not sit on the surface already scanned is not written into the file. Mold's thickness is applied once, when the solid is shown and saved, so the export is not millions of stacked sheets.
+
 ## 0.6.7
 
 - A close object fills the frame with more stripes than the calibration lists. The scan no longer throws that frame away, so the 3D view is not empty while the camera still sees the object.

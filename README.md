@@ -1,6 +1,6 @@
 # fox3d
 
-Linux program for the 3DMakerpro Fox scanner (JMM8), version 0.6.7. It shows both cameras, follows one object as you move the scanner around it, and exports that mesh.
+Linux program for the 3DMakerpro Fox scanner (JMM8), version 0.6.8. It shows both cameras, follows one object as you move the scanner around it, and exports that mesh.
 
 `fox3d --version` prints the version. Releases are git tags `vX.Y.Z`. The notes are in [CHANGELOG.md](CHANGELOG.md).
 

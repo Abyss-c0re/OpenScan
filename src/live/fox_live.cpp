@@ -1901,52 +1901,21 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
                 body.tris.push_back(Tri{p10, p11, p01, tone3(gy, gx + 1, gy + 1, gx + 1, gy + 1, gx)});
         }
     }
-    /* Mold is this measured shape, 8 mm thick. The outline is not spun
-     * into a round body. */
-    if (shape != FOX_SHAPE_MEASURED && !body.tris.empty()) {
-        const float thick = 8.f;
-        auto qk = [](const cv::Vec3f &p) {
-            return voxel_key((int)std::lround(p[0] * 2.f), (int)std::lround(p[1] * 2.f),
-                             (int)std::lround(p[2] * 2.f));
-        };
-        std::map<std::pair<uint64_t, uint64_t>, int> edge_n;
-        std::map<std::pair<uint64_t, uint64_t>, std::pair<cv::Vec3f, cv::Vec3f>> edge_p;
-        auto add_edge = [&](const cv::Vec3f &a, const cv::Vec3f &b) {
-            uint64_t ka = qk(a), kb = qk(b);
-            cv::Vec3f pa = a, pb = b;
-            if (ka > kb) {
-                std::swap(ka, kb);
-                std::swap(pa, pb);
-            }
-            auto key = std::make_pair(ka, kb);
-            edge_n[key]++;
-            edge_p[key] = {pa, pb};
-        };
-        size_t nfront = body.tris.size();
-        for (size_t i = 0; i < nfront; i++) {
-            const Tri &t = body.tris[i];
-            add_edge(t.a, t.b);
-            add_edge(t.b, t.c);
-            add_edge(t.c, t.a);
-            auto back = [&](cv::Vec3f p) {
-                p[2] += thick;
-                return p;
-            };
-            body.tris.push_back(Tri{back(t.c), back(t.b), back(t.a), t.tone});
-        }
-        for (const auto &kv : edge_n) {
-            if (kv.second != 1) continue;
-            cv::Vec3f a = edge_p[kv.first].first;
-            cv::Vec3f b = edge_p[kv.first].second;
-            cv::Vec3f ab = a;
-            ab[2] += thick;
-            cv::Vec3f bb = b;
-            bb[2] += thick;
-            body.tris.push_back(Tri{a, b, bb, 0.45f});
-            body.tris.push_back(Tri{a, bb, ab, 0.45f});
-        }
-    }
     return body;
+}
+
+/* One sheet, 8 mm thick, for the mold export and the mold view. */
+static void thicken_shell(std::vector<Tri> &tris, float thick) {
+    size_t nfront = tris.size();
+    tris.reserve(nfront * 2);
+    for (size_t i = 0; i < nfront; i++) {
+        const Tri &t = tris[i];
+        cv::Vec3f n = (t.b - t.a).cross(t.c - t.a);
+        float ln = std::sqrt(n.dot(n));
+        if (ln < 1e-6f) continue;
+        n *= thick / ln;
+        tris.push_back(Tri{t.c - n, t.b - n, t.a - n, t.tone});
+    }
 }
 
 static const int kBins = 72;
@@ -2162,6 +2131,24 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
      * sideways and the export becomes a trail of copies. Scale stays 1.
      * The turn itself is object_yaw from track_spin; this does not drop it. */
     const float scale = 1.f;
+    if (L->cloud.size() >= 80 && !body.P.empty()) {
+        /* A frame that does not sit on the surface already scanned would be
+         * written down as a second sheet. That is the thick junk in the file. */
+        std::vector<float> dist;
+        int stride = std::max(1, (int)body.P.size() / 400);
+        int tested = 0;
+        for (size_t i = 0; i < body.P.size(); i += (size_t)stride) {
+            tested++;
+            cv::Vec3f w = world_of(body.P[i], R, t, scale);
+            int id = 0;
+            if (!nearest_model(L, w, id)) continue;
+            float d = cv::norm(L->cloud[(size_t)id] - w);
+            if (d < 18.f) dist.push_back(d);
+        }
+        if (tested < 30 || (int)dist.size() * 8 < tested) return 0;
+        std::nth_element(dist.begin(), dist.begin() + (ptrdiff_t)dist.size() / 2, dist.end());
+        if (dist[dist.size() / 2] > 6.f) return 0;
+    }
     L->pose_R = R;
     L->pose_t = t;
     L->pose_s = scale;
@@ -2410,6 +2397,10 @@ static void render_model(fox_live *L, cv::Mat &out) {
             float tone = t.tone > 0.02f ? t.tone : 0.55f;
             int g = (int)std::min(255.f, 255.f * tone * (0.55f + 0.45f * lam));
             paint_tri(t.a, t.b, t.c, cv::Vec3b((uint8_t)g, (uint8_t)g, (uint8_t)g));
+            if (L->shape == FOX_SHAPE_MOLD) {
+                cv::Vec3f back = n * 8.f;
+                paint_tri(t.c - back, t.b - back, t.a - back, cv::Vec3b((uint8_t)g, (uint8_t)g, (uint8_t)g));
+            }
         }
     }
     draw_coverage_ring(out, L);
@@ -2627,16 +2618,12 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
             st.tracking = 0;
             /* Mold still keeps the solid of this frame. Measured waits until
              * the turn is known, so a lost frame is not pasted on the wrong side. */
-            if (!measured && live->mode == FOX_MODE_SCAN) {
-                fuse_shell(live, body, 0);
+            if (!measured && live->mode == FOX_MODE_SCAN && fuse_shell(live, body, 0))
                 live->fused++;
-            }
         } else if (live->mode == FOX_MODE_SCAN) {
-            /* Measured aligns this depth surface to the model and adds the
-             * new part. A view that does not land is dropped. Mold always
-             * keeps the turned solid. */
-            int added = fuse_shell(live, body, measured);
-            if (added || !measured) {
+            /* A view that does not sit on the scanned surface is dropped.
+             * That is what stacked a second sheet into the exported file. */
+            if (fuse_shell(live, body, measured)) {
                 live->fused++;
                 live->tracked_frames++;
                 st.tracking = 1;
@@ -2731,6 +2718,7 @@ int fox_live_write(fox_live *live, const char *stl_path, int *triangles_out) {
                     pts.rows, pts.cols, pts.type());
         }
     }
+    if (live && live->shape == FOX_SHAPE_MOLD && tris.size() >= 80) thicken_shell(tris, 8.f);
     if (write_mesh(stl_path, tris) < 0) return -1;
     if (triangles_out) *triangles_out = (int)tris.size();
     return 0;
