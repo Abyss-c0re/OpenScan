@@ -2,6 +2,10 @@
 
 Versions follow [semantic versioning](https://semver.org). The number in the window title, `fox3d --version`, and the git tag `vX.Y.Z` are the same version. Nothing before 0.5.0 was tagged.
 
+## 0.6.6
+
+- The mold is no longer a silhouette spun into a round body. Both modes use the stripe measurement. Mold is that shape, 8 mm thick.
+
 ## 0.6.5
 
 - Mold builds the solid again, including when a turn is not measured on that frame. Orbiting the view shows one skull-shaped object.

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -710,41 +711,7 @@ void fox_live_set_distance_mm(fox_live *live, float mm) {
     if (!live) return;
     if (mm < 80.f) mm = 80.f;
     if (mm > 500.f) mm = 500.f;
-    float old = live->distance_mm > 1.f ? live->distance_mm : mm;
-    float k = old > 1.f ? mm / old : 1.f;
     live->distance_mm = mm;
-    /* Measured depth is already in millimetres. Scaling it would lie.
-     * Mold size is the working distance, so the solid grows with the slider. */
-    if (live->shape != FOX_SHAPE_MOLD) return;
-    if (k < 0.995f || k > 1.005f) {
-        auto scale_p = [k](cv::Vec3f &p) { p *= k; };
-        if (live->have_axis) scale_p(live->axis0);
-        live->radius_mm *= k;
-        if (live->span_y0 < 1e8f && live->span_y1 > live->span_y0) {
-            live->span_y0 *= k;
-            live->span_y1 *= k;
-        }
-        for (auto &kv : live->cells) scale_p(kv.second.p);
-        for (auto &ref : live->refs)
-            for (int i = 0; i < 3; i++) scale_p(ref.p[i]);
-        for (auto &wd : live->wedge)
-            for (Tri &t : wd.tris) {
-                scale_p(t.a);
-                scale_p(t.b);
-                scale_p(t.c);
-            }
-        for (cv::Vec3f &p : live->cloud) scale_p(p);
-        scale_p(live->pose_t);
-        live->vox.clear();
-        const float voxel = 2.5f;
-        for (size_t i = 0; i < live->cloud.size(); i++) {
-            const cv::Vec3f &p = live->cloud[i];
-            int ix = (int)std::floor(p[0] / voxel);
-            int iy = (int)std::floor(p[1] / voxel);
-            int iz = (int)std::floor(p[2] / voxel);
-            live->vox.emplace(voxel_key(ix, iy, iz), (uint32_t)i);
-        }
-    }
 }
 
 float fox_live_distance_mm(const fox_live *live) {
@@ -1628,84 +1595,6 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
     int gw = 2;
     int gh = 2;
     std::vector<ShadeVert> grid;
-    if (shape != FOX_SHAPE_MEASURED) {
-        cv::Mat mid, wide;
-        cv::GaussianBlur(gray, mid, cv::Size(0, 0), std::max(2.f, 7.f * rel));
-        cv::GaussianBlur(gray, wide, cv::Size(0, 0), std::max(6.f, 26.f * rel));
-        int ystep = std::max(2, (int)std::lround(3.f * rel));
-        gh = (gray.rows + ystep - 1) / ystep;
-        gw = 112;
-        grid.assign((size_t)gw * gh, ShadeVert{});
-        const float th_max = 1.40f;
-        const float sin_max = std::sin(th_max);
-        for (int iy = 0; iy < gh; iy++) {
-            int y = std::min(gray.rows - 1, iy * ystep);
-            float half = 0.5f * (right[y] - left[y]);
-            float mid_x = 0.5f * (right[y] + left[y]);
-            bool row = left[y] >= 0.f && right[y] >= 0.f && half > 8.f;
-            for (int ix = 0; ix < gw; ix++) {
-                ShadeVert v{0, 0, 0, 0, 0, false};
-                if (row) {
-                    float u = -1.f + 2.f * (float)ix / (float)(gw - 1);
-                    float th = u * th_max;
-                    float x_geom = mid_x + half * (std::sin(th) / sin_max);
-                    int x = (int)std::lround(x_geom);
-                    x = std::max(0, std::min(gray.cols - 1, x));
-                    float hf = (float)gray.at<uint8_t>(y, x) - (float)mid.at<uint8_t>(y, x);
-                    float br = (float)mid.at<uint8_t>(y, x) - (float)wide.at<uint8_t>(y, x);
-                    float bump = (hf * 0.55f + br * 0.35f) / 22.f;
-                    bump = std::max(-1.f, std::min(1.f, bump));
-                    float radius = half * z0 / fx;
-                    v.x = (x_geom - cxr) * z0 / fx;
-                    v.y = -((y - cyr) * z0 / fy);
-                    v.z = z0 - radius * std::cos(th);
-                    v.bump = bump;
-                    v.albedo = gray.at<uint8_t>(y, x) / 255.f;
-                    v.ok = true;
-                }
-                grid[(size_t)iy * gw + ix] = v;
-            }
-        }
-        std::vector<float> sm(grid.size(), 0.f);
-        for (int y = 0; y < gh; y++) {
-            for (int x = 0; x < gw; x++) {
-                float s = 0, w = 0;
-                for (int dy = -2; dy <= 2; dy++) {
-                    for (int dx = -2; dx <= 2; dx++) {
-                        int yy = y + dy, xx = x + dx;
-                        if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
-                        const ShadeVert &nb = grid[(size_t)yy * gw + xx];
-                        if (!nb.ok) continue;
-                        float wt = std::exp(-(dx * dx + dy * dy) / 3.f);
-                        s += wt * nb.bump;
-                        w += wt;
-                    }
-                }
-                sm[(size_t)y * gw + x] = w > 0.f ? s / w : 0.f;
-            }
-        }
-        for (size_t i = 0; i < grid.size(); i++)
-            if (grid[i].ok) grid[i].bump = sm[i];
-        std::vector<float> zcopy(grid.size());
-        for (size_t i = 0; i < grid.size(); i++) zcopy[i] = grid[i].z;
-        for (int iy = 0; iy < gh; iy++) {
-            for (int ix = 0; ix < gw; ix++) {
-                ShadeVert &v = grid[(size_t)iy * gw + ix];
-                if (!v.ok) continue;
-                float s = 0, w = 0;
-                for (int dy = -5; dy <= 5; dy++) {
-                    int yy = iy + dy;
-                    if (yy < 0 || yy >= gh) continue;
-                    const ShadeVert &nb = grid[(size_t)yy * gw + ix];
-                    if (!nb.ok) continue;
-                    float wt = std::exp(-(float)(dy * dy) / 10.f);
-                    s += wt * zcopy[(size_t)yy * gw + ix];
-                    w += wt;
-                }
-                if (w > 0.f) v.z = s / w;
-            }
-        }
-    } else {
     cv::Mat depth(gray.rows, gray.cols, CV_32F, cv::Scalar(0));
     cv::Mat depth_n(gray.rows, gray.cols, CV_32F, cv::Scalar(0));
     if (cal && cal->nplanes >= 8 && !pattern.empty() && pattern.type() == CV_8UC1 &&
@@ -1934,7 +1823,6 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
          * count as opposite sides of the object. */
         body.axis = cv::Vec3f((float)(sx3 / nok), (float)(sy3 / nok), z_far + 8.f);
     }
-    }
 
     const float bump_mm = 1.8f;
     if (shade_live) {
@@ -2011,6 +1899,51 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
             if (b && d && c0 && cv::norm(p10 - p11) < 14.f && cv::norm(p10 - p01) < 14.f &&
                 cv::norm(p11 - p01) < 14.f)
                 body.tris.push_back(Tri{p10, p11, p01, tone3(gy, gx + 1, gy + 1, gx + 1, gy + 1, gx)});
+        }
+    }
+    /* Mold is this measured shape, 8 mm thick. The outline is not spun
+     * into a round body. */
+    if (shape != FOX_SHAPE_MEASURED && !body.tris.empty()) {
+        const float thick = 8.f;
+        auto qk = [](const cv::Vec3f &p) {
+            return voxel_key((int)std::lround(p[0] * 2.f), (int)std::lround(p[1] * 2.f),
+                             (int)std::lround(p[2] * 2.f));
+        };
+        std::map<std::pair<uint64_t, uint64_t>, int> edge_n;
+        std::map<std::pair<uint64_t, uint64_t>, std::pair<cv::Vec3f, cv::Vec3f>> edge_p;
+        auto add_edge = [&](const cv::Vec3f &a, const cv::Vec3f &b) {
+            uint64_t ka = qk(a), kb = qk(b);
+            cv::Vec3f pa = a, pb = b;
+            if (ka > kb) {
+                std::swap(ka, kb);
+                std::swap(pa, pb);
+            }
+            auto key = std::make_pair(ka, kb);
+            edge_n[key]++;
+            edge_p[key] = {pa, pb};
+        };
+        size_t nfront = body.tris.size();
+        for (size_t i = 0; i < nfront; i++) {
+            const Tri &t = body.tris[i];
+            add_edge(t.a, t.b);
+            add_edge(t.b, t.c);
+            add_edge(t.c, t.a);
+            auto back = [&](cv::Vec3f p) {
+                p[2] += thick;
+                return p;
+            };
+            body.tris.push_back(Tri{back(t.c), back(t.b), back(t.a), t.tone});
+        }
+        for (const auto &kv : edge_n) {
+            if (kv.second != 1) continue;
+            cv::Vec3f a = edge_p[kv.first].first;
+            cv::Vec3f b = edge_p[kv.first].second;
+            cv::Vec3f ab = a;
+            ab[2] += thick;
+            cv::Vec3f bb = b;
+            bb[2] += thick;
+            body.tris.push_back(Tri{a, b, bb, 0.45f});
+            body.tris.push_back(Tri{a, bb, ab, 0.45f});
         }
     }
     return body;

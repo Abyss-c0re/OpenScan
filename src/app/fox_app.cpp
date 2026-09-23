@@ -132,9 +132,8 @@ public:
         fox_live_set_shape(live, saved_shape);
         mold_btn->setChecked(saved_shape == FOX_SHAPE_MOLD);
         measured_btn->setChecked(saved_shape == FOX_SHAPE_MEASURED);
-        mold_btn->setToolTip("Solid molding model. It stays one object when you turn it or orbit the view.");
-        measured_btn->setToolTip("Builds the model from the projector stripes. Each new view is aligned "
-                                 "to the surface already scanned and added. A view that does not fit is dropped.");
+        mold_btn->setToolTip("The scanned shape, made 8 mm thick. It is a solid of the measurement, not a round outline.");
+        measured_btn->setToolTip("The surface the projector stripes measured. Each new view is aligned and added.");
 
         auto *tools = new QHBoxLayout;
         tools->setContentsMargins(12, 10, 12, 6);
