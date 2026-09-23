@@ -1600,7 +1600,7 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
     if (cal && cal->nplanes >= 8 && !pattern.empty() && pattern.type() == CV_8UC1 &&
         pattern.cols == gray.cols && pattern.rows == gray.rows) {
         cv::Mat pat = pattern.isContinuous() ? pattern : pattern.clone();
-        std::vector<fox_shot> shots(24000);
+        std::vector<fox_shot> shots(120000);
         int nshot = fox_oneshot_points(pat.ptr<uint8_t>(), pat.cols, pat.rows, cal, z0, shots.data(),
                                        (int)shots.size());
         if (nshot > 0 && cal->cam[1].fx > 100.0) {

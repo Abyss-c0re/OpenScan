@@ -208,15 +208,15 @@ int fox_oneshot_points(const uint8_t *pattern, int width, int height,
         }
     }
     if (anchor < 0) return 0;
+    /* A close object can show more stripes than the file lists. Keep the
+     * stripes that have a plane. Dropping the whole frame is an empty 3D view. */
     int i0 = anchor - (int)cols.size() / 2;
-    int max_i0 = (int)planes.size() - (int)cols.size();
-    if (i0 < 0) i0 = 0;
-    if (max_i0 < 0) return 0;
-    if (i0 > max_i0) i0 = max_i0;
 
     int written = 0;
     for (size_t k = 0; k < cols.size() && written < cap; k++) {
-        const PlaneEq &e = planes[(size_t)(i0 + (int)k)];
+        int pi = i0 + (int)k;
+        if (pi < 0 || pi >= (int)planes.size()) continue;
+        const PlaneEq &e = planes[(size_t)pi];
         for (const Dot &d : cols[k].pts) {
             if (written >= cap) break;
             undistort_ray((double)d.x, (double)d.y, cam, ray);
