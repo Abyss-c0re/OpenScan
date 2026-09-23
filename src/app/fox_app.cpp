@@ -297,8 +297,8 @@ private:
                 "Camera B is the clean view. Lower this if the object is blown out white.");
         add_row(3, "Camera B gain", gb, gb_n, "Amplifies camera B. Usually lower than camera A.");
         add_row(4, "Distance (mm)", dist, dist_n,
-                "How far the scanner is from the object. Mold uses this as the size of the solid. "
-                "Measured uses it to tell the projector stripes apart. Reset and scan again after changing it.");
+                "How far the scanner is from the object. Both modes use this to tell the stripes apart. "
+                "Reset and scan again after changing it.");
         ea_n->setText(exposure_text(ea->value()));
         eb_n->setText(exposure_text(eb->value()));
 
