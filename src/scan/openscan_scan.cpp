@@ -1,4 +1,4 @@
-#include "fox/fox_scan.h"
+#include "openscan/openscan_scan.h"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <vector>
 
-static cv::Mat pinhole_k(const fox_pinhole &p, double scale) {
+static cv::Mat pinhole_k(const openscan_pinhole &p, double scale) {
     cv::Mat K(3, 3, CV_64F);
     K.at<double>(0, 0) = p.fx * scale;
     K.at<double>(0, 1) = 0;
@@ -23,7 +23,7 @@ static cv::Mat pinhole_k(const fox_pinhole &p, double scale) {
     return K;
 }
 
-static cv::Mat pinhole_d(const fox_pinhole &p) {
+static cv::Mat pinhole_d(const openscan_pinhole &p) {
     cv::Mat D(1, 5, CV_64F);
     D.at<double>(0) = p.k1;
     D.at<double>(1) = p.k2;
@@ -39,8 +39,8 @@ struct cloud_stats {
 };
 
 static cloud_stats match_and_write(const cv::Mat &left, const cv::Mat &right,
-                                   const fox_pinhole &c1, const fox_pinhole &c2,
-                                   double scale, const fox_scan_opts &opt,
+                                   const openscan_pinhole &c1, const openscan_pinhole &c2,
+                                   double scale, const openscan_scan_opts &opt,
                                    const char *stl_path, const char *preview) {
     cloud_stats st;
     cv::Size size(left.cols, left.rows);
@@ -149,7 +149,7 @@ static cloud_stats match_and_write(const cv::Mat &left, const cv::Mat &right,
     if (!fp) return st;
     char header[80];
     memset(header, 0, sizeof header);
-    snprintf(header, sizeof header, "fox3d stereo %d triangles", st.triangles);
+    snprintf(header, sizeof header, "openscan stereo %d triangles", st.triangles);
     fwrite(header, 1, 80, fp);
     uint32_t n = (uint32_t)tris.size();
     fwrite(&n, 4, 1, fp);
@@ -175,10 +175,10 @@ static cloud_stats match_and_write(const cv::Mat &left, const cv::Mat &right,
     return st;
 }
 
-int fox_scan_to_stl(const uint8_t *ya, const uint8_t *yb, int width, int height,
-                    const fox_calib *calib, const fox_scan_opts *opt,
+int openscan_scan_to_stl(const uint8_t *ya, const uint8_t *yb, int width, int height,
+                    const openscan_calib *calib, const openscan_scan_opts *opt,
                     const char *stl_path, int *triangles_out) {
-    fox_scan_opts o = *opt;
+    openscan_scan_opts o = *opt;
     if (o.scale < 0.2) o.scale = 0.2;
     if (o.scale > 1.0) o.scale = 1.0;
     cv::Mat A(height, width, CV_8UC1, const_cast<uint8_t *>(ya));

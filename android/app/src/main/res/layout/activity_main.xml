@@ -1,0 +1,251 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0C0C0E"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="OpenScan"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/modeChip"
+            style="@style/OpenScanChip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:text="Mold" />
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/distanceChip"
+            style="@style/OpenScanChip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="—" />
+
+        <TextView
+            android:id="@+id/trackChip"
+            style="@style/OpenScanChip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="Ready" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="10dp"
+        android:layout_weight="1"
+        android:orientation="horizontal">
+
+        <FrameLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginEnd="6dp"
+            android:layout_weight="1"
+            android:background="@drawable/card">
+
+            <ImageView
+                android:id="@+id/cameraView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="Live camera"
+                android:scaleType="centerCrop" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|start"
+                android:layout_margin="10dp"
+                android:background="@drawable/caption"
+                android:paddingLeft="8dp"
+                android:paddingTop="3dp"
+                android:paddingRight="8dp"
+                android:paddingBottom="3dp"
+                android:text="Camera"
+                android:textSize="12sp" />
+        </FrameLayout>
+
+        <FrameLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1.15"
+            android:background="@drawable/card">
+
+            <ImageView
+                android:id="@+id/modelView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="3D model"
+                android:scaleType="fitCenter" />
+
+            <TextView
+                android:id="@+id/modelCaption"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|start"
+                android:layout_margin="10dp"
+                android:background="@drawable/caption"
+                android:paddingLeft="8dp"
+                android:paddingTop="3dp"
+                android:paddingRight="8dp"
+                android:paddingBottom="3dp"
+                android:text="3D  ·  drag to turn"
+                android:textSize="12sp" />
+        </FrameLayout>
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="84dp"
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal">
+
+        <FrameLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginEnd="4dp"
+            android:layout_weight="1"
+            android:background="@drawable/card">
+
+            <ImageView
+                android:id="@+id/camA"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="Pattern camera"
+                android:scaleType="centerCrop" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|start"
+                android:layout_margin="6dp"
+                android:background="@drawable/caption"
+                android:paddingLeft="6dp"
+                android:paddingRight="6dp"
+                android:text="A"
+                android:textSize="11sp" />
+        </FrameLayout>
+
+        <FrameLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginEnd="4dp"
+            android:layout_weight="1"
+            android:background="@drawable/card">
+
+            <ImageView
+                android:id="@+id/camB"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="Clean camera"
+                android:scaleType="centerCrop" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|start"
+                android:layout_margin="6dp"
+                android:background="@drawable/caption"
+                android:paddingLeft="6dp"
+                android:paddingRight="6dp"
+                android:text="B"
+                android:textSize="11sp" />
+        </FrameLayout>
+
+        <FrameLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@drawable/card">
+
+            <ImageView
+                android:id="@+id/sideView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="Side view"
+                android:scaleType="fitCenter" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|start"
+                android:layout_margin="6dp"
+                android:background="@drawable/caption"
+                android:paddingLeft="6dp"
+                android:paddingRight="6dp"
+                android:text="Side"
+                android:textSize="11sp" />
+        </FrameLayout>
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/mold"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Mold" />
+
+        <Button
+            android:id="@+id/measured"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Measured" />
+
+        <Button
+            android:id="@+id/scan"
+            style="@style/OpenScanPrimary"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_marginEnd="8dp"
+            android:layout_weight="1.3"
+            android:text="Start" />
+
+        <Button
+            android:id="@+id/settings"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Settings" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:orientation="horizontal">
+
+        <Button android:id="@+id/stop" style="@style/OpenScanQuiet" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Stop" />
+        <Button android:id="@+id/reset" style="@style/OpenScanQuiet" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Reset" />
+        <Button android:id="@+id/swap" style="@style/OpenScanQuiet" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Swap" />
+        <Button android:id="@+id/frames" style="@style/OpenScanQuiet" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Frames" />
+        <Button android:id="@+id/export" style="@style/OpenScanQuiet" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Export" />
+        <Button android:id="@+id/view" style="@style/OpenScanQuiet" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Open" />
+    </LinearLayout>
+</LinearLayout>

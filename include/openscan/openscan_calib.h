@@ -1,5 +1,5 @@
-#ifndef FOX_CALIB_H
-#define FOX_CALIB_H
+#ifndef OPENSCAN_CALIB_H
+#define OPENSCAN_CALIB_H
 
 #include <stddef.h>
 
@@ -22,44 +22,46 @@ extern "C" {
  * Camera 2's translation is in millimetres relative to camera 1.
  * On this Fox the baseline is about 32 mm along X. */
 
-typedef struct fox_pinhole {
+typedef struct openscan_pinhole {
     double fx, fy, cx, cy;
     double k1, k2, p1, p2, k3;
     double rvec[3];
     double tvec[3]; /* millimetres, camera-2 and projector only */
-} fox_pinhole;
+} openscan_pinhole;
 
 /* A projector stripe. In the projector image it is the line
  * u = slope * v + offset. OneShot turns that line into a 3D plane. */
-typedef struct fox_plane {
+typedef struct openscan_plane {
     int index;
     double slope;
     double offset;
-} fox_plane;
+} openscan_plane;
 
-#define FOX_MAX_PLANES 160
+#define OPENSCAN_MAX_PLANES 160
 
-typedef struct fox_calib {
+typedef struct openscan_calib {
     int width, height;
     char serial[64];
     char date[64];
-    fox_pinhole cam[3]; /* 0 pattern camera, 1 clean camera, 2 projector */
+    openscan_pinhole cam[3]; /* 0 pattern camera, 1 clean camera, 2 projector */
     int nplanes;
-    fox_plane plane[FOX_MAX_PLANES];
-} fox_calib;
+    openscan_plane plane[OPENSCAN_MAX_PLANES];
+} openscan_calib;
 
-int fox_calib_load(const char *path, fox_calib *out);
+int openscan_calib_load(const char *path, openscan_calib *out);
 
-/* Download the factory calib.txt for this serial. The request is signed
- * from the serial alone; no account cookie is sent. Writes dest_path. */
-int fox_calib_fetch(const char *serial, const char *dest_path);
+/* Download the factory calib.txt for this serial from 3DMakerpro's
+ * proprietary servers (sw.3dyunzhan.com, then swcn.3dyunzhan.com).
+ * The request is signed from the serial alone; no account cookie is sent.
+ * Tested on the Fox. Other 3DMakerpro serials may resolve. Writes dest_path. */
+int openscan_calib_fetch(const char *serial, const char *dest_path);
 
 /* Load a local file for this serial, or download one into
- * $XDG_DATA_HOME/fox3d/calib/<serial>.txt when none is on disk.
+ * $XDG_DATA_HOME/openscan/calib/<serial>.txt when none is on disk.
  * explicit_path, when set, is the only file tried and is never downloaded.
  * used_path may be NULL. */
-int fox_calib_ensure(const char *serial, const char *explicit_path,
-                     fox_calib *out, char *used_path, size_t used_n);
+int openscan_calib_ensure(const char *serial, const char *explicit_path,
+                     openscan_calib *out, char *used_path, size_t used_n);
 
 #ifdef __cplusplus
 }

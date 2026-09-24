@@ -1,4 +1,4 @@
-#include "fox/fox_calib.h"
+#include "openscan/openscan_calib.h"
 
 #include <curl/curl.h>
 #include <openssl/evp.h>
@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* The JMStudio client signs calibration/find as MD5(MD5(serial + this)). */
 static const char kSignSecret[] = "REDACTED";
@@ -84,7 +85,7 @@ static int http_get(const char *url, struct Mem *m) {
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 20L);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, mem_write);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, m);
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "fox3d");
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "openscan");
     CURLcode rc = curl_easy_perform(c);
     long status = 0;
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
@@ -120,7 +121,7 @@ static int lookup_url(const char *serial, char *url_out, size_t url_n) {
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 20L);
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, mem_write);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &m);
-        curl_easy_setopt(c, CURLOPT_USERAGENT, "fox3d");
+        curl_easy_setopt(c, CURLOPT_USERAGENT, "openscan");
         CURLcode rc = curl_easy_perform(c);
         long status = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
@@ -149,7 +150,7 @@ static int looks_like_calib(const char *text) {
     return strstr(text, "DevID:") != NULL;
 }
 
-int fox_calib_fetch(const char *serial, const char *dest_path) {
+int openscan_calib_fetch(const char *serial, const char *dest_path) {
     if (!serial || !serial[0] || !dest_path) return -1;
     char url[1024];
     if (lookup_url(serial, url, sizeof url) != 0) {
@@ -189,57 +190,73 @@ int fox_calib_fetch(const char *serial, const char *dest_path) {
     return 0;
 }
 
+/* AppImage and a prefix install keep factory files beside the program:
+ * usr/bin/openscan and usr/share/openscan/calib/. */
+static int exe_calib_path(const char *serial, char *out, size_t n) {
+    char exe[512];
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (len <= 0) return -1;
+    exe[len] = 0;
+    char *slash = strrchr(exe, '/');
+    if (!slash) return -1;
+    *slash = 0;
+    return snprintf(out, n, "%s/../share/openscan/calib/%s.txt", exe, serial) > 0 ? 0 : -1;
+}
+
 static int xdg_calib_path(const char *serial, char *out, size_t n) {
     const char *xdg = getenv("XDG_DATA_HOME");
     const char *home = getenv("HOME");
     if (xdg && xdg[0])
-        return snprintf(out, n, "%s/fox3d/calib/%s.txt", xdg, serial) > 0 ? 0 : -1;
+        return snprintf(out, n, "%s/openscan/calib/%s.txt", xdg, serial) > 0 ? 0 : -1;
     if (!home || !home[0]) return -1;
-    return snprintf(out, n, "%s/.local/share/fox3d/calib/%s.txt", home, serial) > 0 ? 0 : -1;
+    return snprintf(out, n, "%s/.local/share/openscan/calib/%s.txt", home, serial) > 0 ? 0 : -1;
 }
 
-static int try_load(const char *path, fox_calib *out, char *used, size_t used_n) {
-    if (fox_calib_load(path, out) != 0) return -1;
+static int try_load(const char *path, openscan_calib *out, char *used, size_t used_n) {
+    if (openscan_calib_load(path, out) != 0) return -1;
     if (used && used_n) snprintf(used, used_n, "%s", path);
     return 0;
 }
 
-int fox_calib_ensure(const char *serial, const char *explicit_path,
-                     fox_calib *out, char *used_path, size_t used_n) {
+int openscan_calib_ensure(const char *serial, const char *explicit_path,
+                     openscan_calib *out, char *used_path, size_t used_n) {
     if (!out) return -1;
     if (explicit_path && explicit_path[0])
         return try_load(explicit_path, out, used_path, used_n);
     if (!serial || !serial[0]) return -1;
 
     char path[512];
-    const char *rels[] = {"calib/%s.txt", "fox3d/calib/%s.txt"};
+    const char *rels[] = {"calib/%s.txt", "openscan/calib/%s.txt"};
     for (size_t i = 0; i < sizeof rels / sizeof rels[0]; i++) {
         snprintf(path, sizeof path, rels[i], serial);
         if (try_load(path, out, used_path, used_n) == 0) return 0;
     }
-#ifdef FOX3D_CALIB_DIR
-    snprintf(path, sizeof path, FOX3D_CALIB_DIR "/%s.txt", serial);
+#ifdef OPENSCAN_CALIB_DIR
+    snprintf(path, sizeof path, OPENSCAN_CALIB_DIR "/%s.txt", serial);
     if (try_load(path, out, used_path, used_n) == 0) return 0;
 #endif
+    if (exe_calib_path(serial, path, sizeof path) == 0 &&
+        try_load(path, out, used_path, used_n) == 0)
+        return 0;
     if (xdg_calib_path(serial, path, sizeof path) == 0 &&
         try_load(path, out, used_path, used_n) == 0)
         return 0;
 
     if (xdg_calib_path(serial, path, sizeof path) != 0) return -1;
     fprintf(stderr, "fetching factory calibration\n");
-    if (fox_calib_fetch(serial, path) != 0) return -1;
+    if (openscan_calib_fetch(serial, path) != 0) return -1;
     if (try_load(path, out, used_path, used_n) != 0) return -1;
     fprintf(stderr, "saved factory calibration\n");
     return 0;
 }
 
-#ifdef FOX_CALIB_FETCH_TEST
+#ifdef OPENSCAN_CALIB_FETCH_TEST
 int main(int argc, char **argv) {
     const char *sn = argc > 1 ? argv[1] : "EXAMPLE01";
-    const char *dest = argc > 2 ? argv[2] : "/tmp/fox-calib-fetch.txt";
-    if (fox_calib_fetch(sn, dest) != 0) return 1;
-    fox_calib cal;
-    if (fox_calib_load(dest, &cal) != 0) return 2;
+    const char *dest = argc > 2 ? argv[2] : "/tmp/openscan-calib-fetch.txt";
+    if (openscan_calib_fetch(sn, dest) != 0) return 1;
+    openscan_calib cal;
+    if (openscan_calib_load(dest, &cal) != 0) return 2;
     printf("ok %s %s baseline %.2f\n", cal.serial, cal.date, cal.cam[1].tvec[0]);
     return 0;
 }

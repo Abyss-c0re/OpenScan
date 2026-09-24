@@ -1,4 +1,4 @@
-#include "fox/fox_calib.h"
+#include "openscan/openscan_calib.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -11,7 +11,7 @@ static int read_doubles(FILE *f, double *dst, int n) {
     return 0;
 }
 
-int fox_calib_load(const char *path, fox_calib *out) {
+int openscan_calib_load(const char *path, openscan_calib *out) {
     memset(out, 0, sizeof *out);
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -29,7 +29,7 @@ int fox_calib_load(const char *path, fox_calib *out) {
     for (int c = 0; c < 3; c++) {
         double v[15];
         if (read_doubles(f, v, 15) < 0) { fclose(f); return -1; }
-        fox_pinhole *p = &out->cam[c];
+        openscan_pinhole *p = &out->cam[c];
         p->fx = v[0]; p->fy = v[1]; p->cx = v[2]; p->cy = v[3];
         p->k1 = v[4]; p->k2 = v[5]; p->p1 = v[6]; p->p2 = v[7]; p->k3 = v[8];
         p->rvec[0] = v[9]; p->rvec[1] = v[10]; p->rvec[2] = v[11];
@@ -41,7 +41,7 @@ int fox_calib_load(const char *path, fox_calib *out) {
      * cut the plane. */
     int np = 0;
     if (fscanf(f, "%d", &np) == 1 && np > 0) {
-        if (np > FOX_MAX_PLANES) np = FOX_MAX_PLANES;
+        if (np > OPENSCAN_MAX_PLANES) np = OPENSCAN_MAX_PLANES;
         for (int i = 0; i < np; i++) {
             int index = 0;
             double slope = 0, offset = 0;

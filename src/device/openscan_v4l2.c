@@ -1,4 +1,4 @@
-#include "fox/fox_v4l2.h"
+#include "openscan/openscan_v4l2.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -15,14 +15,14 @@
 #include <sys/select.h>
 #include <unistd.h>
 
-#define FOX_BUFFERS 4
+#define OPENSCAN_BUFFERS 4
 
-struct fox_buf {
+struct openscan_buf {
     void *start;
     size_t length;
 };
 
-struct fox_cam {
+struct openscan_cam {
     int fd;
     char path[256];
     int width;
@@ -30,7 +30,7 @@ struct fox_cam {
     int mjpeg;
     int bytesperline;
     int streaming;
-    struct fox_buf bufs[FOX_BUFFERS];
+    struct openscan_buf bufs[OPENSCAN_BUFFERS];
     unsigned nbufs;
 };
 
@@ -47,7 +47,7 @@ static void trim_nl(char *s) {
     while (n && (s[n - 1] == '\n' || s[n - 1] == '\r')) s[--n] = 0;
 }
 
-int fox_find_cameras(char *path_a, char *path_b, size_t path_n,
+int openscan_find_cameras(char *path_a, char *path_b, size_t path_n,
                      char *serial_out, size_t serial_n) {
     DIR *d = opendir("/sys/class/video4linux");
     if (!d) return -1;
@@ -97,8 +97,8 @@ int fox_find_cameras(char *path_a, char *path_b, size_t path_n,
     return 0;
 }
 
-fox_cam *fox_cam_open(const char *path, int width, int height, int fps, int mjpeg) {
-    fox_cam *cam = calloc(1, sizeof *cam);
+openscan_cam *openscan_cam_open(const char *path, int width, int height, int fps, int mjpeg) {
+    openscan_cam *cam = calloc(1, sizeof *cam);
     if (!cam) return NULL;
     snprintf(cam->path, sizeof cam->path, "%s", path);
     cam->fd = open(path, O_RDWR | O_NONBLOCK);
@@ -118,7 +118,7 @@ fox_cam *fox_cam_open(const char *path, int width, int height, int fps, int mjpe
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
     if (xioctl(cam->fd, VIDIOC_S_FMT, &fmt) < 0) {
         fprintf(stderr, "%s: set format %dx%d: %s\n", path, width, height, strerror(errno));
-        fox_cam_close(cam);
+        openscan_cam_close(cam);
         return NULL;
     }
     if (fmt.fmt.pix.pixelformat != want ||
@@ -130,7 +130,7 @@ fox_cam *fox_cam_open(const char *path, int width, int height, int fps, int mjpe
                 (fmt.fmt.pix.pixelformat >> 16) & 255,
                 (fmt.fmt.pix.pixelformat >> 24) & 255,
                 fmt.fmt.pix.width, fmt.fmt.pix.height);
-        fox_cam_close(cam);
+        openscan_cam_close(cam);
         return NULL;
     }
     cam->width = (int)fmt.fmt.pix.width;
@@ -148,12 +148,12 @@ fox_cam *fox_cam_open(const char *path, int width, int height, int fps, int mjpe
 
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof req);
-    req.count = FOX_BUFFERS;
+    req.count = OPENSCAN_BUFFERS;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
     if (xioctl(cam->fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 2) {
         fprintf(stderr, "%s: reqbufs: %s\n", path, strerror(errno));
-        fox_cam_close(cam);
+        openscan_cam_close(cam);
         return NULL;
     }
     cam->nbufs = req.count;
@@ -165,7 +165,7 @@ fox_cam *fox_cam_open(const char *path, int width, int height, int fps, int mjpe
         buf.index = i;
         if (xioctl(cam->fd, VIDIOC_QUERYBUF, &buf) < 0) {
             fprintf(stderr, "%s: querybuf: %s\n", path, strerror(errno));
-            fox_cam_close(cam);
+            openscan_cam_close(cam);
             return NULL;
         }
         cam->bufs[i].length = buf.length;
@@ -173,16 +173,16 @@ fox_cam *fox_cam_open(const char *path, int width, int height, int fps, int mjpe
         if (cam->bufs[i].start == MAP_FAILED) {
             fprintf(stderr, "%s: mmap: %s\n", path, strerror(errno));
             cam->bufs[i].start = NULL;
-            fox_cam_close(cam);
+            openscan_cam_close(cam);
             return NULL;
         }
     }
     return cam;
 }
 
-void fox_cam_close(fox_cam *cam) {
+void openscan_cam_close(openscan_cam *cam) {
     if (!cam) return;
-    if (cam->streaming) fox_cam_stop(cam);
+    if (cam->streaming) openscan_cam_stop(cam);
     for (unsigned i = 0; i < cam->nbufs; i++) {
         if (cam->bufs[i].start && cam->bufs[i].start != MAP_FAILED)
             munmap(cam->bufs[i].start, cam->bufs[i].length);
@@ -196,7 +196,7 @@ static int set_ctrl(int fd, uint32_t id, int value) {
     return xioctl(fd, VIDIOC_S_CTRL, &c);
 }
 
-int fox_cam_set_exposure(fox_cam *cam, int exposure_100us, int gain) {
+int openscan_cam_set_exposure(openscan_cam *cam, int exposure_100us, int gain) {
     /* Manual mode is menu value 1 on this sensor (V4L2_EXPOSURE_MANUAL). */
     if (set_ctrl(cam->fd, V4L2_CID_EXPOSURE_AUTO, 1) < 0)
         fprintf(stderr, "%s: manual exposure: %s\n", cam->path, strerror(errno));
@@ -211,7 +211,7 @@ int fox_cam_set_exposure(fox_cam *cam, int exposure_100us, int gain) {
     return 0;
 }
 
-int fox_cam_start(fox_cam *cam) {
+int openscan_cam_start(openscan_cam *cam) {
     if (cam->streaming) return 0;
     for (unsigned i = 0; i < cam->nbufs; i++) {
         struct v4l2_buffer buf;
@@ -233,7 +233,7 @@ int fox_cam_start(fox_cam *cam) {
     return 0;
 }
 
-int fox_cam_stop(fox_cam *cam) {
+int openscan_cam_stop(openscan_cam *cam) {
     if (!cam->streaming) return 0;
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     xioctl(cam->fd, VIDIOC_STREAMOFF, &type);
@@ -241,7 +241,7 @@ int fox_cam_stop(fox_cam *cam) {
     return 0;
 }
 
-static int copy_payload(fox_cam *cam, const struct v4l2_buffer *buf,
+static int copy_payload(openscan_cam *cam, const struct v4l2_buffer *buf,
                         uint8_t *dst, size_t dst_cap, size_t *out_n, uint64_t *ts_us) {
     if (buf->index >= cam->nbufs) return -1;
     const uint8_t *src = cam->bufs[buf->index].start;
@@ -269,7 +269,7 @@ static int copy_payload(fox_cam *cam, const struct v4l2_buffer *buf,
     return 0;
 }
 
-static int dq_one(fox_cam *cam, struct v4l2_buffer *buf, int block) {
+static int dq_one(openscan_cam *cam, struct v4l2_buffer *buf, int block) {
     memset(buf, 0, sizeof *buf);
     buf->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf->memory = V4L2_MEMORY_MMAP;
@@ -297,7 +297,7 @@ static int dq_one(fox_cam *cam, struct v4l2_buffer *buf, int block) {
     }
 }
 
-int fox_cam_grab(fox_cam *cam, uint8_t *dst, size_t dst_cap, size_t *out_n, uint64_t *ts_us) {
+int openscan_cam_grab(openscan_cam *cam, uint8_t *dst, size_t dst_cap, size_t *out_n, uint64_t *ts_us) {
     struct v4l2_buffer buf;
     if (dq_one(cam, &buf, 1) < 0) return -1;
     int rc = copy_payload(cam, &buf, dst, dst_cap, out_n, ts_us);
@@ -308,8 +308,8 @@ int fox_cam_grab(fox_cam *cam, uint8_t *dst, size_t dst_cap, size_t *out_n, uint
     return rc;
 }
 
-int fox_cam_grab_latest(fox_cam *cam, uint8_t *dst, size_t dst_cap, size_t *out_n, uint64_t *ts_us) {
-    if (fox_cam_grab(cam, dst, dst_cap, out_n, ts_us) < 0) return -1;
+int openscan_cam_grab_latest(openscan_cam *cam, uint8_t *dst, size_t dst_cap, size_t *out_n, uint64_t *ts_us) {
+    if (openscan_cam_grab(cam, dst, dst_cap, out_n, ts_us) < 0) return -1;
     for (;;) {
         struct v4l2_buffer buf;
         if (dq_one(cam, &buf, 0) < 0) {
@@ -325,10 +325,10 @@ int fox_cam_grab_latest(fox_cam *cam, uint8_t *dst, size_t dst_cap, size_t *out_
     }
 }
 
-int fox_cam_width(const fox_cam *cam) { return cam->width; }
-int fox_cam_height(const fox_cam *cam) { return cam->height; }
-int fox_cam_mjpeg(const fox_cam *cam) { return cam->mjpeg; }
-const char *fox_cam_path(const fox_cam *cam) { return cam->path; }
+int openscan_cam_width(const openscan_cam *cam) { return cam->width; }
+int openscan_cam_height(const openscan_cam *cam) { return cam->height; }
+int openscan_cam_mjpeg(const openscan_cam *cam) { return cam->mjpeg; }
+const char *openscan_cam_path(const openscan_cam *cam) { return cam->path; }
 
 static int xu_query(int fd, uint8_t sel, uint8_t query, uint16_t size, uint8_t *data) {
     struct uvc_xu_control_query q = {
@@ -342,7 +342,7 @@ static int xu_query(int fd, uint8_t sel, uint8_t query, uint16_t size, uint8_t *
     return 0;
 }
 
-int fox_asic_read(fox_cam *cam, unsigned addr, uint8_t *value) {
+int openscan_asic_read(openscan_cam *cam, unsigned addr, uint8_t *value) {
     uint8_t b[4] = { (uint8_t)(addr & 0xff), (uint8_t)((addr >> 8) & 0xff), 0x00, 0xff };
     if (xu_query(cam->fd, 1, UVC_SET_CUR, 4, b) < 0) return -1;
     memset(b, 0, sizeof b);
@@ -351,7 +351,7 @@ int fox_asic_read(fox_cam *cam, unsigned addr, uint8_t *value) {
     return 0;
 }
 
-int fox_asic_write(fox_cam *cam, unsigned addr, uint8_t value) {
+int openscan_asic_write(openscan_cam *cam, unsigned addr, uint8_t value) {
     uint8_t b[4] = { (uint8_t)(addr & 0xff), (uint8_t)((addr >> 8) & 0xff), value, 0x00 };
     return xu_query(cam->fd, 1, UVC_SET_CUR, 4, b);
 }

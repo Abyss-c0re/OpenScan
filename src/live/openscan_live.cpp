@@ -1,12 +1,14 @@
-#include "fox/fox_live.h"
-#include "fox/fox_oneshot.h"
+#include "openscan/openscan_live.h"
+#include "openscan/openscan_oneshot.h"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/ocl.hpp>
-#include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#if !defined(__ANDROID__)
+#include <opencv2/highgui.hpp>
 #include <opencv2/rgbd/kinfu.hpp>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -20,6 +22,22 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#if defined(__ANDROID__)
+static const int OPENSCAN_EV_MOVE = 0;
+static const int OPENSCAN_EV_DOWN = 1;
+static const int OPENSCAN_EV_UP = 4;
+static const int OPENSCAN_EV_WHEEL = 10;
+static int openscan_wheel_delta(int flags) {
+    return (int)(short)((unsigned)flags >> 16);
+}
+#else
+static const int OPENSCAN_EV_MOVE = cv::EVENT_MOUSEMOVE;
+static const int OPENSCAN_EV_DOWN = cv::EVENT_LBUTTONDOWN;
+static const int OPENSCAN_EV_UP = cv::EVENT_LBUTTONUP;
+static const int OPENSCAN_EV_WHEEL = cv::EVENT_MOUSEWHEEL;
+static int openscan_wheel_delta(int flags) { return cv::getMouseWheelDelta(flags); }
+#endif
 
 namespace {
 
@@ -54,7 +72,7 @@ static int write_stl(const char *path, const std::vector<Tri> &tris) {
     if (!fp) return -1;
     char header[80];
     memset(header, 0, sizeof header);
-    memcpy(header, "fox3d mesh", 10);
+    memcpy(header, "openscan mesh", 10);
     fwrite(header, 1, 80, fp);
     uint32_t n = (uint32_t)tris.size();
     fwrite(&n, 4, 1, fp);
@@ -77,7 +95,7 @@ static int write_stl(const char *path, const std::vector<Tri> &tris) {
 static int write_obj(const char *path, const std::vector<Tri> &tris) {
     FILE *fp = fopen(path, "w");
     if (!fp) return -1;
-    fprintf(fp, "# fox3d mesh\n");
+    fprintf(fp, "# openscan mesh\n");
     int idx = 1;
     for (const Tri &t : tris) {
         cv::Vec3f n = tri_normal(t);
@@ -112,6 +130,19 @@ static int write_ply(const char *path, const std::vector<Tri> &tris) {
     }
     for (size_t i = 0; i < tris.size(); i++)
         fprintf(fp, "3 %zu %zu %zu\n", i * 3, i * 3 + 1, i * 3 + 2);
+    fclose(fp);
+    return 0;
+}
+
+static int write_points(const char *path, const std::vector<cv::Vec3f> &pts) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    fprintf(fp, "ply\nformat ascii 1.0\n");
+    fprintf(fp, "element vertex %zu\n", pts.size());
+    fprintf(fp, "property float x\nproperty float y\nproperty float z\n");
+    fprintf(fp, "end_header\n");
+    for (const cv::Vec3f &p : pts)
+        fprintf(fp, "%.4f %.4f %.4f\n", p[0], p[1], p[2]);
     fclose(fp);
     return 0;
 }
@@ -190,7 +221,7 @@ static void marching_cubes(const std::vector<float> &sdf, const std::vector<floa
     }
 }
 
-static cv::Mat pinhole_k(const fox_pinhole &p, double scale) {
+static cv::Mat pinhole_k(const openscan_pinhole &p, double scale) {
     cv::Mat K(3, 3, CV_64F);
     K.at<double>(0, 0) = p.fx * scale;
     K.at<double>(0, 1) = 0;
@@ -204,7 +235,7 @@ static cv::Mat pinhole_k(const fox_pinhole &p, double scale) {
     return K;
 }
 
-static cv::Mat pinhole_d(const fox_pinhole &p) {
+static cv::Mat pinhole_d(const openscan_pinhole &p) {
     cv::Mat D(1, 5, CV_64F);
     D.at<double>(0) = p.k1;
     D.at<double>(1) = p.k2;
@@ -222,11 +253,11 @@ struct Geom {
     cv::Size size;
 };
 
-static Geom build_geom(const fox_calib *cal, const fox_scan_opts &opt, cv::Size size) {
+static Geom build_geom(const openscan_calib *cal, const openscan_scan_opts &opt, cv::Size size) {
     Geom g;
     g.size = size;
-    const fox_pinhole &c1 = cal->cam[0];
-    const fox_pinhole &c2 = cal->cam[1];
+    const openscan_pinhole &c1 = cal->cam[0];
+    const openscan_pinhole &c2 = cal->cam[1];
     double scale_x = (double)size.width / cal->width;
     double scale_y = (double)size.height / cal->height;
     double scale = 0.5 * (scale_x + scale_y);
@@ -260,7 +291,12 @@ static Geom build_geom(const fox_calib *cal, const fox_scan_opts &opt, cv::Size 
     /* alpha -1 keeps the calibrated focal length. alpha 0 zooms until the
      * picture is a few valid pixels wide and the pair is useless. */
     cv::stereoRectify(K1, D1, K2, D2, size, R, T, R1, R2, P1, P2, g.Q,
-                      cv::STEREO_ZERO_DISPARITY, -1, size);
+#if CV_VERSION_MAJOR >= 5
+                      cv::STEREO_ZERO_DISPARITY,
+#else
+                      cv::CALIB_ZERO_DISPARITY,
+#endif
+                      -1, size);
     cv::initUndistortRectifyMap(K1, D1, R1, P1, size, CV_32FC1, g.map1x, g.map1y);
     cv::initUndistortRectifyMap(K2, D2, R2, P2, size, CV_32FC1, g.map2x, g.map2y);
     g.fx = (float)P1.at<double>(0, 0);
@@ -437,8 +473,10 @@ static int mesh_points(const std::vector<cv::Vec3f> &P, const std::vector<cv::Ve
     }
     float ext = std::max(hi[0] - lo[0], std::max(hi[1] - lo[1], hi[2] - lo[2]));
     if (!(ext > 1.f) || ext > 2000.f) return 0;
-    float voxel = std::max(1.5f, ext / 180.f);
-    float trunc = voxel * 3.f;
+    float voxel = std::max(1.2f, ext / 200.f);
+    /* Stripes sit a little apart. Five voxels joins them into one sheet
+     * without bridging a real gap in the object. */
+    float trunc = voxel * 5.f;
     int margin = 3;
     int nx = (int)std::ceil((hi[0] - lo[0]) / voxel) + 1 + 2 * margin;
     int ny = (int)std::ceil((hi[1] - lo[1]) / voxel) + 1 + 2 * margin;
@@ -488,23 +526,25 @@ static int mesh_points(const std::vector<cv::Vec3f> &P, const std::vector<cv::Ve
 
 } // namespace
 
-struct FoxButton {
+struct OpenScanButton {
     int x, y, w, h;
     int id;
 };
 
-struct fox_live {
-    fox_calib calib;
-    fox_scan_opts opt;
+struct openscan_live {
+    openscan_calib calib;
+    openscan_scan_opts opt;
     Geom geom;
     cv::Size size;
     int locked = 0;          /* 0 unknown, 1 USB A is calib cam1, 2 USB B is cam1 */
     int fused = 0;
     int lost = 0;
-    int mode = FOX_MODE_STOP;
+    int mode = OPENSCAN_MODE_STOP;
     int quit = 0;
     int save_req = 0;
+#if !defined(__ANDROID__)
     cv::Ptr<cv::kinfu::KinFu> kf;
+#endif
     cv::Mat last_model;
     cv::Mat align_gray;
     cv::Mat preview;
@@ -516,12 +556,15 @@ struct fox_live {
     char line1[160];
     char line2[160];
     std::vector<cv::Vec3f> cloud, cloud_n;
+    std::vector<int> cloud_hits;
     std::unordered_map<uint64_t, uint32_t> vox;
     cv::Matx33f pose_R = cv::Matx33f::eye();
     cv::Vec3f pose_t = cv::Vec3f(0, 0, 0);
     float pose_s = 1.f;
     float distance_mm = 220.f;
-    int shape = FOX_SHAPE_MOLD;
+    openscan_build build = {80.f, 550.f, 1, 5, 80, 40, 1, 1};
+    std::vector<cv::Vec3f> preview_pts;
+    int shape = OPENSCAN_SHAPE_MOLD;
     int covered = 0;
     int tracked_frames = 0;
     std::vector<Tri> shell;
@@ -576,16 +619,17 @@ struct fox_live {
     int drag_x = 0;
     int drag_y = 0;
     int view_x = 0, view_y = 0, view_w = 0, view_h = 0;
-    std::vector<FoxButton> buttons;
+    std::vector<OpenScanButton> buttons;
     /* Full-resolution undistort of each sensor, in the sensor's own orientation. */
     cv::Mat und_ax, und_ay, und_bx, und_by;
     double view_fx = 0, view_fy = 0, view_cx = 0, view_cy = 0;
     cv::Mat stereo_a, stereo_b;
+    cv::Mat panel_cam, panel_model, panel_a, panel_b, panel_side;
 };
 
 /* Remove lens distortion without zooming the picture. alpha 1 keeps every
  * source pixel, so the skull is not cropped again to hide the bend. */
-static void build_undistort(const fox_pinhole &cam, cv::Size size, cv::Mat &mx, cv::Mat &my,
+static void build_undistort(const openscan_pinhole &cam, cv::Size size, cv::Mat &mx, cv::Mat &my,
                             double &fx, double &fy, double &cx, double &cy) {
     cv::Mat K = pinhole_k(cam, 1.0);
     cv::Mat D = pinhole_d(cam);
@@ -597,8 +641,8 @@ static void build_undistort(const fox_pinhole &cam, cv::Size size, cv::Mat &mx, 
     cy = neu.at<double>(1, 2);
 }
 
-fox_live *fox_live_create(const fox_calib *calib, const fox_scan_opts *opt) {
-    fox_live *L = new fox_live();
+openscan_live *openscan_live_create(const openscan_calib *calib, const openscan_scan_opts *opt) {
+    openscan_live *L = new openscan_live();
     L->calib = *calib;
     L->opt = *opt;
     if (L->opt.scale < 0.25) L->opt.scale = 0.25;
@@ -628,11 +672,13 @@ fox_live *fox_live_create(const fox_calib *calib, const fox_scan_opts *opt) {
     return L;
 }
 
-void fox_live_destroy(fox_live *live) { delete live; }
+void openscan_live_destroy(openscan_live *live) { delete live; }
 
-void fox_live_reset(fox_live *live) {
+void openscan_live_reset(openscan_live *live) {
     if (!live) return;
+#if !defined(__ANDROID__)
     live->kf.release();
+#endif
     live->last_model.release();
     live->fused = 0;
     live->lost = 0;
@@ -641,6 +687,8 @@ void fox_live_reset(fox_live *live) {
     live->hist_i = 0;
     live->cloud.clear();
     live->cloud_n.clear();
+    live->cloud_hits.clear();
+    live->preview_pts.clear();
     live->vox.clear();
     live->pose_R = cv::Matx33f::eye();
     live->pose_t = cv::Vec3f(0, 0, 0);
@@ -651,7 +699,7 @@ void fox_live_reset(fox_live *live) {
     live->shell_mark = 0;
     live->shell_R = cv::Matx33f::eye();
     live->shell_set = 0;
-    live->wedge.assign(72, fox_live::Wedge{});
+    live->wedge.assign(72, openscan_live::Wedge{});
     live->cells.clear();
     live->refs.clear();
     live->seen_cells.clear();
@@ -670,85 +718,144 @@ void fox_live_reset(fox_live *live) {
     live->scanned_bins = 0;
     live->dist = -1.f;
     live->user_zoom = 0;
-    live->mode = FOX_MODE_STOP;
+    live->mode = OPENSCAN_MODE_STOP;
     snprintf(live->line1, sizeof live->line1,
              "STOPPED   scanned 0°   not scanned 360°   detail x1   0 tris");
 }
 
-void fox_live_set_mode(fox_live *live, int mode) {
+void openscan_live_set_mode(openscan_live *live, int mode) {
     if (!live) return;
-    if (mode != FOX_MODE_SCAN && mode != FOX_MODE_PAUSE) mode = FOX_MODE_STOP;
+    if (mode != OPENSCAN_MODE_SCAN && mode != OPENSCAN_MODE_PAUSE) mode = OPENSCAN_MODE_STOP;
     live->mode = mode;
 }
 
-void fox_live_set_shape(fox_live *live, int shape) {
+void openscan_live_set_shape(openscan_live *live, int shape) {
     if (!live) return;
-    if (shape != FOX_SHAPE_MEASURED) shape = FOX_SHAPE_MOLD;
+    if (shape != OPENSCAN_SHAPE_MEASURED) shape = OPENSCAN_SHAPE_MOLD;
     if (live->shape == shape) return;
     int mode = live->mode;
     float dist_mm = live->distance_mm;
+    openscan_build keep_build = live->build;
     float yaw = live->yaw;
     float pitch = live->pitch;
     float dist = live->dist;
     int zoom = live->user_zoom;
-    fox_live_reset(live);
+    openscan_live_reset(live);
     live->shape = shape;
     live->mode = mode;
     live->distance_mm = dist_mm;
+    live->build = keep_build;
     live->yaw = yaw;
     live->pitch = pitch;
     live->dist = dist;
     live->user_zoom = zoom;
 }
 
-int fox_live_shape(const fox_live *live) {
-    return live ? live->shape : FOX_SHAPE_MOLD;
+int openscan_live_shape(const openscan_live *live) {
+    return live ? live->shape : OPENSCAN_SHAPE_MOLD;
 }
 
 static uint64_t voxel_key(int ix, int iy, int iz);
 
-void fox_live_set_distance_mm(fox_live *live, float mm) {
+void openscan_live_set_distance_mm(openscan_live *live, float mm) {
     if (!live) return;
     if (mm < 80.f) mm = 80.f;
     if (mm > 500.f) mm = 500.f;
     live->distance_mm = mm;
 }
 
-float fox_live_distance_mm(const fox_live *live) {
+float openscan_live_distance_mm(const openscan_live *live) {
     return live ? live->distance_mm : 220.f;
 }
 
-int fox_live_mode(const fox_live *live) { return live ? live->mode : FOX_MODE_STOP; }
-int fox_live_points(const fox_live *live) {
+static openscan_build build_clamped(const openscan_build *in) {
+    openscan_build b = {80.f, 550.f, 1, 5, 80, 40, 1, 1};
+    if (!in) return b;
+    b = *in;
+    if (b.near_mm < 60.f) b.near_mm = 60.f;
+    if (b.near_mm > 450.f) b.near_mm = 450.f;
+    if (b.far_mm < b.near_mm + 40.f) b.far_mm = b.near_mm + 40.f;
+    if (b.far_mm > 800.f) b.far_mm = 800.f;
+    if (b.stride < 1) b.stride = 1;
+    if (b.stride > 6) b.stride = 6;
+    if (b.smooth < 0) b.smooth = 0;
+    if (b.smooth > 8) b.smooth = 8;
+    if (b.sweep_deg < 20) b.sweep_deg = 20;
+    if (b.sweep_deg > 140) b.sweep_deg = 140;
+    if (b.relief < 0) b.relief = 0;
+    if (b.relief > 100) b.relief = 100;
+    b.solid = b.solid ? 1 : 0;
+    b.flip = b.flip ? 1 : 0;
+    return b;
+}
+
+void openscan_live_set_build(openscan_live *live, const openscan_build *build) {
+    if (!live || !build) return;
+    openscan_build next = build_clamped(build);
+    int flipped = live->build.flip != next.flip;
+    if (!flipped) {
+        live->build = next;
+        return;
+    }
+    int mode = live->mode;
+    int shape = live->shape;
+    float dist_mm = live->distance_mm;
+    float yaw = live->yaw;
+    float pitch = live->pitch;
+    float dist = live->dist;
+    int zoom = live->user_zoom;
+    openscan_live_reset(live);
+    live->mode = mode;
+    live->shape = shape;
+    live->distance_mm = dist_mm;
+    live->build = next;
+    live->yaw = yaw;
+    live->pitch = pitch;
+    live->dist = dist;
+    live->user_zoom = zoom;
+}
+
+void openscan_live_get_build(const openscan_live *live, openscan_build *build) {
+    if (!build) return;
+    if (!live) {
+        *build = build_clamped(NULL);
+        return;
+    }
+    *build = live->build;
+}
+
+int openscan_live_mode(const openscan_live *live) { return live ? live->mode : OPENSCAN_MODE_STOP; }
+int openscan_live_points(const openscan_live *live) {
     if (!live) return 0;
+    if (!live->build.solid && live->preview_pts.size() >= 80) return (int)live->preview_pts.size();
     int n = 0;
     for (const auto &w : live->wedge) n += (int)w.tris.size();
     if (n > 0) return n;
     if (live->shell.size() >= 80) return (int)live->shell.size();
     return (int)live->cloud.size();
 }
-int fox_live_take_save(fox_live *live) {
+int openscan_live_take_save(openscan_live *live) {
     if (!live || !live->save_req) return 0;
     live->save_req = 0;
     return 1;
 }
-int fox_live_quit(const fox_live *live) { return live && live->quit; }
+int openscan_live_quit(const openscan_live *live) { return live && live->quit; }
 
-void fox_live_key(fox_live *live, int key) {
+void openscan_live_key(openscan_live *live, int key) {
     if (!live) return;
     if (key == 's' || key == 'S') live->save_req = 1;
-    else if (key == ' ') live->mode = live->mode == FOX_MODE_SCAN ? FOX_MODE_PAUSE : FOX_MODE_SCAN;
+    else if (key == ' ') live->mode = live->mode == OPENSCAN_MODE_SCAN ? OPENSCAN_MODE_PAUSE : OPENSCAN_MODE_SCAN;
     else if (key == 'q' || key == 'Q' || key == 27) live->quit = 1;
 }
 
-void fox_live_mouse(fox_live *live, int event, int x, int y, int flags) {
+void openscan_live_mouse(openscan_live *live, int event, int x, int y, int flags) {
     if (!live) return;
-    if (event == cv::EVENT_LBUTTONDOWN) {
-        for (const FoxButton &b : live->buttons) {
+    if (event == OPENSCAN_EV_DOWN) {
+        for (const OpenScanButton &b : live->buttons) {
             if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
-                if (b.id == 1) live->mode = FOX_MODE_SCAN;
-                else if (b.id == 2) live->mode = FOX_MODE_PAUSE;
-                else if (b.id == 3) live->mode = FOX_MODE_STOP;
+                if (b.id == 1) live->mode = OPENSCAN_MODE_SCAN;
+                else if (b.id == 2) live->mode = OPENSCAN_MODE_PAUSE;
+                else if (b.id == 3) live->mode = OPENSCAN_MODE_STOP;
                 else if (b.id == 4) live->save_req = 1;
                 else if (b.id == 5) live->quit = 1;
                 return;
@@ -762,17 +869,17 @@ void fox_live_mouse(fox_live *live, int event, int x, int y, int flags) {
         live->spin = 0;
         live->drag_x = x;
         live->drag_y = y;
-    } else if (event == cv::EVENT_MOUSEMOVE && live->dragging) {
+    } else if (event == OPENSCAN_EV_MOVE && live->dragging) {
         live->yaw += (x - live->drag_x) * 0.01f;
         live->pitch += (y - live->drag_y) * 0.01f;
         if (live->pitch < -1.2f) live->pitch = -1.2f;
         if (live->pitch > 1.2f) live->pitch = 1.2f;
         live->drag_x = x;
         live->drag_y = y;
-    } else if (event == cv::EVENT_LBUTTONUP) {
+    } else if (event == OPENSCAN_EV_UP) {
         live->dragging = 0;
-    } else if (event == cv::EVENT_MOUSEWHEEL) {
-        int delta = cv::getMouseWheelDelta(flags);
+    } else if (event == OPENSCAN_EV_WHEEL) {
+        int delta = openscan_wheel_delta(flags);
         live->user_zoom = 1;
         if (live->dist < 30.f) live->dist = 160.f;
         live->dist *= delta > 0 ? 0.9f : 1.1f;
@@ -966,7 +1073,7 @@ static void build_object(const cv::Mat &depth, float fx, float fy, float cx, flo
     }
 }
 
-static bool nearest_model(const fox_live *L, const cv::Vec3f &p, int &idx) {
+static bool nearest_model(const openscan_live *L, const cv::Vec3f &p, int &idx) {
     const float voxel = 2.5f;
     int ix = (int)std::floor(p[0] / voxel);
     int iy = (int)std::floor(p[1] / voxel);
@@ -991,22 +1098,30 @@ static bool nearest_model(const fox_live *L, const cv::Vec3f &p, int &idx) {
     return found;
 }
 
-/* Align the new object cloud to the model. Scale lets the scanner move
- * closer or farther. A frame that does not land on this object is rejected,
- * so the background is not fused. */
-static bool track_object(fox_live *L, const std::vector<cv::Vec3f> &P, cv::Matx33f &R, cv::Vec3f &t,
-                         float &scale) {
+static cv::Matx33f rot_y(float a);
+
+/* Align the new cloud to the overlap already scanned. yaw_seed is a trial
+ * turn about the model centre, used when the object moved farther than one
+ * ICP step. The part of the frame that is new surface is not required to
+ * already sit on the model. */
+static bool track_object(openscan_live *L, const std::vector<cv::Vec3f> &P, cv::Matx33f &R, cv::Vec3f &t,
+                         float &scale, float yaw_seed) {
     if (L->cloud.size() < 80) {
         R = cv::Matx33f::eye();
         t = cv::Vec3f(0, 0, 0);
         scale = 1.f;
         return P.size() >= 80;
     }
-    R = L->pose_R;
-    t = L->pose_t;
+    cv::Vec3f centre(0, 0, 0);
+    for (const cv::Vec3f &p : L->cloud) centre += p;
+    centre *= 1.f / (float)L->cloud.size();
+    cv::Matx33f Y = rot_y(yaw_seed);
+    R = Y * L->pose_R;
+    t = Y * (L->pose_t - centre) + centre;
     scale = L->pose_s > 0.2f ? L->pose_s : 1.f;
+    cv::Matx33f seed_R = R;
     int stride = std::max(1, (int)P.size() / 900);
-    for (int iter = 0; iter < 10; iter++) {
+    for (int iter = 0; iter < 8; iter++) {
         std::vector<cv::Vec3f> src, dst;
         for (size_t i = 0; i < P.size(); i += (size_t)stride) {
             cv::Vec3f pm = scale * (R * P[i]) + t;
@@ -1063,23 +1178,77 @@ static bool track_object(fox_live *L, const std::vector<cv::Vec3f> &P, cv::Matx3
         cv::Vec3f cdf((float)cd[0], (float)cd[1], (float)cd[2]);
         t = cdf - scale * (R * csf);
     }
+    /* Reject a seed that flipped the cloud. trace(R * seed^T) is the step. */
+    cv::Matx33f step = R * seed_R.t();
+    float cang = (step(0, 0) + step(1, 1) + step(2, 2) - 1.f) * 0.5f;
+    if (cang > 1.f) cang = 1.f;
+    if (cang < -1.f) cang = -1.f;
+    if (std::acos(cang) > 28.f * 3.14159265f / 180.f) return false;
     double res = 0;
-    int inliers = 0, tested = 0;
+    int inliers = 0, overlap = 0, tested = 0;
     for (size_t i = 0; i < P.size(); i += (size_t)stride) {
         tested++;
         cv::Vec3f pm = scale * (R * P[i]) + t;
         int id = 0;
         if (!nearest_model(L, pm, id)) continue;
         float d = cv::norm(pm - L->cloud[(size_t)id]);
-        if (d > 8.f) continue;
+        if (d > 15.f) continue;
+        overlap++;
+        if (d > 5.f) continue;
         res += d;
         inliers++;
     }
-    if (tested < 40 || inliers < 40) return false;
-    return (float)inliers / (float)tested >= 0.42f && res / inliers < 5.5;
+    if (tested < 40 || overlap < 30 || inliers < 30) return false;
+    if ((float)inliers / (float)overlap < 0.55f) return false;
+    return res / inliers < 3.5;
 }
 
-static void note_coverage(fox_live *L, const std::vector<cv::Vec3f> &N) {
+/* Try the last pose, then a wider turn, and keep the alignment whose
+ * overlapping surface sits tightest. */
+static bool track_search(openscan_live *L, const std::vector<cv::Vec3f> &P, cv::Matx33f &R, cv::Vec3f &t,
+                         float &scale) {
+    if (L->cloud.size() < 80) return track_object(L, P, R, t, scale, 0.f);
+    const float seeds[] = {0.f, 8.f, -8.f, 16.f, -16.f, 24.f, -24.f};
+    bool any = false;
+    double best_res = 1e9;
+    cv::Matx33f best_R;
+    cv::Vec3f best_t;
+    float best_s = 1.f;
+    int stride = std::max(1, (int)P.size() / 400);
+    for (float deg : seeds) {
+        cv::Matx33f Ri;
+        cv::Vec3f ti;
+        float si;
+        if (!track_object(L, P, Ri, ti, si, deg * 3.14159265f / 180.f)) continue;
+        double res = 0;
+        int n = 0;
+        for (size_t i = 0; i < P.size(); i += (size_t)stride) {
+            cv::Vec3f pm = si * (Ri * P[i]) + ti;
+            int id = 0;
+            if (!nearest_model(L, pm, id)) continue;
+            float d = cv::norm(pm - L->cloud[(size_t)id]);
+            if (d > 5.f) continue;
+            res += d;
+            n++;
+        }
+        if (n < 30) continue;
+        res /= n;
+        if (!any || res < best_res) {
+            any = true;
+            best_res = res;
+            best_R = Ri;
+            best_t = ti;
+            best_s = si;
+        }
+    }
+    if (!any) return false;
+    R = best_R;
+    t = best_t;
+    scale = best_s;
+    return true;
+}
+
+static void note_coverage(openscan_live *L, const std::vector<cv::Vec3f> &N) {
     cv::Vec3f s(0, 0, 0);
     for (const cv::Vec3f &n : N) s += L->pose_R * n;
     if (s.dot(s) < 1e-6f) return;
@@ -1097,7 +1266,7 @@ static int coverage_count(int mask) {
     return n;
 }
 
-static void absorb_points(fox_live *L, const std::vector<cv::Vec3f> &P, const std::vector<cv::Vec3f> &N) {
+static void absorb_points(openscan_live *L, const std::vector<cv::Vec3f> &P, const std::vector<cv::Vec3f> &N) {
     const float voxel = 2.5f;
     for (size_t i = 0; i < P.size(); i++) {
         if (L->cloud.size() >= 70000) return;
@@ -1112,7 +1281,7 @@ static void absorb_points(fox_live *L, const std::vector<cv::Vec3f> &P, const st
     }
 }
 
-static cv::Mat render_orbit(fox_live *L, const std::vector<cv::Vec3f> &P, const std::vector<cv::Vec3f> &N,
+static cv::Mat render_orbit(openscan_live *L, const std::vector<cv::Vec3f> &P, const std::vector<cv::Vec3f> &N,
                             int w, int h, const char *title) {
     cv::Mat img(h, w, CV_8UC3, cv::Scalar(18, 20, 24));
     cv::putText(img, title, cv::Point(10, 24), cv::FONT_HERSHEY_SIMPLEX, 0.55,
@@ -1194,7 +1363,7 @@ static cv::Mat render_orbit(fox_live *L, const std::vector<cv::Vec3f> &P, const 
     return img;
 }
 
-static void draw_solid(fox_live *L, cv::Mat &img, const std::vector<SurfTri> &tris) {
+static void draw_solid(openscan_live *L, cv::Mat &img, const std::vector<SurfTri> &tris) {
     if (tris.size() < 20) return;
     cv::Vec3f c(0, 0, 0);
     cv::Vec3f lo = tris[0].a, hi = tris[0].a;
@@ -1437,7 +1606,8 @@ static cv::Mat foreground_mask(const cv::Mat &gray) {
 }
 
 static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::Mat &out,
-                        float yaw_deg, float pitch_deg, float bump_mm, float *dist, int user_zoom) {
+                        float yaw_deg, float pitch_deg, float bump_mm, float *dist, int user_zoom,
+                        float shell_mm, int points_only) {
     out.setTo(cv::Scalar(12, 14, 18));
     cv::Vec3f c(0, 0, 0);
     int cnt = 0;
@@ -1489,6 +1659,28 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
     auto proj = [&](const ShadeVert &v, float &sx, float &sy, float &zc) {
         project_point(cv::Vec3f(v.x, v.y, v.z - bump_mm * v.bump), sx, sy, zc);
     };
+    if (points_only) {
+        for (const ShadeVert &v : grid) {
+            if (!v.ok) continue;
+            float sx, sy, zc;
+            project_point(cv::Vec3f(v.x, v.y, v.z - bump_mm * v.bump), sx, sy, zc);
+            int px = (int)std::lround(sx);
+            int py = (int)std::lround(sy);
+            int g = (int)std::min(255.f, 40.f + 200.f * v.albedo);
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int x = px + dx, y = py + dy;
+                    if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                    float &slot = zbuf[(size_t)y * w + x];
+                    if (zc < slot) {
+                        slot = zc;
+                        out.at<cv::Vec3b>(y, x) = cv::Vec3b((uint8_t)g, (uint8_t)g, (uint8_t)g);
+                    }
+                }
+            }
+        }
+        return;
+    }
     for (int gy = 0; gy < gh - 1; gy++) {
         for (int gx = 0; gx < gw - 1; gx++) {
             const ShadeVert &a = grid[(size_t)gy * gw + gx];
@@ -1501,7 +1693,7 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
                 cv::Vec3f pa(t[0]->x, t[0]->y, t[0]->z - bump_mm * t[0]->bump);
                 cv::Vec3f pb(t[1]->x, t[1]->y, t[1]->z - bump_mm * t[1]->bump);
                 cv::Vec3f pc(t[2]->x, t[2]->y, t[2]->z - bump_mm * t[2]->bump);
-                if (cv::norm(pa - pb) > 28.f || cv::norm(pa - pc) > 28.f || cv::norm(pb - pc) > 28.f)
+                if (cv::norm(pa - pb) > 16.f || cv::norm(pa - pc) > 16.f || cv::norm(pb - pc) > 16.f)
                     continue;
                 cv::Vec3f nrm = (pb - pa).cross(pc - pa);
                 float ln = std::sqrt(nrm.dot(nrm));
@@ -1514,10 +1706,18 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
                 float shade = alb * (0.72f + 0.28f * lam);
                 int g = (int)std::min(255.f, 255.f * shade);
                 cv::Vec3b col((uint8_t)g, (uint8_t)g, (uint8_t)g);
+                int layers = shell_mm > 0.f ? 2 : 1;
+                for (int layer = 0; layer < layers; layer++) {
+                cv::Vec3f qa = pa, qb = pb, qc = pc;
+                if (layer == 1) {
+                    qa -= nrm * shell_mm;
+                    qb -= nrm * shell_mm;
+                    qc -= nrm * shell_mm;
+                }
                 float ax, ay, az, bx, by, bz, cxp, cyp, cz;
-                proj(*t[0], ax, ay, az);
-                proj(*t[1], bx, by, bz);
-                proj(*t[2], cxp, cyp, cz);
+                project_point(qa, ax, ay, az);
+                project_point(qb, bx, by, bz);
+                project_point(qc, cxp, cyp, cz);
                 int minx = std::max(0, (int)std::floor(std::min(ax, std::min(bx, cxp))) - 1);
                 int maxx = std::min(w - 1, (int)std::ceil(std::max(ax, std::max(bx, cxp))) + 1);
                 int miny = std::max(0, (int)std::floor(std::min(ay, std::min(by, cyp))) - 1);
@@ -1539,20 +1739,30 @@ static void render_body(const std::vector<ShadeVert> &grid, int gw, int gh, cv::
                         }
                     }
                 }
+                }
             }
         }
     }
 }
 
-static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const fox_calib *cal,
+static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const openscan_calib *cal,
                           float fx, float fy, float cx, float cy, float yaw_deg, float pitch_deg,
-                          float &dist, int user_zoom, int shade_live, float z_mm, int shape) {
+                          float &dist, int user_zoom, int shade_live, float z_mm, int shape,
+                          const openscan_build *tune_in) {
+    openscan_build tune = build_clamped(tune_in);
     BodyView body;
     if (sensor.empty() || fx < 50.f) return body;
     cv::Mat gray;
-    cv::rotate(sensor, gray, cv::ROTATE_180);
-    float cxr = (gray.cols - 1) - cx;
-    float cyr = (gray.rows - 1) - cy;
+    float cxr, cyr;
+    if (tune.flip) {
+        cv::rotate(sensor, gray, cv::ROTATE_180);
+        cxr = (gray.cols - 1) - cx;
+        cyr = (gray.rows - 1) - cy;
+    } else {
+        gray = sensor;
+        cxr = cx;
+        cyr = cy;
+    }
     float rel = gray.cols / 1280.f;
     cv::Mat mask = foreground_mask(gray);
     std::vector<float> left, right;
@@ -1595,106 +1805,257 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
     int gw = 2;
     int gh = 2;
     std::vector<ShadeVert> grid;
+    if (shape != OPENSCAN_SHAPE_MEASURED) {
+        /* Mold is the solid the scanner built before Measured existed: the
+         * camera outline swept into a body, with the picture's shading as
+         * relief. Measured, below, is the projector-stripe surface. */
+        cv::Mat mid, wide;
+        cv::GaussianBlur(gray, mid, cv::Size(0, 0), std::max(2.f, 7.f * rel));
+        cv::GaussianBlur(gray, wide, cv::Size(0, 0), std::max(6.f, 26.f * rel));
+        int ystep = std::max(2, (int)std::lround(3.f * rel)) * tune.stride;
+        gh = (gray.rows + ystep - 1) / ystep;
+        gw = std::max(24, 112 / tune.stride);
+        grid.assign((size_t)gw * gh, ShadeVert{});
+        const float th_max = tune.sweep_deg * 3.14159265f / 180.f;
+        const float sin_max = std::sin(th_max);
+        for (int iy = 0; iy < gh; iy++) {
+            int y = std::min(gray.rows - 1, iy * ystep);
+            float half = 0.5f * (right[y] - left[y]);
+            float mid_x = 0.5f * (right[y] + left[y]);
+            bool row = left[y] >= 0.f && right[y] >= 0.f && half > 8.f;
+            for (int ix = 0; ix < gw; ix++) {
+                ShadeVert v{0, 0, 0, 0, 0, false};
+                if (row) {
+                    float u = -1.f + 2.f * (float)ix / (float)(gw - 1);
+                    float th = u * th_max;
+                    float x_geom = mid_x + half * (std::sin(th) / sin_max);
+                    int x = (int)std::lround(x_geom);
+                    x = std::max(0, std::min(gray.cols - 1, x));
+                    float hf = (float)gray.at<uint8_t>(y, x) - (float)mid.at<uint8_t>(y, x);
+                    float br = (float)mid.at<uint8_t>(y, x) - (float)wide.at<uint8_t>(y, x);
+                    float bump = (hf * 0.55f + br * 0.35f) / 22.f * (tune.relief / 40.f);
+                    bump = std::max(-1.f, std::min(1.f, bump));
+                    float radius = half * z0 / fx;
+                    v.x = (x_geom - cxr) * z0 / fx;
+                    v.y = -((y - cyr) * z0 / fy);
+                    v.z = z0 - radius * std::cos(th);
+                    if (v.z < tune.near_mm || v.z > tune.far_mm) {
+                        grid[(size_t)iy * gw + ix] = v;
+                        continue;
+                    }
+                    v.bump = bump;
+                    v.albedo = gray.at<uint8_t>(y, x) / 255.f;
+                    v.ok = true;
+                }
+                grid[(size_t)iy * gw + ix] = v;
+            }
+        }
+        std::vector<float> sm(grid.size(), 0.f);
+        for (int y = 0; y < gh; y++) {
+            for (int x = 0; x < gw; x++) {
+                float s = 0, w = 0;
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dx = -2; dx <= 2; dx++) {
+                        int yy = y + dy, xx = x + dx;
+                        if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
+                        const ShadeVert &nb = grid[(size_t)yy * gw + xx];
+                        if (!nb.ok) continue;
+                        float wt = std::exp(-(dx * dx + dy * dy) / 3.f);
+                        s += wt * nb.bump;
+                        w += wt;
+                    }
+                }
+                sm[(size_t)y * gw + x] = w > 0.f ? s / w : 0.f;
+            }
+        }
+        for (size_t i = 0; i < grid.size(); i++)
+            if (grid[i].ok) grid[i].bump = sm[i];
+        std::vector<float> zcopy(grid.size());
+        for (size_t i = 0; i < grid.size(); i++) zcopy[i] = grid[i].z;
+        int rad = tune.smooth;
+        for (int iy = 0; iy < gh && rad > 0; iy++) {
+            for (int ix = 0; ix < gw; ix++) {
+                ShadeVert &v = grid[(size_t)iy * gw + ix];
+                if (!v.ok) continue;
+                float s = 0, w = 0;
+                for (int dy = -rad; dy <= rad; dy++) {
+                    int yy = iy + dy;
+                    if (yy < 0 || yy >= gh) continue;
+                    const ShadeVert &nb = grid[(size_t)yy * gw + ix];
+                    if (!nb.ok) continue;
+                    float wt = std::exp(-(float)(dy * dy) / 10.f);
+                    s += wt * zcopy[(size_t)yy * gw + ix];
+                    w += wt;
+                }
+                if (w > 0.f) v.z = s / w;
+                if (v.z < tune.near_mm || v.z > tune.far_mm) v.ok = false;
+            }
+        }
+    } else {
     cv::Mat depth(gray.rows, gray.cols, CV_32F, cv::Scalar(0));
     cv::Mat depth_n(gray.rows, gray.cols, CV_32F, cv::Scalar(0));
+    cv::Mat xy(gray.rows, gray.cols, CV_32FC2, cv::Scalar(0, 0));
     if (cal && cal->nplanes >= 8 && !pattern.empty() && pattern.type() == CV_8UC1 &&
         pattern.cols == gray.cols && pattern.rows == gray.rows) {
         cv::Mat pat = pattern.isContinuous() ? pattern : pattern.clone();
-        std::vector<fox_shot> shots(120000);
-        int nshot = fox_oneshot_points(pat.ptr<uint8_t>(), pat.cols, pat.rows, cal, z0, shots.data(),
+        std::vector<openscan_shot> shots(120000);
+        int nshot = openscan_oneshot_points(pat.ptr<uint8_t>(), pat.cols, pat.rows, cal, z0, shots.data(),
                                        (int)shots.size());
-        if (nshot > 0 && cal->cam[1].fx > 100.0) {
+        /* Put each stripe on the clean camera, and keep it only where that
+         * camera sees the object. The sheet then has the skull's outline. */
+        cv::Matx33d Rb = cv::Matx33d::eye();
+        cv::Vec3d tb(0, 0, 0);
+        if (cal->cam[1].fx > 100.0) {
             cv::Mat R;
             cv::Rodrigues(cv::Vec3d(cal->cam[1].rvec[0], cal->cam[1].rvec[1], cal->cam[1].rvec[2]), R);
-            cv::Matx33d Rb(R);
-            cv::Vec3d tb(cal->cam[1].tvec[0], cal->cam[1].tvec[1], cal->cam[1].tvec[2]);
-            cv::Mat allow;
-            cv::dilate(mask, allow,
-                       cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(11, 11)));
+            Rb = cv::Matx33d(R);
+            tb = cv::Vec3d(cal->cam[1].tvec[0], cal->cam[1].tvec[1], cal->cam[1].tvec[2]);
+        }
+        cv::Mat allow;
+        cv::dilate(mask, allow, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(41, 41)));
+        if (nshot > 0) {
             for (int i = 0; i < nshot; i++) {
-                const fox_shot &s = shots[(size_t)i];
+                const openscan_shot &s = shots[(size_t)i];
                 cv::Vec3d Xb = Rb * cv::Vec3d(s.x, s.y, s.z) + tb;
-                if (Xb[2] < 40.0 || Xb[2] > 900.0) continue;
+                if (Xb[2] < tune.near_mm || Xb[2] > tune.far_mm) continue;
                 float u = (float)(fx * Xb[0] / Xb[2] + cx);
                 float v = (float)(fy * Xb[1] / Xb[2] + cy);
-                int xu = (int)std::lround((gray.cols - 1) - u);
-                int yu = (int)std::lround((gray.rows - 1) - v);
-                if (xu < 0 || yu < 0 || xu >= gray.cols || yu >= gray.rows) continue;
-                if (!allow.at<uint8_t>(yu, xu)) continue;
-                depth.at<float>(yu, xu) += (float)Xb[2];
-                depth_n.at<float>(yu, xu) += 1.f;
+                int x = (int)std::lround(tune.flip ? (depth.cols - 1) - u : u);
+                int y = (int)std::lround(tune.flip ? (depth.rows - 1) - v : v);
+                if (x < 2 || y < 2 || x >= depth.cols - 2 || y >= depth.rows - 2) continue;
+                if (!allow.at<uint8_t>(y, x)) continue;
+                depth.at<float>(y, x) += (float)Xb[2];
+                depth_n.at<float>(y, x) += 1.f;
+                xy.at<cv::Vec2f>(y, x)[0] += (float)((x - cxr) * Xb[2] / fx);
+                xy.at<cv::Vec2f>(y, x)[1] += (float)(-((y - cyr) * Xb[2] / fy));
             }
         }
-    }
-    for (int y = 0; y < gray.rows; y++) {
-        float *d = depth.ptr<float>(y);
-        const float *c = depth_n.ptr<float>(y);
-        for (int x = 0; x < gray.cols; x++)
-            if (c[x] > 0.f) d[x] /= c[x];
-    }
-    /* Stripes are a few pixels apart. Fill that gap inside the object so
-     * the mesh is one surface. A second pass closes the corners. */
-    const int gap_px = 28;
-    const float gap_mm = 16.f;
-    for (int pass = 0; pass < 2; pass++) {
-    for (int y = 0; y < gray.rows; y++) {
-        float *d = depth.ptr<float>(y);
-        const uint8_t *m = mask.ptr<uint8_t>(y);
-        int x = 0;
-        while (x < gray.cols) {
-            if (d[x] <= 0.f) {
-                x++;
-                continue;
+        for (int y = 0; y < depth.rows; y++) {
+            float *d = depth.ptr<float>(y);
+            float *c = depth_n.ptr<float>(y);
+            cv::Vec2f *p = xy.ptr<cv::Vec2f>(y);
+            for (int x = 0; x < depth.cols; x++) {
+                if (c[x] <= 0.f) continue;
+                d[x] /= c[x];
+                p[x][0] /= c[x];
+                p[x][1] /= c[x];
             }
-            int a = x;
-            int b = a + 1;
-            while (b < gray.cols && d[b] <= 0.f) b++;
-            if (b < gray.cols && b > a + 1 && b - a - 1 <= gap_px && std::fabs(d[a] - d[b]) <= gap_mm) {
-                bool inside = true;
-                for (int k = a + 1; k < b; k++)
-                    if (!m[k]) inside = false;
-                if (inside) {
-                    for (int k = a + 1; k < b; k++) {
-                        float t = (float)(k - a) / (float)(b - a);
-                        d[k] = (1.f - t) * d[a] + t * d[b];
+        }
+        cv::Mat geom;
+        cv::dilate(mask, geom, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(21, 21)));
+        const int gap_px = 32;
+        const float gap_mm = 22.f;
+        for (int y = 0; y < depth.rows; y++) {
+            float *d = depth.ptr<float>(y);
+            cv::Vec2f *p = xy.ptr<cv::Vec2f>(y);
+            const uint8_t *m = geom.ptr<uint8_t>(y);
+            int x = 0;
+            while (x < depth.cols) {
+                if (d[x] <= 0.f) {
+                    x++;
+                    continue;
+                }
+                int a = x;
+                int b = a + 1;
+                while (b < depth.cols && d[b] <= 0.f) b++;
+                if (b < depth.cols && b > a + 1 && b - a - 1 <= gap_px &&
+                    std::fabs(d[a] - d[b]) <= gap_mm) {
+                    bool inside = true;
+                    for (int k = a + 1; k < b; k++)
+                        if (!m[k]) inside = false;
+                    if (inside) {
+                        for (int k = a + 1; k < b; k++) {
+                            float t = (float)(k - a) / (float)(b - a);
+                            d[k] = (1.f - t) * d[a] + t * d[b];
+                            p[k][0] = (1.f - t) * p[a][0] + t * p[b][0];
+                            p[k][1] = (1.f - t) * p[a][1] + t * p[b][1];
+                        }
+                    }
+                }
+                x = b < depth.cols ? b : depth.cols;
+            }
+        }
+        for (int x = 0; x < depth.cols; x++) {
+            int y = 0;
+            while (y < depth.rows) {
+                if (depth.at<float>(y, x) <= 0.f) {
+                    y++;
+                    continue;
+                }
+                int a = y;
+                int b = a + 1;
+                while (b < depth.rows && depth.at<float>(b, x) <= 0.f) b++;
+                if (b < depth.rows && b > a + 1 && b - a - 1 <= gap_px &&
+                    std::fabs(depth.at<float>(a, x) - depth.at<float>(b, x)) <= gap_mm) {
+                    bool inside = true;
+                    for (int k = a + 1; k < b; k++)
+                        if (!geom.at<uint8_t>(k, x)) inside = false;
+                    if (inside) {
+                        float za = depth.at<float>(a, x), zb = depth.at<float>(b, x);
+                        cv::Vec2f pa = xy.at<cv::Vec2f>(a, x), pb = xy.at<cv::Vec2f>(b, x);
+                        for (int k = a + 1; k < b; k++) {
+                            if (depth.at<float>(k, x) > 0.f) continue;
+                            float t = (float)(k - a) / (float)(b - a);
+                            depth.at<float>(k, x) = (1.f - t) * za + t * zb;
+                            xy.at<cv::Vec2f>(k, x) = (1.f - t) * pa + t * pb;
+                        }
+                    }
+                }
+                y = b < depth.rows ? b : depth.rows;
+            }
+        }
+        /* Drop a stripe that never met its neighbour. Those are the spikes
+         * under the jaw. The sheet, where two stripes were joined, stays. */
+        {
+            cv::Mat keep = depth.clone();
+            for (int y = 0; y < depth.rows; y++) {
+                const float *d = depth.ptr<float>(y);
+                float *o = keep.ptr<float>(y);
+                cv::Vec2f *p = xy.ptr<cv::Vec2f>(y);
+                for (int x = 0; x < depth.cols; x++) {
+                    if (d[x] <= 40.f) continue;
+                    bool left = false, right = false;
+                    for (int k = 1; k <= 6; k++) {
+                        if (x - k >= 0 && d[x - k] > 40.f) left = true;
+                        if (x + k < depth.cols && d[x + k] > 40.f) right = true;
+                    }
+                    if (!left || !right) {
+                        o[x] = 0.f;
+                        p[x] = cv::Vec2f(0, 0);
                     }
                 }
             }
-            x = b < gray.cols ? b : gray.cols;
+            keep.copyTo(depth);
         }
-    }
-    for (int x = 0; x < gray.cols; x++) {
-        int y = 0;
-        while (y < gray.rows) {
-            if (depth.at<float>(y, x) <= 0.f) {
-                y++;
-                continue;
-            }
-            int a = y;
-            int b = a + 1;
-            while (b < gray.rows && depth.at<float>(b, x) <= 0.f) b++;
-            if (b < gray.rows && b > a + 1 && b - a - 1 <= gap_px &&
-                std::fabs(depth.at<float>(a, x) - depth.at<float>(b, x)) <= gap_mm) {
-                bool inside = true;
-                for (int k = a + 1; k < b; k++)
-                    if (!mask.at<uint8_t>(k, x)) inside = false;
-                if (inside) {
-                    float za = depth.at<float>(a, x);
-                    float zb = depth.at<float>(b, x);
-                    for (int k = a + 1; k < b; k++) {
-                        if (depth.at<float>(k, x) > 0.f) continue;
-                        float t = (float)(k - a) / (float)(b - a);
-                        depth.at<float>(k, x) = (1.f - t) * za + t * zb;
-                    }
+        /* Soften the stripe ribs. The nose and sockets stay, because this
+         * only blends a pixel with its two horizontal neighbours. */
+        for (int pass = 0; pass < tune.smooth; pass++) {
+            cv::Mat zd = depth.clone();
+            cv::Mat xyd = xy.clone();
+            for (int y = 0; y < depth.rows; y++) {
+                const float *d = zd.ptr<float>(y);
+                float *o = depth.ptr<float>(y);
+                const cv::Vec2f *p = xyd.ptr<cv::Vec2f>(y);
+                cv::Vec2f *q = xy.ptr<cv::Vec2f>(y);
+                for (int x = 1; x < depth.cols - 1; x++) {
+                    if (d[x] <= 40.f || d[x - 1] <= 40.f || d[x + 1] <= 40.f) continue;
+                    o[x] = 0.25f * d[x - 1] + 0.5f * d[x] + 0.25f * d[x + 1];
+                    q[x] = 0.25f * p[x - 1] + 0.5f * p[x] + 0.25f * p[x + 1];
                 }
             }
-            y = b < gray.rows ? b : gray.rows;
         }
-    }
+        /* Hand the filled sheet to the grid below through depth_n>0. */
+        depth_n.setTo(0);
+        for (int y = 0; y < depth.rows; y++) {
+            const float *d = depth.ptr<float>(y);
+            float *c = depth_n.ptr<float>(y);
+            for (int x = 0; x < depth.cols; x++)
+                if (d[x] > 40.f) c[x] = 1.f;
+        }
     }
 
-    int xstep = std::max(3, (int)std::lround(4.f * rel));
-    int ystep = std::max(3, (int)std::lround(4.f * rel));
+    int xstep = std::max(3, (int)std::lround(4.f * rel)) * tune.stride;
+    int ystep = std::max(3, (int)std::lround(4.f * rel)) * tune.stride;
     gw = std::max(2, (gray.cols + xstep - 1) / xstep);
     gh = std::max(2, (gray.rows + ystep - 1) / ystep);
     grid.assign((size_t)gw * gh, ShadeVert{});
@@ -1705,7 +2066,6 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
      * borrows the nearest filled pixel inside a few millimetres. */
     auto sample_z = [&](int x, int y, float &z) -> bool {
         if (x < 0 || y < 0 || x >= depth.cols || y >= depth.rows) return false;
-        if (!mask.at<uint8_t>(y, x)) return false;
         float here = depth.at<float>(y, x);
         if (here > 40.f) {
             z = here;
@@ -1738,8 +2098,14 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
             float z = 0.f;
             ShadeVert v{0, 0, 0, 0, 0, false};
             if (sample_z(x, y, z)) {
-                v.x = (x - cxr) * z / fx;
-                v.y = -((y - cyr) * z / fy);
+                cv::Vec2f p = xy.at<cv::Vec2f>(y, x);
+                if (p[0] == 0.f && p[1] == 0.f) {
+                    v.x = (x - cxr) * z / fx;
+                    v.y = -((y - cyr) * z / fy);
+                } else {
+                    v.x = p[0];
+                    v.y = p[1];
+                }
                 v.z = z;
                 v.bump = 0.f;
                 v.albedo = gray.at<uint8_t>(y, x) / 255.f;
@@ -1752,7 +2118,7 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
             grid[(size_t)iy * gw + ix] = v;
         }
     }
-    for (int pass = 0; pass < 8; pass++) {
+    for (int pass = 0; pass < 2; pass++) {
         std::vector<ShadeVert> prev = grid;
         for (int iy = 1; iy < gh - 1; iy++) {
             int y = std::min(gray.rows - 1, iy * ystep);
@@ -1773,7 +2139,7 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
                         n++;
                     }
                 }
-                if (n < 3 || hi - lo > 30.f) continue;
+                if (n < 3 || hi - lo > 8.f) continue;
                 float z = acc / (float)n;
                 ShadeVert v{0, 0, 0, 0, 0, false};
                 v.x = (x - cxr) * z / fx;
@@ -1797,8 +2163,8 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
                 ShadeVert &v = grid[(size_t)iy * gw + ix];
                 if (!v.ok || v.z < 40.f) continue;
                 float s = 0.f, w = 0.f;
-                for (int dy = -2; dy <= 2; dy++) {
-                    for (int dx = -2; dx <= 2; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
                         int yy = iy + dy, xx = ix + dx;
                         if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
                         const ShadeVert &nb = grid[(size_t)yy * gw + xx];
@@ -1824,14 +2190,19 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
         body.axis = cv::Vec3f((float)(sx3 / nok), (float)(sy3 / nok), z_far + 8.f);
     }
 
+    }
+
     const float bump_mm = 1.8f;
     if (shade_live) {
         body.solid.create(gray.rows, gray.cols, CV_8UC3);
         body.side.create(gray.rows, gray.cols, CV_8UC3);
-        render_body(grid, gw, gh, body.solid, yaw_deg, pitch_deg, bump_mm, &dist, user_zoom);
+        float shell = shape == OPENSCAN_SHAPE_MOLD ? 8.f : 0.f;
+        int as_points = tune.solid ? 0 : 1;
+        render_body(grid, gw, gh, body.solid, yaw_deg, pitch_deg, bump_mm, &dist, user_zoom, 0.f,
+                    as_points);
         float ignored = 0;
-        float side_yaw = shape == FOX_SHAPE_MEASURED ? 32.f : 78.f;
-        render_body(grid, gw, gh, body.side, side_yaw, -8.f, bump_mm, &ignored, 0);
+        float side_yaw = shape == OPENSCAN_SHAPE_MEASURED ? 32.f : 70.f;
+        render_body(grid, gw, gh, body.side, side_yaw, -8.f, bump_mm, &ignored, 0, shell, as_points);
     } else {
         (void)yaw_deg;
         (void)pitch_deg;
@@ -1873,7 +2244,7 @@ static BodyView make_body(const cv::Mat &sensor, const cv::Mat &pattern, const f
         body.median_mm = zs[mid];
     }
     body.tris.reserve((size_t)gw * gh * 2);
-    for (int gy = 0; gy < gh - 1; gy++) {
+    for (int gy = 0; gy < gh - 1 && tune.solid; gy++) {
         for (int gx = 0; gx < gw - 1; gx++) {
             cv::Vec3f p00, p10, p01, p11;
             bool a = displaced(gy, gx, p00);
@@ -2008,7 +2379,7 @@ static float yaw_from_points(const std::vector<cv::Vec3f> &prev, const std::vect
 /* 1 = turn applied, 0 = lost (yaw stays put), -1 = no object.
  * The window stays on the object instead of chasing the silhouette.
  * A measured turn is taken from the depth itself when that agrees. */
-static int track_spin(fox_live *L, const BodyView &body, float &response) {
+static int track_spin(openscan_live *L, const BodyView &body, float &response) {
     response = 0.f;
     if (body.gray.empty() || body.radius_px < 30.f || body.P.size() < 80) return -1;
     if (!L->track_have) {
@@ -2047,7 +2418,7 @@ static int track_spin(fox_live *L, const BodyView &body, float &response) {
             cv::createHanningWindow(window, r.size(), CV_32F);
             double resp = 0;
             cv::Point2d shift = cv::phaseCorrelate(L->track_ref(r), f(r), window, &resp);
-            if (!std::isfinite(resp) || resp < 0.02 || !std::isfinite(shift.x) || !std::isfinite(shift.y))
+            if (!std::isfinite(resp) || resp < 0.012 || !std::isfinite(shift.x) || !std::isfinite(shift.y))
                 continue;
             if (std::fabs(shift.y) > r.height * 0.45) continue;
             xs.push_back((float)shift.x);
@@ -2057,7 +2428,7 @@ static int track_spin(fox_live *L, const BodyView &body, float &response) {
     }
     response = best_resp;
     float sx = 0.f, sy = 0.f;
-    bool have_tex = xs.size() >= 3;
+    bool have_tex = xs.size() >= 2;
     if (have_tex) {
         std::nth_element(xs.begin(), xs.begin() + (ptrdiff_t)xs.size() / 2, xs.end());
         std::nth_element(ys.begin(), ys.begin() + (ptrdiff_t)ys.size() / 2, ys.end());
@@ -2071,23 +2442,18 @@ static int track_spin(fox_live *L, const BodyView &body, float &response) {
     float th3 = yaw_from_points(L->track_pts, body.P, L->track_axis, frac);
     /* Depth wins when it sees a real turn. A still surface must not cancel
      * the texture measurement of a slow turn. */
-    if (frac >= 0.28f && (!have_tex || std::fabs(th3) >= 1.f * 3.14159265f / 180.f)) dtheta = th3;
-    if (!have_tex && frac < 0.28f) {
-        L->track_miss++;
-        if (L->track_miss >= 3) {
-            L->track_ref = f;
-            L->track_pts = body.P;
-            L->track_axis = body.axis;
-            L->track_miss = 0;
-        }
-        return 0;
-    }
+    if (frac >= 0.18f && (!have_tex || std::fabs(th3) >= 1.f * 3.14159265f / 180.f)) dtheta = th3;
+    /* A missed measurement holds the last angle and still keeps the frame.
+     * Dropping it is what made the solid look like it had lost the object. */
+    if (!have_tex && frac < 0.18f) dtheta = 0.f;
     if (!std::isfinite(dtheta)) dtheta = 0.f;
     const float kMax = 15.f * 3.14159265f / 180.f;
     if (dtheta > kMax) dtheta = kMax;
     if (dtheta < -kMax) dtheta = -kMax;
-    if (have_tex && std::fabs(sy) > f.rows * 0.45f && frac < 0.28f) {
+    if (have_tex && std::fabs(sy) > f.rows * 0.45f && frac < 0.18f) {
         L->track_ref = f;
+        L->track_pts = body.P;
+        L->track_axis = body.axis;
         return 0;
     }
     L->object_yaw += dtheta;
@@ -2112,8 +2478,8 @@ static cv::Vec3f world_of(const cv::Vec3f &p, const cv::Matx33f &R, const cv::Ve
 
 /* measured: align this depth surface onto the model, then merge.
  * Returns 0 when the view does not land on the model. */
-static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
-    if (L->wedge.size() != (size_t)kBins) L->wedge.assign(kBins, fox_live::Wedge{});
+static int fuse_shell(openscan_live *L, const BodyView &body, int measured) {
+    if (L->wedge.size() != (size_t)kBins) L->wedge.assign(kBins, openscan_live::Wedge{});
     /* Positive object_yaw is a turn whose texture moved left. The shell that
      * is in front of the camera belonged on the other side, so it is swung
      * the opposite way around the first view's axis. Both signs are used. */
@@ -2131,7 +2497,7 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
      * sideways and the export becomes a trail of copies. Scale stays 1.
      * The turn itself is object_yaw from track_spin; this does not drop it. */
     const float scale = 1.f;
-    if (L->cloud.size() >= 80 && !body.P.empty()) {
+    if (measured && L->cloud.size() >= 80 && !body.P.empty()) {
         /* A frame that does not sit on the surface already scanned would be
          * written down as a second sheet. That is the thick junk in the file. */
         std::vector<float> dist;
@@ -2145,9 +2511,9 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
             float d = cv::norm(L->cloud[(size_t)id] - w);
             if (d < 18.f) dist.push_back(d);
         }
-        if (tested < 30 || (int)dist.size() * 8 < tested) return 0;
+        if (tested < 30 || (int)dist.size() * 4 < tested) return 0;
         std::nth_element(dist.begin(), dist.begin() + (ptrdiff_t)dist.size() / 2, dist.end());
-        if (dist[dist.size() / 2] > 6.f) return 0;
+        if (dist[dist.size() / 2] > 12.f) return 0;
     }
     L->pose_R = R;
     L->pose_t = t;
@@ -2217,7 +2583,7 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
     for (const auto &kv : frame) {
         const Acc &a = kv.second;
         cv::Vec3f p = a.sum * (1.f / (float)a.n);
-        fox_live::Sample &s = L->cells[kv.first];
+        openscan_live::Sample &s = L->cells[kv.first];
         if (s.n <= 0) {
             s.p = p;
             s.w = a.view;
@@ -2229,7 +2595,7 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
             s.n++;
         }
     }
-    for (fox_live::TriRef &ref : L->refs) {
+    for (openscan_live::TriRef &ref : L->refs) {
         for (int i = 0; i < 3; i++) {
             auto old = before.find(ref.k[i]);
             auto cur = L->cells.find(ref.k[i]);
@@ -2254,7 +2620,7 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
         if (L->seen_cells.count(ck)) continue;
         if (measured && kind != 2) continue;
         fresh.insert(ck);
-        fox_live::TriRef ref;
+        openscan_live::TriRef ref;
         ref.bin = bin_of(mid[0] - L->axis0[0], mid[2] - L->axis0[2]);
         ref.tone = src.tone;
         for (int i = 0; i < 3; i++) {
@@ -2266,7 +2632,7 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
     }
     L->seen_cells.insert(fresh.begin(), fresh.end());
     for (auto &wd : L->wedge) wd.tris.clear();
-    for (const fox_live::TriRef &ref : L->refs) {
+    for (const openscan_live::TriRef &ref : L->refs) {
         if (ref.bin < 0 || ref.bin >= kBins) continue;
         if (cv::norm(ref.p[0] - ref.p[1]) > 28.f || cv::norm(ref.p[0] - ref.p[2]) > 28.f) continue;
         L->wedge[(size_t)ref.bin].tris.push_back(Tri{ref.p[0], ref.p[1], ref.p[2], ref.tone});
@@ -2303,19 +2669,19 @@ static int fuse_shell(fox_live *L, const BodyView &body, int measured) {
     return 1;
 }
 
-static int model_tris(const fox_live *L) {
+static int model_tris(const openscan_live *L) {
     int n = 0;
     for (const auto &w : L->wedge) n += (int)w.tris.size();
     return n;
 }
 
-static void draw_coverage_ring(cv::Mat &img, const fox_live *L) {
+static void draw_coverage_ring(cv::Mat &img, const openscan_live *L) {
     int r = std::max(28, std::min(img.cols, img.rows) / 10);
     cv::Point c(img.cols - r - 16, img.rows - r - 18);
     cv::circle(img, c, r, cv::Scalar(28, 28, 32), -1, cv::LINE_AA);
     cv::circle(img, c, r, cv::Scalar(70, 70, 78), 2, cv::LINE_AA);
     for (int b = 0; b < kBins; b++) {
-        if (b >= (int)L->wedge.size() || !L->wedge[(size_t)b].filled) continue;
+        if (!L->seen_dir[b] && (b >= (int)L->wedge.size() || !L->wedge[(size_t)b].filled)) continue;
         float a0 = bin_angle(b) - 0.5f * (6.2831853f / kBins);
         float a1 = a0 + (6.2831853f / kBins);
         /* 0° (first side) at the top of the dial. OpenCV angles grow clockwise. */
@@ -2330,7 +2696,7 @@ static void draw_coverage_ring(cv::Mat &img, const fox_live *L) {
                 cv::Scalar(240, 240, 240), 1, cv::LINE_AA);
 }
 
-static void render_model(fox_live *L, cv::Mat &out) {
+static void render_model(openscan_live *L, cv::Mat &out) {
     out.setTo(cv::Scalar(12, 14, 18));
     cv::Vec3f c = L->axis0;
     c[1] = 0.5f * (L->span_y0 + L->span_y1);
@@ -2397,20 +2763,20 @@ static void render_model(fox_live *L, cv::Mat &out) {
             float tone = t.tone > 0.02f ? t.tone : 0.55f;
             int g = (int)std::min(255.f, 255.f * tone * (0.55f + 0.45f * lam));
             paint_tri(t.a, t.b, t.c, cv::Vec3b((uint8_t)g, (uint8_t)g, (uint8_t)g));
-            if (L->shape == FOX_SHAPE_MOLD) {
+            if (L->shape == OPENSCAN_SHAPE_MOLD) {
                 cv::Vec3f back = n * 8.f;
                 paint_tri(t.c - back, t.b - back, t.a - back, cv::Vec3b((uint8_t)g, (uint8_t)g, (uint8_t)g));
             }
         }
     }
     draw_coverage_ring(out, L);
-    if (L->mode == FOX_MODE_SCAN && L->last_track == 0) {
+    if (L->mode == OPENSCAN_MODE_SCAN && L->last_track == 0) {
         cv::putText(out, "tracking lost  —  stay on the object", cv::Point(16, out.rows - 18),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(40, 40, 220), 2, cv::LINE_AA);
     }
 }
 
-static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_b,
+static void paint_preview(openscan_live *L, const cv::Mat &cam_a, const cv::Mat &cam_b,
                           const BodyView &body) {
     /* Keep the sensor aspect. A 1280x720 frame drawn into a tall half-panel
      * is squeezed to half its width, and a round crown looks smallest. */
@@ -2424,10 +2790,13 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     cv::Size view(view_w, view_h);
 
     cv::Mat hero(hero_h, hero_w, CV_8UC3, cv::Scalar(12, 12, 12));
+    /* Measured shows the stripe surface of this frame. Mold shows the solid
+     * body, and once a scan has started, the solid built by turning it. */
     cv::Mat solid = body.solid;
     cv::Mat model;
-    if ((L->shape == FOX_SHAPE_MEASURED && L->fused > 0) ||
-        (L->shape != FOX_SHAPE_MEASURED && L->scanned_bins > 0)) {
+    /* The right panel is the object already built. A stopped scan keeps that
+     * object on screen. Before any triangles exist, the live solid is shown. */
+    if (model_tris(L) >= 80 && (L->mode != OPENSCAN_MODE_STOP || L->scanned_bins > 0)) {
         model.create(view_h, view_w, CV_8UC3);
         render_model(L, model);
         solid = model;
@@ -2437,6 +2806,8 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
         cv::resize(body.camera, left, view, 0, 0, cv::INTER_AREA);
         if (solid.size() == view) right = solid;
         else cv::resize(solid, right, view, 0, 0, cv::INTER_AREA);
+        L->panel_cam = left.clone();
+        L->panel_model = right.clone();
         label_panel(left, "camera");
         int deg = (int)std::lround(L->scanned_bins * (360.0 / kBins));
         char cap[96];
@@ -2449,6 +2820,8 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
         left.copyTo(hero(cv::Rect(0, 0, hero_w / 2, hero_h)));
         right.copyTo(hero(cv::Rect(hero_w / 2, 0, hero_w / 2, hero_h)));
     } else {
+        L->panel_cam.release();
+        L->panel_model.release();
         cv::putText(hero, "waiting for a frame", cv::Point(12, hero_h / 2),
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
     }
@@ -2459,11 +2832,11 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     const cv::Mat &src_a = L->stereo_a.empty() ? cam_a : L->stereo_a;
     const cv::Mat &src_b = L->stereo_b.empty() ? cam_b : L->stereo_b;
     if (!src_a.empty()) {
-        if (L->stereo_a.empty()) cv::rotate(src_a, show_a, cv::ROTATE_180);
+        if (L->stereo_a.empty() && L->build.flip) cv::rotate(src_a, show_a, cv::ROTATE_180);
         else show_a = src_a;
     }
     if (!src_b.empty()) {
-        if (L->stereo_b.empty()) cv::rotate(src_b, show_b, cv::ROTATE_180);
+        if (L->stereo_b.empty() && L->build.flip) cv::rotate(src_b, show_b, cv::ROTATE_180);
         else show_b = src_b;
     }
     cv::Mat a = to_bgr(show_a, side);
@@ -2480,6 +2853,9 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
         cv::putText(d, line, cv::Point(12, d.rows / 2 + 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
                     cv::Scalar(160, 160, 170), 1, cv::LINE_AA);
     }
+    L->panel_a = a.clone();
+    L->panel_b = b.clone();
+    L->panel_side = d.clone();
     label_panel(a, L->stereo_a.empty() ? "camera A" : "stereo A");
     label_panel(b, L->stereo_b.empty() ? "camera B" : "stereo B");
     label_panel(d, body.side.empty() ? "coverage" : "side");
@@ -2496,8 +2872,8 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     L->view_w = hero_w;
     L->view_h = hero_h;
 
-    cv::Scalar col = L->mode == FOX_MODE_SCAN ? cv::Scalar(80, 220, 80)
-                    : L->mode == FOX_MODE_PAUSE ? cv::Scalar(80, 210, 230)
+    cv::Scalar col = L->mode == OPENSCAN_MODE_SCAN ? cv::Scalar(80, 220, 80)
+                    : L->mode == OPENSCAN_MODE_PAUSE ? cv::Scalar(80, 210, 230)
                                                 : cv::Scalar(180, 180, 180);
     cv::putText(L->preview, L->line1, cv::Point(8, 18), cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv::LINE_AA);
     L->buttons.clear();
@@ -2505,7 +2881,8 @@ static void paint_preview(fox_live *L, const cv::Mat &cam_a, const cv::Mat &cam_
     L->preview_h = L->preview.rows;
 }
 
-static int ensure_kinfu(fox_live *L) {
+#if !defined(__ANDROID__)
+static int ensure_kinfu(openscan_live *L) {
     if (L->kf) return 0;
     try {
         cv::Ptr<cv::kinfu::Params> p = cv::kinfu::Params::coarseParams();
@@ -2552,10 +2929,106 @@ static int ensure_kinfu(fox_live *L) {
             L->kf->getParams().volumePose(2, 3) * 1000.f);
     return 0;
 }
+#endif
 
-int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
-                  int width, int height, fox_live_status *status) {
-    fox_live_status st{};
+static void reindex_cloud(openscan_live *L) {
+    L->vox.clear();
+    const float voxel = 2.5f;
+    for (size_t i = 0; i < L->cloud.size(); i++) {
+        const cv::Vec3f &p = L->cloud[i];
+        int ix = (int)std::floor(p[0] / voxel);
+        int iy = (int)std::floor(p[1] / voxel);
+        int iz = (int)std::floor(p[2] / voxel);
+        uint64_t k = voxel_key(ix, iy, iz);
+        if (L->vox.find(k) == L->vox.end()) L->vox.emplace(k, (uint32_t)i);
+    }
+}
+
+/* 1 = fused, 0 = tracking lost, -1 = no surface yet.
+ * Overlap aligns the pose. Points the model has not seen are added, so a
+ * turn grows the object instead of being thrown away. */
+static int fuse_tracked(openscan_live *L, const BodyView &body) {
+    if (body.P.size() < 80 || body.N.size() != body.P.size()) return -1;
+    cv::Matx33f R;
+    cv::Vec3f t;
+    float scale = 1.f;
+    if (!track_search(L, body.P, R, t, scale)) return 0;
+    L->pose_R = R;
+    L->pose_t = t;
+    L->pose_s = scale;
+    if (L->cloud_hits.size() != L->cloud.size()) L->cloud_hits.assign(L->cloud.size(), 1);
+    for (size_t i = 0; i < body.P.size(); i++) {
+        cv::Vec3f w = scale * (R * body.P[i]) + t;
+        cv::Vec3f n = R * body.N[i];
+        float ln = std::sqrt(n.dot(n));
+        if (ln > 1e-6f) n /= ln;
+        else n = cv::Vec3f(0.f, 0.f, -1.f);
+        int id = 0;
+        bool near = L->cloud.size() >= 80 && nearest_model(L, w, id);
+        float d = near ? cv::norm(L->cloud[(size_t)id] - w) : 1e9f;
+        if (near && d < 8.f) {
+            float keep = std::min(12.f, (float)L->cloud_hits[(size_t)id]);
+            float a = keep / (keep + 1.f);
+            L->cloud[(size_t)id] = L->cloud[(size_t)id] * a + w * (1.f - a);
+            L->cloud_n[(size_t)id] = L->cloud_n[(size_t)id] * a + n * (1.f - a);
+            float nl = std::sqrt(L->cloud_n[(size_t)id].dot(L->cloud_n[(size_t)id]));
+            if (nl > 1e-6f) L->cloud_n[(size_t)id] /= nl;
+            if (L->cloud_hits[(size_t)id] < 24) L->cloud_hits[(size_t)id]++;
+        } else if (L->cloud.size() < 70000) {
+            const float voxel = 2.5f;
+            int ix = (int)std::floor(w[0] / voxel);
+            int iy = (int)std::floor(w[1] / voxel);
+            int iz = (int)std::floor(w[2] / voxel);
+            uint64_t k = voxel_key(ix, iy, iz);
+            if (L->vox.find(k) != L->vox.end()) continue;
+            L->vox.emplace(k, (uint32_t)L->cloud.size());
+            L->cloud.push_back(w);
+            L->cloud_n.push_back(n);
+            L->cloud_hits.push_back(1);
+        }
+    }
+    if (L->cloud.size() < 80) return 0;
+    reindex_cloud(L);
+    cv::Vec3f lo = L->cloud[0], hi = L->cloud[0], centre(0, 0, 0);
+    for (const cv::Vec3f &p : L->cloud) {
+        centre += p;
+        for (int a = 0; a < 3; a++) {
+            lo[a] = std::min(lo[a], p[a]);
+            hi[a] = std::max(hi[a], p[a]);
+        }
+    }
+    centre *= 1.f / (float)L->cloud.size();
+    L->axis0 = centre;
+    L->have_axis = 1;
+    L->span_y0 = lo[1];
+    L->span_y1 = hi[1];
+    L->radius_mm = 0.5f * std::max(hi[0] - lo[0], hi[2] - lo[2]);
+    if (L->wedge.size() != (size_t)kBins) L->wedge.assign((size_t)kBins, openscan_live::Wedge{});
+    memset(L->seen_dir, 0, sizeof L->seen_dir);
+    for (const cv::Vec3f &p : L->cloud) {
+        int b = bin_of(p[0] - centre[0], p[2] - centre[2]);
+        if (b >= 0 && b < kBins) L->seen_dir[b] = 1;
+    }
+    int nbin = 0;
+    for (int b = 0; b < kBins; b++) nbin += L->seen_dir[b] ? 1 : 0;
+    L->scanned_bins = nbin;
+    std::vector<Tri> tris;
+    if (mesh_points(L->cloud, L->cloud_n, tris) >= 80) {
+        for (auto &w : L->wedge) w.tris.clear();
+        L->wedge[0].tris = std::move(tris);
+        L->wedge[0].filled = 1;
+        L->shell = L->wedge[0].tris;
+    }
+    long hits = 0;
+    for (int h : L->cloud_hits) hits += h;
+    L->detail = std::max(1, (int)(hits / (long)L->cloud_hits.size()));
+    note_coverage(L, body.N);
+    return 1;
+}
+
+int openscan_live_push(openscan_live *live, const uint8_t *ya, const uint8_t *yb,
+                  int width, int height, openscan_live_status *status) {
+    openscan_live_status st{};
     st.tracking = -1;
     if (!live || width != live->calib.width || height != live->calib.height) return -1;
 
@@ -2586,20 +3059,27 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
         cv::Mat ra, rb, ua, ub;
         cv::remap(As, ra, live->geom.map1x, live->geom.map1y, cv::INTER_LINEAR);
         cv::remap(Bs, rb, live->geom.map2x, live->geom.map2y, cv::INTER_LINEAR);
-        cv::rotate(ra, ua, cv::ROTATE_180);
-        cv::rotate(rb, ub, cv::ROTATE_180);
-        live->stereo_a = ua;
-        live->stereo_b = ub;
+        if (live->build.flip) {
+            cv::rotate(ra, ua, cv::ROTATE_180);
+            cv::rotate(rb, ub, cv::ROTATE_180);
+            live->stereo_a = ua;
+            live->stereo_b = ub;
+        } else {
+            live->stereo_a = ra;
+            live->stereo_b = rb;
+        }
     }
 
     /* Camera B is the clean view (no projector dots). The picture is
      * undistorted above and turned upright inside make_body. */
     float yaw_deg = live->yaw * (180.f / 3.14159265f);
     float pitch_deg = live->pitch * (180.f / 3.14159265f);
-    int measured = live->shape == FOX_SHAPE_MEASURED;
+    int measured = live->shape == OPENSCAN_SHAPE_MEASURED;
     int shade_live = 1;
     BodyView body = make_body(*use_b, A, &live->calib, bfx, bfy, bcx, bcy, yaw_deg, pitch_deg,
-                              live->dist, live->user_zoom, shade_live, live->distance_mm, live->shape);
+                              live->dist, live->user_zoom, shade_live, live->distance_mm, live->shape,
+                              &live->build);
+    live->preview_pts = body.P;
     live->locked = 1;
 
     auto t1 = std::chrono::steady_clock::now();
@@ -2607,23 +3087,40 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     st.valid_pixels = (int)body.P.size();
     st.median_mm = body.median_mm;
 
-    if (live->mode == FOX_MODE_SCAN || live->mode == FOX_MODE_PAUSE) {
+    if (measured) {
+        live->shell = body.tris;
+        if (live->mode == OPENSCAN_MODE_PAUSE) {
+            live->last_track = body.P.size() >= 80 ? 1 : -1;
+            st.tracking = live->last_track;
+        } else if (live->mode == OPENSCAN_MODE_SCAN) {
+            int trk = fuse_shell(live, body, 1) ? 1 : 0;
+            if (body.P.size() < 80) trk = -1;
+            live->last_track = trk;
+            if (trk > 0) {
+                live->fused++;
+                live->tracked_frames++;
+                st.tracking = 1;
+            } else if (trk == 0) {
+                live->lost++;
+                st.tracking = 0;
+            } else {
+                st.tracking = -1;
+            }
+        } else {
+            live->last_track = body.P.size() >= 80 ? 1 : -1;
+            st.tracking = live->last_track;
+        }
+    } else if (live->mode == OPENSCAN_MODE_SCAN || live->mode == OPENSCAN_MODE_PAUSE) {
         float response = 0.f;
         int trk = track_spin(live, body, response);
         live->last_track = trk;
         if (trk < 0) {
             st.tracking = -1;
         } else if (trk == 0) {
-            if (live->mode == FOX_MODE_SCAN) live->lost++;
+            if (live->mode == OPENSCAN_MODE_SCAN) live->lost++;
             st.tracking = 0;
-            /* Mold still keeps the solid of this frame. Measured waits until
-             * the turn is known, so a lost frame is not pasted on the wrong side. */
-            if (!measured && live->mode == FOX_MODE_SCAN && fuse_shell(live, body, 0))
-                live->fused++;
-        } else if (live->mode == FOX_MODE_SCAN) {
-            /* A view that does not sit on the scanned surface is dropped.
-             * That is what stacked a second sheet into the exported file. */
-            if (fuse_shell(live, body, measured)) {
+        } else if (live->mode == OPENSCAN_MODE_SCAN) {
+            if (fuse_shell(live, body, 0)) {
                 live->fused++;
                 live->tracked_frames++;
                 st.tracking = 1;
@@ -2637,19 +3134,20 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     } else {
         live->last_track = -1;
         st.tracking = body.P.size() >= 80 ? 1 : -1;
-        if (measured && live->fused == 0) live->shell = body.tris;
     }
 
     st.fused = live->fused;
     st.lost = live->lost;
     st.mode = live->mode;
-    st.points = (measured && live->fused == 0) ? (int)live->shell.size() : model_tris(live);
+    st.points = model_tris(live);
+    if (st.points < 80 && !live->shell.empty()) st.points = (int)live->shell.size();
+    if (st.points < 80 && !body.tris.empty()) st.points = (int)body.tris.size();
     st.scanned_deg = (int)std::lround(live->scanned_bins * (360.0 / kBins));
     st.detail = std::max(1, live->detail);
-    const char *mode_name = live->mode == FOX_MODE_SCAN ? "SCANNING" :
-                            live->mode == FOX_MODE_PAUSE ? "PAUSED" : "STOPPED";
+    const char *mode_name = live->mode == OPENSCAN_MODE_SCAN ? "SCANNING" :
+                            live->mode == OPENSCAN_MODE_PAUSE ? "PAUSED" : "STOPPED";
     const char *shape_name = measured ? "MEASURED" : "MOLD";
-    const char *lost = (live->mode == FOX_MODE_SCAN && st.tracking == 0) ? "   TRACKING LOST" : "";
+    const char *lost = (live->mode == OPENSCAN_MODE_SCAN && st.tracking == 0) ? "   TRACKING LOST" : "";
     float height_mm = (live->span_y1 > live->span_y0 && live->span_y0 < 1e8f)
                           ? live->span_y1 - live->span_y0 : 0.f;
     float width_mm = live->have_axis ? live->radius_mm * 2.f : 0.f;
@@ -2672,14 +3170,34 @@ int fox_live_push(fox_live *live, const uint8_t *ya, const uint8_t *yb,
     return 0;
 }
 
-const uint8_t *fox_live_preview_bgr(const fox_live *live, int *width, int *height) {
+const uint8_t *openscan_live_preview_bgr(const openscan_live *live, int *width, int *height) {
     if (!live || live->preview.empty()) return NULL;
     if (width) *width = live->preview_w;
     if (height) *height = live->preview_h;
     return live->preview.data;
 }
 
-int fox_live_write(fox_live *live, const char *stl_path, int *triangles_out) {
+const uint8_t *openscan_live_panel_bgr(const openscan_live *live, int panel, int *width, int *height) {
+    if (!live) return NULL;
+    const cv::Mat *m = NULL;
+    if (panel == 0) m = &live->panel_cam;
+    else if (panel == 1) m = &live->panel_model;
+    else if (panel == 2) m = &live->panel_a;
+    else if (panel == 3) m = &live->panel_b;
+    else if (panel == 4) m = &live->panel_side;
+    if (!m || m->empty() || !m->isContinuous()) return NULL;
+    if (width) *width = m->cols;
+    if (height) *height = m->rows;
+    return m->data;
+}
+
+int openscan_live_write(openscan_live *live, const char *stl_path, int *triangles_out) {
+    if (live && !live->build.solid && live->preview_pts.size() >= 80) {
+        fprintf(stderr, "writing %zu points\n", live->preview_pts.size());
+        if (write_points(stl_path, live->preview_pts) < 0) return -1;
+        if (triangles_out) *triangles_out = 0;
+        return 0;
+    }
     std::vector<Tri> tris;
     if (live) {
         for (const auto &w : live->wedge)
@@ -2694,6 +3212,7 @@ int fox_live_write(fox_live *live, const char *stl_path, int *triangles_out) {
     } else if (live && live->cloud.size() >= 80) {
         fprintf(stderr, "meshing %zu model points\n", live->cloud.size());
         mesh_points(live->cloud, live->cloud_n, tris);
+#if !defined(__ANDROID__)
     } else if (live && live->kf) {
         cv::Mat pts, nrm;
         try {
@@ -2717,14 +3236,15 @@ int fox_live_write(fox_live *live, const char *stl_path, int *triangles_out) {
             fprintf(stderr, "fused cloud is empty (mat %d x %d type %d)\n",
                     pts.rows, pts.cols, pts.type());
         }
+#endif
     }
-    if (live && live->shape == FOX_SHAPE_MOLD && tris.size() >= 80) thicken_shell(tris, 8.f);
+    if (live && live->shape == OPENSCAN_SHAPE_MOLD && tris.size() >= 80) thicken_shell(tris, 8.f);
     if (write_mesh(stl_path, tris) < 0) return -1;
     if (triangles_out) *triangles_out = (int)tris.size();
     return 0;
 }
 
-int fox_mesh_self_test(void) {
+int openscan_mesh_self_test(void) {
     const int n = 48;
     const float voxel = 1.f;
     const float radius = 12.f;
@@ -2759,7 +3279,7 @@ int fox_mesh_self_test(void) {
 
     Tri one{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
     std::vector<Tri> one_tri{one};
-    const char *outs[] = {"/tmp/fox3d-export.stl", "/tmp/fox3d-export.obj", "/tmp/fox3d-export.ply"};
+    const char *outs[] = {"/tmp/openscan-export.stl", "/tmp/openscan-export.obj", "/tmp/openscan-export.ply"};
     for (const char *path : outs) {
         if (write_mesh(path, one_tri) != 0) {
             fprintf(stderr, "mesh self-test: could not write %s\n", path);

@@ -1,8 +1,8 @@
-#include "fox/fox_app.h"
-#include "fox/fox_calib.h"
-#include "fox/fox_live.h"
-#include "fox/fox_scan.h"
-#include "fox/fox_v4l2.h"
+#include "openscan/openscan_app.h"
+#include "openscan/openscan_calib.h"
+#include "openscan/openscan_live.h"
+#include "openscan/openscan_scan.h"
+#include "openscan/openscan_v4l2.h"
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -23,7 +23,9 @@ static void on_sigint(int) { g_stop = 1; }
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "fox3d " FOX3D_VERSION " — open-source scanner for the 3DMakerpro Fox (JMM8)\n"
+            "OpenScan " OPENSCAN_VERSION " — tested on the 3DMakerpro Fox (JMM8). "
+            "Other 3DMakerpro scanners may work.\n"
+            "Calibration is downloaded from 3DMakerpro's servers when it is not on disk.\n"
             "\n"
             "  %s\n"
             "      Open the app. The cameras and 3D view come up idle.\n"
@@ -48,7 +50,7 @@ static void usage(const char *argv0) {
             "\n"
             "exposure is UVC absolute exposure in units of 100 microseconds.\n"
             "scan adjusts it per camera unless --no-ae is set. gain is 0..100.\n"
-            "Calibration is calib/<serial>.txt, or downloaded for the device serial.\n",
+            "Calibration is calib/<serial>.txt, or downloaded from 3DMakerpro's proprietary servers.\n",
             argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
@@ -100,27 +102,27 @@ static double hf_energy(const uint8_t *y, int w, int h) {
     return n ? s / n : 0;
 }
 
-static int open_pair(fox_cam **a, fox_cam **b, char *serial, size_t serial_n,
+static int open_pair(openscan_cam **a, openscan_cam **b, char *serial, size_t serial_n,
                      int exp_a, int gain_a, int exp_b, int gain_b) {
     char path_a[256], path_b[256];
-    if (fox_find_cameras(path_a, path_b, sizeof path_a, serial, serial_n) < 0) {
-        fprintf(stderr, "No Fox cameras found. Look for 0c45:636a and 0c45:636b in lsusb.\n");
+    if (openscan_find_cameras(path_a, path_b, sizeof path_a, serial, serial_n) < 0) {
+        fprintf(stderr, "No scanner cameras found. Look for 0c45:636a and 0c45:636b in lsusb.\n");
         return -1;
     }
     printf("serial %s\n  A %s\n  B %s\n", serial, path_a, path_b);
-    *a = fox_cam_open(path_a, 1280, 720, 10, 1);
-    *b = fox_cam_open(path_b, 1280, 720, 10, 1);
+    *a = openscan_cam_open(path_a, 1280, 720, 10, 1);
+    *b = openscan_cam_open(path_b, 1280, 720, 10, 1);
     if (!*a || !*b) {
-        fox_cam_close(*a);
-        fox_cam_close(*b);
+        openscan_cam_close(*a);
+        openscan_cam_close(*b);
         *a = *b = NULL;
         return -1;
     }
-    fox_cam_set_exposure(*a, exp_a, gain_a);
-    fox_cam_set_exposure(*b, exp_b, gain_b);
-    if (fox_cam_start(*a) < 0 || fox_cam_start(*b) < 0) {
-        fox_cam_close(*a);
-        fox_cam_close(*b);
+    openscan_cam_set_exposure(*a, exp_a, gain_a);
+    openscan_cam_set_exposure(*b, exp_b, gain_b);
+    if (openscan_cam_start(*a) < 0 || openscan_cam_start(*b) < 0) {
+        openscan_cam_close(*a);
+        openscan_cam_close(*b);
         *a = *b = NULL;
         return -1;
     }
@@ -135,15 +137,15 @@ static int jpeg_to_gray(const uint8_t *jpg, size_t n, int w, int h, std::vector<
     return 0;
 }
 
-static int grab_pair(fox_cam *a, fox_cam *b, std::vector<uint8_t> &ya, std::vector<uint8_t> &yb, int latest) {
-    int w = fox_cam_width(a), h = fox_cam_height(a);
+static int grab_pair(openscan_cam *a, openscan_cam *b, std::vector<uint8_t> &ya, std::vector<uint8_t> &yb, int latest) {
+    int w = openscan_cam_width(a), h = openscan_cam_height(a);
     std::vector<uint8_t> ja(2 * 1024 * 1024), jb(2 * 1024 * 1024);
     size_t na = 0, nb = 0;
-    int (*take)(fox_cam *, uint8_t *, size_t, size_t *, uint64_t *) =
-        latest ? fox_cam_grab_latest : fox_cam_grab;
+    int (*take)(openscan_cam *, uint8_t *, size_t, size_t *, uint64_t *) =
+        latest ? openscan_cam_grab_latest : openscan_cam_grab;
     if (take(a, ja.data(), ja.size(), &na, NULL) < 0) return -1;
     if (take(b, jb.data(), jb.size(), &nb, NULL) < 0) return -1;
-    if (!fox_cam_mjpeg(a)) {
+    if (!openscan_cam_mjpeg(a)) {
         ya.assign(ja.begin(), ja.begin() + (ptrdiff_t)na);
         yb.assign(jb.begin(), jb.begin() + (ptrdiff_t)nb);
         return 0;
@@ -157,11 +159,11 @@ static int grab_pair(fox_cam *a, fox_cam *b, std::vector<uint8_t> &ya, std::vect
 
 static int cmd_devices(void) {
     char path_a[256], path_b[256], serial[64];
-    if (fox_find_cameras(path_a, path_b, sizeof path_a, serial, sizeof serial) < 0) {
-        fprintf(stderr, "Fox not found.\n");
+    if (openscan_find_cameras(path_a, path_b, sizeof path_a, serial, sizeof serial) < 0) {
+        fprintf(stderr, "Scanner not found.\n");
         return 1;
     }
-    printf("Fox serial %s\n", serial);
+    printf("Scanner serial %s\n", serial);
     printf("  camera A %s\n", path_a);
     printf("  camera B %s\n", path_b);
     if (strncmp(serial, "JMM8", 4) != 0)
@@ -170,25 +172,25 @@ static int cmd_devices(void) {
 }
 
 static int cmd_grab(const char *dir, int exp_a, int gain_a, int exp_b, int gain_b) {
-    fox_cam *a = NULL, *b = NULL;
+    openscan_cam *a = NULL, *b = NULL;
     char serial[64];
     if (open_pair(&a, &b, serial, sizeof serial, exp_a, gain_a, exp_b, gain_b) < 0) return 1;
     std::vector<uint8_t> ya, yb;
     for (int i = 0; i < 3; i++) {
         if (grab_pair(a, b, ya, yb, 1) < 0) {
-            fox_cam_close(a);
-            fox_cam_close(b);
+            openscan_cam_close(a);
+            openscan_cam_close(b);
             return 1;
         }
     }
     char pa[512], pb[512];
     snprintf(pa, sizeof pa, "%s/camA.pgm", dir);
     snprintf(pb, sizeof pb, "%s/camB.pgm", dir);
-    int w = fox_cam_width(a), h = fox_cam_height(a);
+    int w = openscan_cam_width(a), h = openscan_cam_height(a);
     if (write_pgm(pa, ya.data(), w, h) < 0 || write_pgm(pb, yb.data(), w, h) < 0) {
         fprintf(stderr, "cannot write into %s\n", dir);
-        fox_cam_close(a);
-        fox_cam_close(b);
+        openscan_cam_close(a);
+        openscan_cam_close(b);
         return 1;
     }
     int n = w * h;
@@ -196,14 +198,14 @@ static int cmd_grab(const char *dir, int exp_a, int gain_a, int exp_b, int gain_
            pa, mean_y(ya.data(), n), hf_energy(ya.data(), w, h),
            pb, mean_y(yb.data(), n), hf_energy(yb.data(), w, h));
     printf("exposure A %d gain %d,  B %d gain %d\n", exp_a, gain_a, exp_b, gain_b);
-    fox_cam_close(a);
-    fox_cam_close(b);
+    openscan_cam_close(a);
+    openscan_cam_close(b);
     return 0;
 }
 
-static int load_calib_for(const char *serial, const char *explicit_path, fox_calib *cal) {
+static int load_calib_for(const char *serial, const char *explicit_path, openscan_calib *cal) {
     char used[512];
-    if (fox_calib_ensure(serial, explicit_path, cal, used, sizeof used) != 0) {
+    if (openscan_calib_ensure(serial, explicit_path, cal, used, sizeof used) != 0) {
         if (explicit_path)
             fprintf(stderr, "cannot read calib %s\n", explicit_path);
         else
@@ -236,21 +238,21 @@ static void nudge_exposure(int *exp, int *gain, double mean) {
 
 static int cmd_snap(const char *stl, const char *calib_path, int frames,
                     int exposure, int gain, double scale, double min_mm, double max_mm) {
-    fox_cam *a = NULL, *b = NULL;
+    openscan_cam *a = NULL, *b = NULL;
     char serial[64];
     if (open_pair(&a, &b, serial, sizeof serial, exposure, gain, exposure, gain) < 0) return 1;
-    fox_calib cal;
+    openscan_calib cal;
     if (load_calib_for(serial, calib_path, &cal) < 0) {
-        fox_cam_close(a);
-        fox_cam_close(b);
+        openscan_cam_close(a);
+        openscan_cam_close(b);
         return 1;
     }
     std::vector<uint8_t> ya, yb, best_a, best_b;
     double best_score = -1;
     for (int i = 0; i < frames + 2; i++) {
         if (grab_pair(a, b, ya, yb, 0) < 0) {
-            fox_cam_close(a);
-            fox_cam_close(b);
+            openscan_cam_close(a);
+            openscan_cam_close(b);
             return 1;
         }
         if (i < 2) continue;
@@ -266,17 +268,17 @@ static int cmd_snap(const char *stl, const char *calib_path, int frames,
             best_b = yb;
         }
     }
-    fox_cam_close(a);
-    fox_cam_close(b);
+    openscan_cam_close(a);
+    openscan_cam_close(b);
     if (best_a.empty()) return 1;
-    fox_scan_opts opt;
+    openscan_scan_opts opt;
     opt.scale = scale;
     opt.min_mm = min_mm;
     opt.max_mm = max_mm;
     opt.edge_mm = 4.0;
     opt.preview_png = NULL;
     int tris = 0;
-    if (fox_scan_to_stl(best_a.data(), best_b.data(), cal.width, cal.height, &cal, &opt, stl, &tris) < 0)
+    if (openscan_scan_to_stl(best_a.data(), best_b.data(), cal.width, cal.height, &cal, &opt, stl, &tris) < 0)
         return 1;
     printf("wrote %s  (%d triangles, millimetres)\n", stl, tris);
     return tris > 0 ? 0 : 2;
@@ -293,42 +295,42 @@ static std::string preview_path_for(const char *stl) {
 static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no_window, int no_ae,
                     int exp_a, int gain_a, int exp_b, int gain_b,
                     double scale, double min_mm, double max_mm) {
-    fox_cam *a = NULL, *b = NULL;
+    openscan_cam *a = NULL, *b = NULL;
     char serial[64];
     if (open_pair(&a, &b, serial, sizeof serial, exp_a, gain_a, exp_b, gain_b) < 0) return 1;
-    fox_calib cal;
+    openscan_calib cal;
     if (load_calib_for(serial, calib_path, &cal) < 0) {
-        fox_cam_close(a);
-        fox_cam_close(b);
+        openscan_cam_close(a);
+        openscan_cam_close(b);
         return 1;
     }
-    fox_scan_opts opt;
+    openscan_scan_opts opt;
     opt.scale = scale;
     opt.min_mm = min_mm;
     opt.max_mm = max_mm;
     opt.edge_mm = 4.0;
     opt.preview_png = NULL;
-    fox_live *live = fox_live_create(&cal, &opt);
+    openscan_live *live = openscan_live_create(&cal, &opt);
     if (!live) {
-        fox_cam_close(a);
-        fox_cam_close(b);
+        openscan_cam_close(a);
+        openscan_cam_close(b);
         return 1;
     }
 
     std::vector<uint8_t> ya, yb;
     for (int i = 0; i < 2 && !g_stop; i++) {
         if (grab_pair(a, b, ya, yb, 1) < 0) {
-            fox_live_destroy(live);
-            fox_cam_close(a);
-            fox_cam_close(b);
+            openscan_live_destroy(live);
+            openscan_cam_close(a);
+            openscan_cam_close(b);
             return 1;
         }
     }
     if (!no_ae) {
         printf("balancing exposure (target mean about 55 on each camera)\n");
         for (int step = 0; step < 8 && !g_stop; step++) {
-            fox_cam_set_exposure(a, exp_a, gain_a);
-            fox_cam_set_exposure(b, exp_b, gain_b);
+            openscan_cam_set_exposure(a, exp_a, gain_a);
+            openscan_cam_set_exposure(b, exp_b, gain_b);
             bool settled = true;
             for (int dump = 0; dump < 3; dump++) {
                 if (grab_pair(a, b, ya, yb, 1) < 0) { settled = false; break; }
@@ -342,10 +344,10 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
             nudge_exposure(&exp_a, &gain_a, ma);
             nudge_exposure(&exp_b, &gain_b, mb);
         }
-        fox_cam_set_exposure(a, exp_a, gain_a);
-        fox_cam_set_exposure(b, exp_b, gain_b);
+        openscan_cam_set_exposure(a, exp_a, gain_a);
+        openscan_cam_set_exposure(b, exp_b, gain_b);
         if (grab_pair(a, b, ya, yb, 1) == 0) {
-            int w = fox_cam_width(a), h = fox_cam_height(a);
+            int w = openscan_cam_width(a), h = openscan_cam_height(a);
             double ha = hf_energy(ya.data(), w, h);
             double hb = hf_energy(yb.data(), w, h);
             printf("row detail  A %.1f   B %.1f   (a projected pattern is usually above 8)\n", ha, hb);
@@ -366,17 +368,17 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
     if (window && !getenv("DISPLAY") && !getenv("WAYLAND_DISPLAY")) window = 0;
     if (window) {
         try {
-            cv::namedWindow("Fox scan", cv::WINDOW_NORMAL);
-            cv::resizeWindow("Fox scan", 1360, 700);
-            cv::setMouseCallback("Fox scan", [](int event, int x, int y, int flags, void *ud) {
-                fox_live_mouse(static_cast<fox_live *>(ud), event, x, y, flags);
+            cv::namedWindow("OpenScan", cv::WINDOW_NORMAL);
+            cv::resizeWindow("OpenScan", 1360, 700);
+            cv::setMouseCallback("OpenScan", [](int event, int x, int y, int flags, void *ud) {
+                openscan_live_mouse(static_cast<openscan_live *>(ud), event, x, y, flags);
             }, live);
         } catch (const cv::Exception &e) {
             fprintf(stderr, "preview window unavailable (%s). Running in the terminal.\n", e.what());
             window = 0;
         }
     }
-    if (!window || seconds > 0) fox_live_set_mode(live, FOX_MODE_SCAN);
+    if (!window || seconds > 0) openscan_live_set_mode(live, OPENSCAN_MODE_SCAN);
 
     std::string preview_path = preview_path_for(stl);
     auto t0 = std::chrono::steady_clock::now();
@@ -387,26 +389,26 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
             if (el >= seconds) break;
         }
         if (grab_pair(a, b, ya, yb, 1) < 0) break;
-        fox_live_status st;
-        if (fox_live_push(live, ya.data(), yb.data(), cal.width, cal.height, &st) < 0) break;
+        openscan_live_status st;
+        if (openscan_live_push(live, ya.data(), yb.data(), cal.width, cal.height, &st) < 0) break;
         pushed++;
-        const char *mode_name = st.mode == FOX_MODE_SCAN ? "scanning" :
-                                st.mode == FOX_MODE_PAUSE ? "paused" : "stopped";
+        const char *mode_name = st.mode == OPENSCAN_MODE_SCAN ? "scanning" :
+                                st.mode == OPENSCAN_MODE_PAUSE ? "paused" : "stopped";
         printf("\r%-8s  scanned %3d°  open %3d°  detail x%-2d  tris %6d  z %5.0f mm  %4.0f ms   ",
                mode_name, st.scanned_deg, 360 - st.scanned_deg, st.detail, st.points, st.median_mm,
                st.match_ms);
         fflush(stdout);
-        if (fox_live_take_save(live)) {
+        if (openscan_live_take_save(live)) {
             int tris = 0;
-            if (fox_live_write(live, stl, &tris) == 0)
+            if (openscan_live_write(live, stl, &tris) == 0)
                 printf("\nsaved %s  (%d triangles)\n", stl, tris);
             else
                 fprintf(stderr, "\ncould not write %s\n", stl);
         }
-        if (fox_live_quit(live)) break;
+        if (openscan_live_quit(live)) break;
 
         int pw = 0, ph = 0;
-        const uint8_t *bg = fox_live_preview_bgr(live, &pw, &ph);
+        const uint8_t *bg = openscan_live_preview_bgr(live, &pw, &ph);
         if (bg && pw > 0 && (pushed % 8 == 0 || st.points == 1)) {
             cv::Mat view(ph, pw, CV_8UC3, const_cast<uint8_t *>(bg));
             cv::imwrite(preview_path, view);
@@ -415,38 +417,38 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
         try {
             if (bg && pw > 0) {
                 cv::Mat view(ph, pw, CV_8UC3, const_cast<uint8_t *>(bg));
-                cv::imshow("Fox scan", view);
+                cv::imshow("OpenScan", view);
             }
             int key = cv::waitKey(1);
             /* Closing the title-bar button must end the process. Another
              * imshow would create the window again. */
-            double vis = cv::getWindowProperty("Fox scan", cv::WND_PROP_VISIBLE);
+            double vis = cv::getWindowProperty("OpenScan", cv::WND_PROP_VISIBLE);
             if (vis < 1) {
                 fprintf(stderr, "\nwindow closed\n");
                 break;
             }
-            if (key >= 0) fox_live_key(live, key & 0xff);
-            if (fox_live_quit(live)) break;
+            if (key >= 0) openscan_live_key(live, key & 0xff);
+            if (openscan_live_quit(live)) break;
             if (key < 0) continue;
             key &= 0xff;
             if (key == 'r' || key == 'R') {
-                fox_live_reset(live);
+                openscan_live_reset(live);
                 printf("\nscan cleared — press Start for a new one\n");
             } else if (key == '[') {
                 exp_a = std::max(1, exp_a - std::max(1, exp_a / 6));
-                fox_cam_set_exposure(a, exp_a, gain_a);
+                openscan_cam_set_exposure(a, exp_a, gain_a);
                 printf("\nexposure A %d\n", exp_a);
             } else if (key == ']') {
                 exp_a = std::min(350, exp_a + std::max(1, exp_a / 6));
-                fox_cam_set_exposure(a, exp_a, gain_a);
+                openscan_cam_set_exposure(a, exp_a, gain_a);
                 printf("\nexposure A %d\n", exp_a);
             } else if (key == '-' || key == '_') {
                 exp_b = std::max(1, exp_b - std::max(1, exp_b / 6));
-                fox_cam_set_exposure(b, exp_b, gain_b);
+                openscan_cam_set_exposure(b, exp_b, gain_b);
                 printf("\nexposure B %d\n", exp_b);
             } else if (key == '=' || key == '+') {
                 exp_b = std::min(350, exp_b + std::max(1, exp_b / 6));
-                fox_cam_set_exposure(b, exp_b, gain_b);
+                openscan_cam_set_exposure(b, exp_b, gain_b);
                 printf("\nexposure B %d\n", exp_b);
             }
         } catch (const cv::Exception &e) {
@@ -456,7 +458,7 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
     }
     printf("\n");
     int pw = 0, ph = 0;
-    const uint8_t *bg = fox_live_preview_bgr(live, &pw, &ph);
+    const uint8_t *bg = openscan_live_preview_bgr(live, &pw, &ph);
     if (bg && pw > 0) {
         cv::Mat view(ph, pw, CV_8UC3, const_cast<uint8_t *>(bg));
         if (cv::imwrite(preview_path, view))
@@ -464,9 +466,9 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
     }
     int tris = 0;
     int rc = 0;
-    int pts = fox_live_points(live);
+    int pts = openscan_live_points(live);
     if (!window || pts > 0) {
-        if (fox_live_write(live, stl, &tris) < 0) {
+        if (openscan_live_write(live, stl, &tris) < 0) {
             fprintf(stderr, "could not write %s\n", stl);
             rc = 1;
         } else {
@@ -481,44 +483,44 @@ static int cmd_scan(const char *stl, const char *calib_path, int seconds, int no
         }
     }
     if (window) cv::destroyAllWindows();
-    fox_live_destroy(live);
-    fox_cam_close(a);
-    fox_cam_close(b);
+    openscan_live_destroy(live);
+    openscan_cam_close(a);
+    openscan_cam_close(b);
     return rc;
 }
 
 static int cmd_asic(const char *hexaddr) {
     char path_a[256], path_b[256], serial[64];
-    if (fox_find_cameras(path_a, path_b, sizeof path_a, serial, sizeof serial) < 0) return 1;
+    if (openscan_find_cameras(path_a, path_b, sizeof path_a, serial, sizeof serial) < 0) return 1;
     unsigned addr = (unsigned)strtoul(hexaddr, NULL, 16);
-    fox_cam *a = fox_cam_open(path_a, 1280, 720, 10, 1);
-    fox_cam *b = fox_cam_open(path_b, 1280, 720, 10, 1);
+    openscan_cam *a = openscan_cam_open(path_a, 1280, 720, 10, 1);
+    openscan_cam *b = openscan_cam_open(path_b, 1280, 720, 10, 1);
     if (!a || !b) {
-        fox_cam_close(a);
-        fox_cam_close(b);
+        openscan_cam_close(a);
+        openscan_cam_close(b);
         return 1;
     }
     uint8_t va = 0, vb = 0;
-    int ra = fox_asic_read(a, addr, &va);
-    int rb = fox_asic_read(b, addr, &vb);
+    int ra = openscan_asic_read(a, addr, &va);
+    int rb = openscan_asic_read(b, addr, &vb);
     printf("asic 0x%04x  A=%s%02x  B=%s%02x\n", addr,
            ra ? "err " : "", va, rb ? "err " : "", vb);
-    fox_cam_close(a);
-    fox_cam_close(b);
+    openscan_cam_close(a);
+    openscan_cam_close(b);
     return (ra || rb) ? 1 : 0;
 }
 
 int main(int argc, char **argv) {
     if (argc >= 2 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "version"))) {
-        printf("fox3d %s\n", FOX3D_VERSION);
+        printf("openscan %s\n", OPENSCAN_VERSION);
         return 0;
     }
     if (argc < 2) {
         /* Negative camera values mean "use the saved Settings". */
-        return fox_app_main(argc, argv, nullptr, -1, -1, -1, -1, 0.5, 80, 550);
+        return openscan_app_main(argc, argv, nullptr, -1, -1, -1, -1, 0.5, 80, 550);
     }
     const char *cmd = argv[1];
-    if (!strcmp(cmd, "mesh-test")) return fox_mesh_self_test();
+    if (!strcmp(cmd, "mesh-test")) return openscan_mesh_self_test();
 
     const char *out = NULL;
     const char *calib = NULL;
@@ -605,7 +607,7 @@ int main(int argc, char **argv) {
             return cmd_scan(out, calib, seconds, 1, no_ae, exp_a, gain_a, exp_b, gain_b,
                             scale, min_mm, max_mm);
         }
-        return fox_app_main(argc, argv, calib, gui_ea, gui_ga, gui_eb, gui_gb, scale, min_mm, max_mm);
+        return openscan_app_main(argc, argv, calib, gui_ea, gui_ga, gui_eb, gui_gb, scale, min_mm, max_mm);
     }
     if (!strcmp(cmd, "asic-read")) return cmd_asic(asic_addr);
     usage(argv[0]);

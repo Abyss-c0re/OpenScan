@@ -1,6 +1,30 @@
 # Changelog
 
-Versions follow [semantic versioning](https://semver.org). The number in the window title, `fox3d --version`, and the git tag `vX.Y.Z` are the same version. Nothing before 0.5.0 was tagged.
+Versions follow [semantic versioning](https://semver.org). The number in the window title, `openscan --version`, and the git tag `vX.Y.Z` are the same version. Nothing before 0.5.0 was tagged.
+
+The program is OpenScan. It was previously called fox3d. A missing calibration file is downloaded from 3DMakerpro's proprietary servers. Tested on the Fox scanner. Other 3DMakerpro products may work.
+
+## 0.6.13
+
+- Measured builds a surface on the skull outline from the stripes, and a scan merges each new view into that object.
+- Mold keeps the frame when the turn is uncertain and holds the last angle, instead of dropping the solid.
+
+## 0.6.12
+
+- Settings that change the model, in the same places Kinect cuts a cloud: Near, Far, Stride, Smooth, and Solid mesh. Mold sweep sets how far the outline is wrapped. Mold relief sets how hard the shading cuts the solid. They take effect on the next frame.
+
+## 0.6.11
+
+- Mold is the solid body again, swept from the camera outline. Measured stays the projector-stripe surface of the face. They are no longer the same mesh.
+
+## 0.6.10
+
+- The 3D view is the skull measured on the pattern camera. Stripes are joined into one sheet, and that sheet is what both Mold and Measured show. Mold adds the 8 mm back on the side view. Measured is the surface itself.
+
+## 0.6.9
+
+- Each bright projector stripe is matched to the calibrated plane at that spacing. The distance slider chooses which band of planes, and the ray-plane intersection is the surface.
+- A new view is aligned to the part of the model still in frame. The side that has just come into view is added. A frame is dropped only when that overlap does not fit, and the model already built stays.
 
 ## 0.6.8
 

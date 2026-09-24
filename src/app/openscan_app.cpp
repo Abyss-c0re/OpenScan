@@ -1,7 +1,7 @@
-#include "fox/fox_app.h"
-#include "fox/fox_calib.h"
-#include "fox/fox_live.h"
-#include "fox/fox_v4l2.h"
+#include "openscan/openscan_app.h"
+#include "openscan/openscan_calib.h"
+#include "openscan/openscan_live.h"
+#include "openscan/openscan_v4l2.h"
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -9,6 +9,7 @@
 #include <cstdio>
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QFileDialog>
 #include <QGridLayout>
@@ -41,19 +42,19 @@ static int jpeg_gray(const uint8_t *jpg, size_t n, int w, int h, std::vector<uin
     return 0;
 }
 
-static int grab_pair(fox_cam *a, fox_cam *b, std::vector<uint8_t> &ya, std::vector<uint8_t> &yb) {
-    int w = fox_cam_width(a), h = fox_cam_height(a);
+static int grab_pair(openscan_cam *a, openscan_cam *b, std::vector<uint8_t> &ya, std::vector<uint8_t> &yb) {
+    int w = openscan_cam_width(a), h = openscan_cam_height(a);
     std::vector<uint8_t> ja(2 * 1024 * 1024), jb(2 * 1024 * 1024);
     size_t na = 0, nb = 0;
-    if (fox_cam_grab_latest(a, ja.data(), ja.size(), &na, NULL) < 0) return -1;
-    if (fox_cam_grab_latest(b, jb.data(), jb.size(), &nb, NULL) < 0) return -1;
+    if (openscan_cam_grab_latest(a, ja.data(), ja.size(), &na, NULL) < 0) return -1;
+    if (openscan_cam_grab_latest(b, jb.data(), jb.size(), &nb, NULL) < 0) return -1;
     if (jpeg_gray(ja.data(), na, w, h, ya) < 0 || jpeg_gray(jb.data(), nb, w, h, yb) < 0) return -1;
     return 0;
 }
 
-static int load_calib(const char *serial, const char *explicit_path, fox_calib *cal) {
+static int load_calib(const char *serial, const char *explicit_path, openscan_calib *cal) {
     char used[512];
-    if (fox_calib_ensure(serial, explicit_path, cal, used, sizeof used) != 0) return -1;
+    if (openscan_calib_ensure(serial, explicit_path, cal, used, sizeof used) != 0) return -1;
     return 0;
 }
 
@@ -61,7 +62,7 @@ static int load_calib(const char *serial, const char *explicit_path, fox_calib *
  * picture are forwarded in image pixels so dragging orbits the model. */
 class Stage : public QLabel {
 public:
-    fox_live *live = nullptr;
+    openscan_live *live = nullptr;
     int img_w = 0;
     int img_h = 0;
     QSize drawn;
@@ -81,33 +82,33 @@ protected:
     void mousePressEvent(QMouseEvent *e) override {
         int ix, iy;
         if (e->button() == Qt::LeftButton && to_image(e->position().toPoint(), ix, iy))
-            fox_live_mouse(live, cv::EVENT_LBUTTONDOWN, ix, iy, 0);
+            openscan_live_mouse(live, cv::EVENT_LBUTTONDOWN, ix, iy, 0);
     }
     void mouseMoveEvent(QMouseEvent *e) override {
         int ix, iy;
         if (to_image(e->position().toPoint(), ix, iy))
-            fox_live_mouse(live, cv::EVENT_MOUSEMOVE, ix, iy, 0);
+            openscan_live_mouse(live, cv::EVENT_MOUSEMOVE, ix, iy, 0);
     }
     void mouseReleaseEvent(QMouseEvent *e) override {
         int ix, iy;
         if (to_image(e->position().toPoint(), ix, iy))
-            fox_live_mouse(live, cv::EVENT_LBUTTONUP, ix, iy, 0);
+            openscan_live_mouse(live, cv::EVENT_LBUTTONUP, ix, iy, 0);
     }
     void wheelEvent(QWheelEvent *e) override {
         int ix, iy;
         if (!to_image(e->position().toPoint(), ix, iy)) return;
         int flags = e->angleDelta().y() > 0 ? 120 << 16 : -(120 << 16);
-        fox_live_mouse(live, cv::EVENT_MOUSEWHEEL, ix, iy, flags);
+        openscan_live_mouse(live, cv::EVENT_MOUSEWHEEL, ix, iy, flags);
     }
 };
 
-class FoxWindow : public QMainWindow {
+class OpenScanWindow : public QMainWindow {
 public:
-    FoxWindow(fox_cam *cam_a, fox_cam *cam_b, fox_live *model, QString serial_text,
+    OpenScanWindow(openscan_cam *cam_a, openscan_cam *cam_b, openscan_live *model, QString serial_text,
               int exposure_a, int gain_a_init, int exposure_b, int gain_b_init)
         : a(cam_a), b(cam_b), live(model), serial(std::move(serial_text)),
           exp_a(exposure_a), gain_a(gain_a_init), exp_b(exposure_b), gain_b(gain_b_init) {
-        setWindowTitle(QString("Fox 3D " FOX3D_VERSION));
+        setWindowTitle(QString("OpenScan " OPENSCAN_VERSION));
         resize(1280, 860);
 
         start = new QPushButton("Start scan");
@@ -127,11 +128,11 @@ public:
         mold_btn->setCheckable(true);
         measured_btn->setCheckable(true);
         exp->setObjectName("export");
-        int saved_shape = QSettings("fox3d", "fox3d").value("shape", FOX_SHAPE_MOLD).toInt();
-        if (saved_shape != FOX_SHAPE_MEASURED) saved_shape = FOX_SHAPE_MOLD;
-        fox_live_set_shape(live, saved_shape);
-        mold_btn->setChecked(saved_shape == FOX_SHAPE_MOLD);
-        measured_btn->setChecked(saved_shape == FOX_SHAPE_MEASURED);
+        int saved_shape = QSettings("openscan", "openscan").value("shape", OPENSCAN_SHAPE_MOLD).toInt();
+        if (saved_shape != OPENSCAN_SHAPE_MEASURED) saved_shape = OPENSCAN_SHAPE_MOLD;
+        openscan_live_set_shape(live, saved_shape);
+        mold_btn->setChecked(saved_shape == OPENSCAN_SHAPE_MOLD);
+        measured_btn->setChecked(saved_shape == OPENSCAN_SHAPE_MEASURED);
         mold_btn->setToolTip("The scanned shape, made 8 mm thick. It is a solid of the measurement, not a round outline.");
         measured_btn->setToolTip("The surface the projector stripes measured. Each new view is aligned and added.");
 
@@ -170,20 +171,20 @@ public:
         statusBar()->showMessage(serial + "   ready");
 
         connect(start, &QPushButton::clicked, this, [this] {
-            fox_live_set_mode(live, FOX_MODE_SCAN);
+            openscan_live_set_mode(live, OPENSCAN_MODE_SCAN);
             refresh_buttons();
         });
         connect(pause, &QPushButton::clicked, this, [this] {
-            fox_live_set_mode(live, FOX_MODE_PAUSE);
+            openscan_live_set_mode(live, OPENSCAN_MODE_PAUSE);
             refresh_buttons();
         });
         connect(stop, &QPushButton::clicked, this, [this] {
-            fox_live_set_mode(live, FOX_MODE_STOP);
+            openscan_live_set_mode(live, OPENSCAN_MODE_STOP);
             refresh_buttons();
         });
         connect(reset, &QPushButton::clicked, this, [this] {
-            fox_live_reset(live);
-            fox_live_set_mode(live, FOX_MODE_STOP);
+            openscan_live_reset(live);
+            openscan_live_set_mode(live, OPENSCAN_MODE_STOP);
             statusBar()->showMessage(serial + "   ready   scan cleared");
             refresh_buttons();
         });
@@ -192,17 +193,17 @@ public:
         connect(mold_btn, &QPushButton::clicked, this, [this] {
             mold_btn->setChecked(true);
             measured_btn->setChecked(false);
-            if (fox_live_shape(live) == FOX_SHAPE_MOLD) return;
-            fox_live_set_shape(live, FOX_SHAPE_MOLD);
-            QSettings("fox3d", "fox3d").setValue("shape", FOX_SHAPE_MOLD);
+            if (openscan_live_shape(live) == OPENSCAN_SHAPE_MOLD) return;
+            openscan_live_set_shape(live, OPENSCAN_SHAPE_MOLD);
+            QSettings("openscan", "openscan").setValue("shape", OPENSCAN_SHAPE_MOLD);
             statusBar()->showMessage(serial + "   mold   model cleared");
         });
         connect(measured_btn, &QPushButton::clicked, this, [this] {
             measured_btn->setChecked(true);
             mold_btn->setChecked(false);
-            if (fox_live_shape(live) == FOX_SHAPE_MEASURED) return;
-            fox_live_set_shape(live, FOX_SHAPE_MEASURED);
-            QSettings("fox3d", "fox3d").setValue("shape", FOX_SHAPE_MEASURED);
+            if (openscan_live_shape(live) == OPENSCAN_SHAPE_MEASURED) return;
+            openscan_live_set_shape(live, OPENSCAN_SHAPE_MEASURED);
+            QSettings("openscan", "openscan").setValue("shape", OPENSCAN_SHAPE_MEASURED);
             statusBar()->showMessage(serial + "   measured   model cleared");
         });
 
@@ -212,11 +213,11 @@ public:
         timer->start(15);
     }
 
-    ~FoxWindow() override {
+    ~OpenScanWindow() override {
         if (timer) timer->stop();
-        fox_cam_close(a);
-        fox_cam_close(b);
-        fox_live_destroy(live);
+        openscan_cam_close(a);
+        openscan_cam_close(b);
+        openscan_live_destroy(live);
         a = b = nullptr;
         live = nullptr;
     }
@@ -229,11 +230,11 @@ protected:
 
 private:
     void refresh_buttons() {
-        int mode = fox_live_mode(live);
-        start->setEnabled(mode != FOX_MODE_SCAN);
-        pause->setEnabled(mode == FOX_MODE_SCAN);
-        stop->setEnabled(mode != FOX_MODE_STOP);
-        reset->setEnabled(mode != FOX_MODE_STOP || fox_live_points(live) > 0);
+        int mode = openscan_live_mode(live);
+        start->setEnabled(mode != OPENSCAN_MODE_SCAN);
+        pause->setEnabled(mode == OPENSCAN_MODE_SCAN);
+        stop->setEnabled(mode != OPENSCAN_MODE_STOP);
+        reset->setEnabled(mode != OPENSCAN_MODE_STOP || openscan_live_points(live) > 0);
     }
 
     QSlider *slider(int min, int max, int value) {
@@ -257,9 +258,20 @@ private:
     }
 
     QWidget *build_settings() {
-        QSettings saved("fox3d", "fox3d");
-        int distance = clamp_int(saved.value("distance-mm", (int)fox_live_distance_mm(live)).toInt(), 100, 500);
-        fox_live_set_distance_mm(live, (float)distance);
+        QSettings saved("openscan", "openscan");
+        int distance = clamp_int(saved.value("distance-mm", (int)openscan_live_distance_mm(live)).toInt(), 100, 500);
+        openscan_live_set_distance_mm(live, (float)distance);
+        openscan_build build{};
+        openscan_live_get_build(live, &build);
+        build.near_mm = (float)clamp_int(saved.value("near-mm", (int)build.near_mm).toInt(), 60, 450);
+        build.far_mm = (float)clamp_int(saved.value("far-mm", (int)build.far_mm).toInt(), 100, 800);
+        build.stride = clamp_int(saved.value("stride", build.stride).toInt(), 1, 6);
+        build.smooth = clamp_int(saved.value("smooth", build.smooth).toInt(), 0, 8);
+        build.sweep_deg = clamp_int(saved.value("sweep-deg", build.sweep_deg).toInt(), 20, 140);
+        build.relief = clamp_int(saved.value("relief", build.relief).toInt(), 0, 100);
+        build.solid = saved.value("solid", build.solid).toInt() ? 1 : 0;
+        build.flip = saved.value("flip", 1).toInt() ? 1 : 0;
+        openscan_live_set_build(live, &build);
 
         auto *panel = new QWidget;
         auto *grid = new QGridLayout(panel);
@@ -284,11 +296,27 @@ private:
         auto *eb = slider(1, 200, exp_b);
         auto *gb = slider(0, 100, gain_b);
         auto *dist = slider(100, 500, distance);
+        auto *near_s = slider(60, 450, (int)build.near_mm);
+        auto *far_s = slider(100, 800, (int)build.far_mm);
+        auto *stride_s = slider(1, 6, build.stride);
+        auto *smooth_s = slider(0, 8, build.smooth);
+        auto *sweep_s = slider(20, 140, build.sweep_deg);
+        auto *relief_s = slider(0, 100, build.relief);
+        auto *solid_c = new QCheckBox("Solid mesh");
+        solid_c->setChecked(build.solid);
+        auto *flip_c = new QCheckBox("Flip scanner");
+        flip_c->setChecked(build.flip);
         auto *ea_n = new QLabel;
         auto *ga_n = new QLabel;
         auto *eb_n = new QLabel;
         auto *gb_n = new QLabel;
         auto *dist_n = new QLabel;
+        auto *near_n = new QLabel;
+        auto *far_n = new QLabel;
+        auto *stride_n = new QLabel;
+        auto *smooth_n = new QLabel;
+        auto *sweep_n = new QLabel;
+        auto *relief_n = new QLabel;
         add_row(0, "Camera A exposure", ea, ea_n,
                 "How long camera A collects light. 1 is 0.1 ms, 200 is 20 ms. Raise it if A is too dark.");
         add_row(1, "Camera A gain", ga, ga_n,
@@ -297,22 +325,57 @@ private:
                 "Camera B is the clean view. Lower this if the object is blown out white.");
         add_row(3, "Camera B gain", gb, gb_n, "Amplifies camera B. Usually lower than camera A.");
         add_row(4, "Distance (mm)", dist, dist_n,
-                "How far the scanner is from the object. Both modes use this to tell the stripes apart. "
-                "Reset and scan again after changing it.");
+                "Working distance. Mold uses it as the size of the solid. Measured uses it to pick the stripe band.");
+        add_row(5, "Near (mm)", near_s, near_n,
+                "Drops any 3D point closer than this. Same job as Kinect Near.");
+        add_row(6, "Far (mm)", far_s, far_n,
+                "Drops any 3D point farther than this. Same job as Kinect Far.");
+        add_row(7, "Stride", stride_s, stride_n,
+                "Sample step of the mesh. 1 is the full grid. 6 keeps every sixth row, so the model is coarser.");
+        add_row(8, "Smooth", smooth_s, smooth_n,
+                "How much depth is blurred before the triangles are built. 0 keeps every stripe. 8 clays the surface.");
+        add_row(9, "Mold sweep (°)", sweep_s, sweep_n,
+                "How far Mold wraps the camera outline into a solid. 20 is almost flat. 140 is a round body.");
+        add_row(10, "Mold relief", relief_s, relief_n,
+                "How strongly the camera shading pushes the Mold surface. 0 is a smooth solid. 100 cuts in eyes and nose.");
         ea_n->setText(exposure_text(ea->value()));
         eb_n->setText(exposure_text(eb->value()));
 
         auto remember = [this] {
-            QSettings s("fox3d", "fox3d");
+            QSettings s("openscan", "openscan");
             s.setValue("exposure-a", exp_a);
             s.setValue("gain-a", gain_a);
             s.setValue("exposure-b", exp_b);
             s.setValue("gain-b", gain_b);
-            s.setValue("distance-mm", (int)std::lround(fox_live_distance_mm(live)));
+            s.setValue("distance-mm", (int)std::lround(openscan_live_distance_mm(live)));
+            openscan_build b{};
+            openscan_live_get_build(live, &b);
+            s.setValue("near-mm", (int)std::lround(b.near_mm));
+            s.setValue("far-mm", (int)std::lround(b.far_mm));
+            s.setValue("stride", b.stride);
+            s.setValue("smooth", b.smooth);
+            s.setValue("sweep-deg", b.sweep_deg);
+            s.setValue("relief", b.relief);
+            s.setValue("solid", b.solid);
+            s.setValue("flip", b.flip);
+        };
+        auto apply_build = [this, near_s, far_s, stride_s, smooth_s, sweep_s, relief_s, solid_c, flip_c, remember] {
+            openscan_build b{};
+            openscan_live_get_build(live, &b);
+            b.near_mm = (float)near_s->value();
+            b.far_mm = (float)far_s->value();
+            b.stride = stride_s->value();
+            b.smooth = smooth_s->value();
+            b.sweep_deg = sweep_s->value();
+            b.relief = relief_s->value();
+            b.solid = solid_c->isChecked() ? 1 : 0;
+            b.flip = flip_c->isChecked() ? 1 : 0;
+            openscan_live_set_build(live, &b);
+            remember();
         };
         auto apply_cam = [this, remember] {
-            fox_cam_set_exposure(a, exp_a, gain_a);
-            fox_cam_set_exposure(b, exp_b, gain_b);
+            openscan_cam_set_exposure(a, exp_a, gain_a);
+            openscan_cam_set_exposure(b, exp_b, gain_b);
             remember();
         };
         connect(ea, &QSlider::valueChanged, this, [this, ea_n, apply_cam](int v) {
@@ -336,34 +399,65 @@ private:
             apply_cam();
         });
         connect(dist, &QSlider::valueChanged, this, [this, dist_n, remember](int v) {
-            fox_live_set_distance_mm(live, (float)v);
+            openscan_live_set_distance_mm(live, (float)v);
             dist_n->setText(QString("%1 mm").arg(v));
             remember();
         });
         dist_n->setText(QString("%1 mm").arg(dist->value()));
+        auto wire = [&](QSlider *s, QLabel *n, const char *suffix) {
+            n->setText(QString("%1%2").arg(s->value()).arg(suffix));
+            connect(s, &QSlider::valueChanged, this, [n, suffix, apply_build](int v) {
+                n->setText(QString("%1%2").arg(v).arg(suffix));
+                apply_build();
+            });
+        };
+        wire(near_s, near_n, " mm");
+        wire(far_s, far_n, " mm");
+        wire(stride_s, stride_n, "");
+        wire(smooth_s, smooth_n, "");
+        wire(sweep_s, sweep_n, "°");
+        wire(relief_s, relief_n, "");
+        solid_c->setToolTip("On builds triangles. Off keeps the point cloud, the way Kinect can show points instead of a solid map.");
+        grid->addWidget(solid_c, 11, 1);
+        connect(solid_c, &QCheckBox::toggled, this, [apply_build](bool) { apply_build(); });
+        flip_c->setToolTip("Turns both cameras upside down. The Fox sensors are mounted that way, so leave this on unless the picture is upside down.");
+        grid->addWidget(flip_c, 12, 1);
+        connect(flip_c, &QCheckBox::toggled, this, [apply_build](bool) { apply_build(); });
 
         auto *hint = new QLabel(
-            "Mold is the solid you can turn. Measured builds a model from the stripes: "
-            "each new view is aligned and added. Switching clears the model.");
+            "Near, Far, Stride, Smooth and Solid change the points and the triangles on the next frame. "
+            "Sweep and Relief change the Mold solid only. Measured stays the stripe surface. "
+            "Flip scanner turns the picture and the model together. "
+            "A missing calibration file is downloaded from 3DMakerpro's servers. "
+            "Tested on the Fox. Other 3DMakerpro scanners may work.");
         hint->setWordWrap(true);
-        grid->addWidget(hint, 5, 0, 1, 2);
+        grid->addWidget(hint, 13, 0, 1, 2);
         auto *defaults = new QPushButton("Defaults");
         defaults->setObjectName("quiet");
-        defaults->setToolTip("Camera A 22 / 6, camera B 16 / 4, distance 220 mm");
-        grid->addWidget(defaults, 5, 2, Qt::AlignRight);
-        connect(defaults, &QPushButton::clicked, this, [ea, ga, eb, gb, dist] {
+        defaults->setToolTip("Cameras 22/6 and 16/4, distance 220, near 80, far 550, stride 1, smooth 5, sweep 80, relief 40, solid on, flip on");
+        grid->addWidget(defaults, 13, 2, Qt::AlignRight);
+        connect(defaults, &QPushButton::clicked, this,
+                [ea, ga, eb, gb, dist, near_s, far_s, stride_s, smooth_s, sweep_s, relief_s, solid_c, flip_c] {
             ea->setValue(22);
             ga->setValue(6);
             eb->setValue(16);
             gb->setValue(4);
             dist->setValue(220);
+            near_s->setValue(80);
+            far_s->setValue(550);
+            stride_s->setValue(1);
+            smooth_s->setValue(5);
+            sweep_s->setValue(80);
+            relief_s->setValue(40);
+            solid_c->setChecked(true);
+            flip_c->setChecked(true);
         });
         remember();
         return panel;
     }
 
     void export_mesh() {
-        if (fox_live_points(live) < 80) {
+        if (openscan_live_points(live) < 80) {
             QMessageBox::information(this, "Export mesh",
                                      "There is nothing to export yet.\n\n"
                                      "Start a scan, rotate the object until the 3D view fills in, "
@@ -381,7 +475,7 @@ private:
             else path += ".stl";
         }
         int tris = 0;
-        if (fox_live_write(live, path.toUtf8().constData(), &tris) != 0) {
+        if (openscan_live_write(live, path.toUtf8().constData(), &tris) != 0) {
             QMessageBox::warning(this, "Export mesh", "Could not write " + path);
             return;
         }
@@ -393,10 +487,10 @@ private:
         if (busy || !live || !a || !b) return;
         busy = true;
         if (grab_pair(a, b, ya, yb) == 0) {
-            fox_live_status st{};
-            if (fox_live_push(live, ya.data(), yb.data(), fox_cam_width(a), fox_cam_height(a), &st) == 0) {
+            openscan_live_status st{};
+            if (openscan_live_push(live, ya.data(), yb.data(), openscan_cam_width(a), openscan_cam_height(a), &st) == 0) {
                 int w = 0, h = 0;
-                const uint8_t *bg = fox_live_preview_bgr(live, &w, &h);
+                const uint8_t *bg = openscan_live_preview_bgr(live, &w, &h);
                 if (bg && w > 0 && h > 0) {
                     QImage img(bg, w, h, w * 3, QImage::Format_BGR888);
                     QPixmap pm = QPixmap::fromImage(img.copy());
@@ -408,8 +502,8 @@ private:
                                            (stage->height() - scaled.height()) / 2);
                     stage->setPixmap(scaled);
                 }
-                const char *mode = st.mode == FOX_MODE_SCAN ? "scanning" :
-                                   st.mode == FOX_MODE_PAUSE ? "paused" : "ready";
+                const char *mode = st.mode == OPENSCAN_MODE_SCAN ? "scanning" :
+                                   st.mode == OPENSCAN_MODE_PAUSE ? "paused" : "ready";
                 statusBar()->showMessage(
                     QString("%1   %2   scanned %3°   not scanned %4°   detail x%5   %6 tris")
                         .arg(serial, mode)
@@ -423,9 +517,9 @@ private:
         busy = false;
     }
 
-    fox_cam *a = nullptr;
-    fox_cam *b = nullptr;
-    fox_live *live = nullptr;
+    openscan_cam *a = nullptr;
+    openscan_cam *b = nullptr;
+    openscan_live *live = nullptr;
     QString serial;
     Stage *stage = nullptr;
     QPushButton *start = nullptr;
@@ -467,14 +561,14 @@ static void style_app(QApplication &app) {
         " background: #e6e6e6; border-radius: 7px; }");
 }
 
-int fox_app_main(int argc, char **argv, const char *calib_path,
+int openscan_app_main(int argc, char **argv, const char *calib_path,
                  int exp_a, int gain_a, int exp_b, int gain_b,
                  double scale, double min_mm, double max_mm) {
     QApplication app(argc, argv);
-    app.setOrganizationName("fox3d");
-    app.setApplicationName("fox3d");
+    app.setOrganizationName("openscan");
+    app.setApplicationName("openscan");
     style_app(app);
-    QSettings saved("fox3d", "fox3d");
+    QSettings saved("openscan", "openscan");
     auto pick = [&](int given, const char *key, int fallback, int lo, int hi) {
         int v = given >= 0 ? given : saved.value(key, fallback).toInt();
         if (v < lo) return lo;
@@ -487,15 +581,15 @@ int fox_app_main(int argc, char **argv, const char *calib_path,
     gain_b = pick(gain_b, "gain-b", 4, 0, 100);
 
     char path_a[256], path_b[256], serial[64];
-    if (fox_find_cameras(path_a, path_b, sizeof path_a, serial, sizeof serial) < 0) {
-        QMessageBox::critical(nullptr, "Fox 3D",
-                              "No Fox scanner was found.\n\n"
+    if (openscan_find_cameras(path_a, path_b, sizeof path_a, serial, sizeof serial) < 0) {
+        QMessageBox::critical(nullptr, "OpenScan",
+                              "No scanner was found.\n\n"
                               "Plug in the scanner and open the app again.");
         return 1;
     }
-    fox_calib cal;
+    openscan_calib cal;
     if (load_calib(serial, calib_path, &cal) != 0) {
-        QMessageBox::critical(nullptr, "Fox 3D",
+        QMessageBox::critical(nullptr, "OpenScan",
                               QString("No calibration for %1.\n\n"
                                       "The scanner serial is read from the device and the "
                                       "factory file is downloaded when it is not already on disk. "
@@ -503,31 +597,31 @@ int fox_app_main(int argc, char **argv, const char *calib_path,
                                   .arg(serial));
         return 1;
     }
-    fox_cam *a = fox_cam_open(path_a, 1280, 720, 10, 1);
-    fox_cam *b = fox_cam_open(path_b, 1280, 720, 10, 1);
-    if (!a || !b || fox_cam_set_exposure(a, exp_a, gain_a) < 0 ||
-        fox_cam_set_exposure(b, exp_b, gain_b) < 0 ||
-        fox_cam_start(a) < 0 || fox_cam_start(b) < 0) {
-        fox_cam_close(a);
-        fox_cam_close(b);
-        QMessageBox::critical(nullptr, "Fox 3D", "The cameras did not start streaming.");
+    openscan_cam *a = openscan_cam_open(path_a, 1280, 720, 10, 1);
+    openscan_cam *b = openscan_cam_open(path_b, 1280, 720, 10, 1);
+    if (!a || !b || openscan_cam_set_exposure(a, exp_a, gain_a) < 0 ||
+        openscan_cam_set_exposure(b, exp_b, gain_b) < 0 ||
+        openscan_cam_start(a) < 0 || openscan_cam_start(b) < 0) {
+        openscan_cam_close(a);
+        openscan_cam_close(b);
+        QMessageBox::critical(nullptr, "OpenScan", "The cameras did not start streaming.");
         return 1;
     }
-    fox_scan_opts opt;
+    openscan_scan_opts opt;
     opt.scale = scale;
     opt.min_mm = min_mm;
     opt.max_mm = max_mm;
     opt.edge_mm = 4.0;
     opt.preview_png = nullptr;
-    fox_live *live = fox_live_create(&cal, &opt);
+    openscan_live *live = openscan_live_create(&cal, &opt);
     if (!live) {
-        fox_cam_close(a);
-        fox_cam_close(b);
+        openscan_cam_close(a);
+        openscan_cam_close(b);
         return 1;
     }
-    fox_live_set_mode(live, FOX_MODE_STOP);
+    openscan_live_set_mode(live, OPENSCAN_MODE_STOP);
 
-    FoxWindow window(a, b, live, QString::fromUtf8(serial), exp_a, gain_a, exp_b, gain_b);
+    OpenScanWindow window(a, b, live, QString::fromUtf8(serial), exp_a, gain_a, exp_b, gain_b);
     window.show();
     return app.exec();
 }
