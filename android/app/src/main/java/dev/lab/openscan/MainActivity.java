@@ -2,7 +2,6 @@ package dev.lab.openscan;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -10,6 +9,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
@@ -31,6 +31,7 @@ import android.media.ImageReader;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
@@ -106,7 +107,6 @@ public class MainActivity extends Activity {
     private volatile boolean calibrating;
     /** True only after a connected scanner's serial is the open calibration. */
     private volatile boolean calibFromScanner;
-    private String exportExt = "stl";
     private volatile String cameraNote = "";
     private volatile boolean alive = true;
     private boolean pushed;
@@ -190,10 +190,7 @@ public class MainActivity extends Activity {
         swapCameras = OpenScanPrefs.store(this).getBoolean("camera-swap", false);
         showSwap();
         engine = Engine.open(this);
-        if (engine == null) {
-            trackChip.setText("No calibration");
-            return;
-        }
+        if (engine == null) trackChip.setText("No calibration");
         scanThread = new HandlerThread("openscan-engine");
         scanThread.start();
         scanHandler = new Handler(scanThread.getLooper());
@@ -223,8 +220,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         resumed = true;
-        if (engine == null) return;
-        applyPrefs();
+        if (engine != null) applyPrefs();
         startCameras();
     }
 
@@ -546,19 +542,13 @@ public class MainActivity extends Activity {
                     Toast.makeText(this, "Nothing to export yet. Start a scan first.", Toast.LENGTH_LONG).show();
                     return;
                 }
-                new AlertDialog.Builder(this)
-                        .setTitle("Export")
-                        .setItems(new String[]{"STL", "OBJ", "PLY"}, (d, which) -> {
-                            exportExt = which == 1 ? "obj" : which == 2 ? "ply" : "stl";
-                            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                            intent.addCategory(Intent.CATEGORY_OPENABLE);
-                            intent.setType("application/octet-stream");
-                            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                            String modeName = shape == Engine.SHAPE_MEASURED ? "measured" : "mold";
-                            intent.putExtra(Intent.EXTRA_TITLE, "openscan-" + modeName + "." + exportExt);
-                            startActivityForResult(intent, REQ_EXPORT);
-                        })
-                        .show();
+                String modeName = shape == Engine.SHAPE_MEASURED ? "measured" : "mold";
+                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("application/octet-stream");
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                intent.putExtra(Intent.EXTRA_TITLE, "openscan-" + modeName + ".stl");
+                startActivityForResult(intent, REQ_EXPORT);
             });
         });
     }
@@ -649,10 +639,27 @@ public class MainActivity extends Activity {
         });
     }
 
+    private static String exportTempName(String display) {
+        if (display == null) return "export.stl";
+        String lower = display.toLowerCase(java.util.Locale.US);
+        if (lower.endsWith(".obj")) return "export.obj";
+        if (lower.endsWith(".ply")) return "export.ply";
+        return "export.stl";
+    }
+
+    private String exportDisplayName(Uri uri) {
+        try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst() && !c.isNull(0)) return c.getString(0);
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
     private void copyExport(Uri uri) {
         Toast.makeText(this, "Exporting…", Toast.LENGTH_SHORT).show();
+        String tmpName = exportTempName(exportDisplayName(uri));
         postCommand(() -> {
-            File tmp = new File(getCacheDir(), "export." + exportExt);
+            File tmp = new File(getCacheDir(), tmpName);
             int tris;
             synchronized (engineLock) {
                 tris = engine == null ? -1 : engine.write(tmp);
@@ -727,7 +734,10 @@ public class MainActivity extends Activity {
         distanceChip.setText(CameraRoute.distanceLabel(distanceMm));
         if (cameraNote != null && !cameraNote.isEmpty()) trackChip.setText(cameraNote);
         else if (scanMode == Engine.MODE_SCAN && tracking == 0)
-            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto, "Tracking lost"));
+            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto,
+                    shape == Engine.SHAPE_MOLD ? "Molding  ·  tracking lost" : "Tracking lost"));
+        else if (scanMode == Engine.MODE_SCAN && shape == Engine.SHAPE_MOLD)
+            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto, "Molding  ·  " + deg + "°  ·  " + pts + " tris"));
         else if (scanMode == Engine.MODE_SCAN)
             trackChip.setText(CameraRoute.trackLine(exposureHeldAuto, deg + "°  ·  " + pts + " tris"));
         else if (scanMode == Engine.MODE_PAUSE)
@@ -1068,7 +1078,7 @@ public class MainActivity extends Activity {
     }
 
     private void startCameras() {
-        if (engine == null || !alive || !resumed) return;
+        if (!alive || !resumed) return;
         String[] nodes = findScannerNodes();
         if (nodes != null) {
             String serial = nodes[2];

@@ -2,6 +2,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <commdlg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,13 +35,12 @@ static LRESULT CALLBACK os_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_LBUTTONUP) ReleaseCapture();
         return 0;
     }
-    if (msg == WM_KEYDOWN) {
-        int ch = 0;
-        if (wp == VK_ESCAPE) ch = 27;
-        else if (wp == 'Q') ch = 'q';
-        else if (wp == 'S') ch = 's';
-        else if (wp == VK_SPACE) ch = ' ';
-        if (ch) s->key = ch;
+    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
+        s->key = 27;
+        return 0;
+    }
+    if (msg == WM_CHAR) {
+        if (wp == 8 || wp == 13 || (wp >= 32 && wp < 127)) s->key = (int)wp;
         return 0;
     }
     if (msg == WM_ERASEBKGND) return 1;
@@ -151,4 +151,48 @@ void os_surf_text(os_surf *s, int x, int y, const char *text, unsigned rgb) {
 
 void os_surf_flush(os_surf *s) {
     if (s && s->hwnd) GdiFlush();
+}
+
+static int ends_iext(const wchar_t *s, const wchar_t *suf) {
+    size_t n = wcslen(s), m = wcslen(suf);
+    size_t i;
+    if (n < m) return 0;
+    for (i = 0; i < m; i++) {
+        wchar_t a = s[n - m + i], b = suf[i];
+        if (a >= L'A' && a <= L'Z') a = (wchar_t)(a + 32);
+        if (b >= L'A' && b <= L'Z') b = (wchar_t)(b + 32);
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+int os_surf_save_dialog(os_surf *s, const char *suggested, char *out, size_t n) {
+    wchar_t file[MAX_PATH];
+    const wchar_t *want;
+    OPENFILENAMEW ofn;
+    if (!out || n < 2) return -1;
+    out[0] = 0;
+    if (!suggested || !suggested[0]) suggested = "openscan-last.stl";
+    file[0] = 0;
+    MultiByteToWideChar(CP_ACP, 0, suggested, -1, file, MAX_PATH);
+    memset(&ofn, 0, sizeof ofn);
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner = s ? s->hwnd : NULL;
+    ofn.lpstrFilter = L"STL (*.stl)\0*.stl\0OBJ (*.obj)\0*.obj\0PLY (*.ply)\0*.ply\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"Export";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.nFilterIndex = 1;
+    if (!GetSaveFileNameW(&ofn)) return -1;
+    want = L".stl";
+    if (ofn.nFilterIndex == 2) want = L".obj";
+    else if (ofn.nFilterIndex == 3) want = L".ply";
+    if (!ends_iext(file, want)) {
+        if (ends_iext(file, L".stl") || ends_iext(file, L".obj") || ends_iext(file, L".ply"))
+            file[wcslen(file) - 4] = 0;
+        if (wcslen(file) + wcslen(want) < MAX_PATH) wcscat(file, want);
+    }
+    if (WideCharToMultiByte(CP_ACP, 0, file, -1, out, (int)n, NULL, NULL) <= 0) return -1;
+    return out[0] ? 0 : -1;
 }

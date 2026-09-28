@@ -1,5 +1,6 @@
 # Generated builds. The source tree stays free of these.
 build/
+build-win/
 dist/
 android/.gradle/
 android/local.properties

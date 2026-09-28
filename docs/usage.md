@@ -10,7 +10,7 @@ Personal tool, not a maintained product. Tested on one handheld scanner. Bring y
 2. Start `./build/openscan`. The window has the settings row, the camera on the left, the 3D view in the middle, and stereo A, stereo B, and the side view on the right.
 3. Drag a slider to set exposure, gain, distance, near, far, stride, smooth, mold sweep, or mold relief. **Mold** and **Measured** switch the solid. **Auto calibrate** picks an exposure. Drag the 3D view to turn it.
 4. Press **Start**. Turn the object. The status line shows triangle count and degrees.
-5. Press **Stop** to hold the model. **Pause** holds it and keeps the turn. **Reset** drops it. **Export** writes `openscan-last.stl`.
+5. Press **Stop** to hold the model. **Pause** holds it and keeps the turn. **Reset** drops it. **Export** opens the system save dialog. The file name's ending chooses STL, OBJ, or PLY.
 6. Quit with `q` or Esc. A model is written to `openscan-last.stl` in the current directory.
 
 A front view covers twice the mold sweep. The default sweep is 80, so that front shell is 160° of the object. A later turn is added when the outline moves.
@@ -28,7 +28,7 @@ openscan turn-test
 
 Exposure is in units of 100 microseconds. Gain is 0..100. A useful starting point on the scanner used here is camera A exposure 22 gain 6, and camera B exposure 16 gain 4.
 
-`scan -o` writes `.stl`, `.obj`, or `.ply` from the file name. The window's Export button writes all three as `openscan-last` in the current directory and shows that path.
+`scan -o` writes `.stl`, `.obj`, or `.ply` from the file name. The window's Export button opens the system save dialog, starting from `openscan-last.stl`, and shows the saved path.
 
 ## Calibration
 

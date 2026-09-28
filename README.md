@@ -10,7 +10,7 @@ Use your own assistant and tailor the code to what you need.
 
 Mold wraps the camera outline into a solid. With Mold sweep at 60, a front view covers 120° of that solid. At 80 it covers 160°. Mold relief turns the photo into bumps on that shape. Measured keeps that outline as a flat sheet.
 
-The window shows the clean camera, the 3D solid, the pattern camera, the clean camera again, and a side view. Export writes STL, OBJ, and PLY. A still picture does not add another shell. A turn is taken from the top of the outline, so a centered spin of a round object can still be missed. A full circle is not guaranteed.
+The window shows the clean camera, the 3D solid, the pattern camera, the clean camera again, and a side view. Export opens the system save dialog and writes STL, OBJ, or PLY from the file name. A still picture does not add another shell. A turn is taken from the top of the outline, so a centered spin of a round object can still be missed. A full circle is not guaranteed.
 
 One USB camera pair was used. Other scanners are untested. There is no factory calibration in this tree. You bring `calib/<serial>.txt` for your own unit.
 
@@ -148,7 +148,7 @@ openscan help
 
 `scan` records without a window. `--shape mold` is the solid. `--shape measured` is the sheet. `--distance` is 100–500 mm. `--sweep 80` covers 160° of the object from the front. Exposure flags are `--exposure-a`, `--gain-a`, `--exposure-b`, and `--gain-b`.
 
-Export in the window saves `openscan-last.stl`, `openscan-last.obj`, and `openscan-last.ply` in the directory you started the program from, and leaves that path on the status line. `scan -o` uses the suffix the same way: `.stl`, `.obj`, or `.ply`.
+Export opens the system save dialog. The suggested name is `openscan-last.stl`. Pick the folder and the name there; `.stl`, `.obj`, or `.ply` selects the format. The saved path stays on the status line. `scan -o` uses the suffix the same way.
 
 Exposure is the UVC absolute exposure in units of 100 microseconds. If the camera API cannot turn manual exposure off, the status line says the sliders were not applied and the camera stays on auto. Gain is 0..100, the value written to the camera. Android's camera API uses that same number when the sensor's ISO range covers 0..100. Otherwise 0 is the bottom of that range and 100 is the top. A useful starting point on this Fox is camera A exposure 22 gain 6, camera B exposure 16 gain 4.
 

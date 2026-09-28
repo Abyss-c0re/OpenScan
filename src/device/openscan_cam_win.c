@@ -166,7 +166,8 @@ openscan_cam *openscan_cam_open(const char *path, int width, int height, int fps
     if (FAILED(MFCreateMediaType(&mt))) goto fail;
     IMFMediaType_SetGUID(mt, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
     IMFMediaType_SetGUID(mt, &MF_MT_SUBTYPE, mjpeg ? &MFVideoFormat_MJPG : &MFVideoFormat_YUY2);
-    MFSetAttributeSize(mt, &MF_MT_FRAME_SIZE, (UINT32)width, (UINT32)height);
+    IMFMediaType_SetUINT64(mt, &MF_MT_FRAME_SIZE,
+                           ((UINT64)(UINT32)width << 32) | (UINT32)height);
     if (FAILED(IMFSourceReader_SetCurrentMediaType(cam->reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, mt))) {
         IMFMediaType_SetGUID(mt, &MF_MT_SUBTYPE, &MFVideoFormat_YUY2);
         cam->mjpeg = 0;

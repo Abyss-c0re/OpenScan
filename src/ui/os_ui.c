@@ -20,6 +20,37 @@ static int grab_gray(openscan_cam *cam, uint8_t *storage, size_t cap, uint8_t *g
     return openscan_frame_gray(cam, storage, cap, gray);
 }
 
+static int mesh_suffix(const char *path) {
+    size_t len = path ? strlen(path) : 0;
+    if (len < 4) return 0;
+    const char *e = path + len - 4;
+    return !strcmp(e, ".stl") || !strcmp(e, ".STL") || !strcmp(e, ".obj") || !strcmp(e, ".OBJ") ||
+           !strcmp(e, ".ply") || !strcmp(e, ".PLY");
+}
+
+static int export_write(openscan_live *live, const char *name, char *note, size_t note_n) {
+    char cwd[360], path[640];
+    int tris = 0;
+    if (!name || !name[0] || !strcmp(name, ".") || !strcmp(name, "..")) {
+        snprintf(note, note_n, "Type a file name.");
+        return -1;
+    }
+    if (name[0] == '/' || (name[0] && name[1] == ':'))
+        snprintf(path, sizeof path, "%s", name);
+    else {
+        if (!os_getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+        snprintf(path, sizeof path, "%s/%s", cwd, name);
+    }
+    if (openscan_live_write(live, path, &tris) != 0) {
+        snprintf(note, note_n, "Nothing to save yet. Press Start, then Export.");
+        fprintf(stderr, "%s\n", note);
+        return -1;
+    }
+    snprintf(note, note_n, "Saved %s  (%d triangles)", path, tris);
+    fprintf(stderr, "%s\n", note);
+    return 0;
+}
+
 static void release_cams(openscan_cam *a, openscan_cam *b) {
     if (a) {
         openscan_cam_stop(a);
@@ -247,8 +278,8 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
     uint8_t *bufb = malloc((size_t)w * h * 4);
     uint8_t *ya = malloc((size_t)w * h);
     uint8_t *yb = malloc((size_t)w * h);
-    char status[640];
-    char note[640];
+    char status[800];
+    char note[800];
     time_t note_until = 0;
     snprintf(status, sizeof status, "idle");
     note[0] = 0;
@@ -290,28 +321,13 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
                     auto_exposure(b, bufb, yb, w, h, &kn.eb, kn.gb);
                     sent_ea = sent_ga = sent_eb = sent_gb = -1;
                 } else if (mx >= 1100 && mx < 1270) {
-                    char cwd[360], stem[400];
-                    char stl[480], obj[480], ply[480];
-                    int tris = 0, ok = 0;
-                    if (!os_getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
-                    snprintf(stem, sizeof stem, "%s/openscan-last", cwd);
-                    snprintf(stl, sizeof stl, "%s.stl", stem);
-                    snprintf(obj, sizeof obj, "%s.obj", stem);
-                    snprintf(ply, sizeof ply, "%s.ply", stem);
-                    if (openscan_live_write(live, stl, &tris) == 0) ok++;
-                    if (openscan_live_write(live, obj, &tris) == 0) ok++;
-                    if (openscan_live_write(live, ply, &tris) == 0) ok++;
-                    if (ok == 3) {
-                        snprintf(note, sizeof note, "Saved %s .stl .obj .ply  (%d triangles)", stem, tris);
-                        fprintf(stderr, "%s\n", note);
-                    } else if (ok == 0) {
-                        snprintf(note, sizeof note, "Nothing to save yet. Press Start, then Export.");
-                        fprintf(stderr, "%s\n", note);
-                    } else {
-                        snprintf(note, sizeof note, "Saved %d of stl, obj, ply in %s", ok, cwd);
-                        fprintf(stderr, "%s\n", note);
+                    char path[640];
+                    if (os_surf_save_dialog(surf, "openscan-last.stl", path, sizeof path) == 0) {
+                        size_t len = strlen(path);
+                        if (!mesh_suffix(path) && len + 4 < sizeof path) memcpy(path + len, ".stl", 5);
+                        export_write(live, path, note, sizeof note);
+                        note_until = time(NULL) + 8;
                     }
-                    note_until = time(NULL) + 8;
                 }
             }
             if (press && my >= 292 && my < 328) {
@@ -335,8 +351,8 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
                 last_x = mx;
                 last_y = my;
             }
-            if (key == 'q' || key == 27) run = 0;
-            if (key == 's') openscan_live_set_mode(live, OPENSCAN_MODE_SCAN);
+            if (key == 'q' || key == 'Q' || key == 27) run = 0;
+            if (key == 's' || key == 'S') openscan_live_set_mode(live, OPENSCAN_MODE_SCAN);
             if (key == ' ') openscan_live_key(live, ' ');
             knobs_clamp(&kn);
         }
@@ -362,6 +378,13 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
             const char *shape = openscan_live_shape(live) == OPENSCAN_SHAPE_MEASURED ? "measured" : "mold";
             if (time(NULL) < note_until)
                 snprintf(status, sizeof status, "%s", note);
+            else if (openscan_live_mode(live) == OPENSCAN_MODE_SCAN &&
+                     openscan_live_shape(live) == OPENSCAN_SHAPE_MOLD)
+                snprintf(status, sizeof status, "MOLDING — turn the object   %d tris   %d deg",
+                         st.points, st.scanned_deg);
+            else if (openscan_live_mode(live) == OPENSCAN_MODE_SCAN)
+                snprintf(status, sizeof status, "SCANNING   %s   %d tris   %d deg",
+                         shape, st.points, st.scanned_deg);
             else
                 snprintf(status, sizeof status, "%s  %s  %d mm  %d tris  %d deg",
                          mode, shape, kn.distance, st.points, st.scanned_deg);
@@ -381,7 +404,12 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
         os_surf_bar(surf, 430, 6, 120, 26, kn.shape == OPENSCAN_SHAPE_MEASURED ? 0x2a6f9d : 0x3a3e48);
         os_surf_bar(surf, 558, 6, 150, 26, 0x2a6f9d);
         os_surf_bar(surf, 1108, 6, 150, 26, 0xc4892a);
-        os_surf_text(surf, 22, 24, "Start", 0xf2f2f2);
+        os_surf_text(surf, 22, 24,
+                     openscan_live_mode(live) == OPENSCAN_MODE_SCAN &&
+                             openscan_live_shape(live) == OPENSCAN_SHAPE_MOLD
+                         ? "Molding"
+                         : "Start",
+                     0xf2f2f2);
         os_surf_text(surf, 104, 24, "Pause", 0xf2f2f2);
         os_surf_text(surf, 188, 24, "Stop", 0xf2f2f2);
         os_surf_text(surf, 264, 24, "Reset", 0xf2f2f2);

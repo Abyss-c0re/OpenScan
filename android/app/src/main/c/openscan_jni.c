@@ -217,12 +217,105 @@ Java_dev_lab_openscan_Engine_nativeScannerClose(JNIEnv *env, jclass cls, jlong h
     free(cams);
 }
 
+/* Android has no libjpeg. The platform decoder turns the camera JPEG into gray. */
+static int jpeg_gray(JNIEnv *env, const uint8_t *jpg, size_t n, int w, int h, uint8_t *dst) {
+    jclass factory, bmp_cls;
+    jmethodID decode, get_w, get_h, get_px, recycle;
+    jbyteArray bytes;
+    jobject bmp;
+    jintArray pixels;
+    jint *px, sw, sh;
+    int y, x;
+    if (!jpg || n < 16 || w < 2 || h < 2 || !dst) return -1;
+    factory = (*env)->FindClass(env, "android/graphics/BitmapFactory");
+    if (!factory) return -1;
+    decode = (*env)->GetStaticMethodID(env, factory, "decodeByteArray", "([BII)Landroid/graphics/Bitmap;");
+    if (!decode) return -1;
+    bytes = (*env)->NewByteArray(env, (jsize)n);
+    if (!bytes) return -1;
+    (*env)->SetByteArrayRegion(env, bytes, 0, (jsize)n, (const jbyte *)jpg);
+    bmp = (*env)->CallStaticObjectMethod(env, factory, decode, bytes, 0, (jint)n);
+    (*env)->DeleteLocalRef(env, bytes);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return -1;
+    }
+    if (!bmp) return -1;
+    bmp_cls = (*env)->GetObjectClass(env, bmp);
+    get_w = (*env)->GetMethodID(env, bmp_cls, "getWidth", "()I");
+    get_h = (*env)->GetMethodID(env, bmp_cls, "getHeight", "()I");
+    get_px = (*env)->GetMethodID(env, bmp_cls, "getPixels", "([IIIIIII)V");
+    recycle = (*env)->GetMethodID(env, bmp_cls, "recycle", "()V");
+    sw = (*env)->CallIntMethod(env, bmp, get_w);
+    sh = (*env)->CallIntMethod(env, bmp, get_h);
+    if (sw < 1 || sh < 1 || !get_px) {
+        if (recycle) (*env)->CallVoidMethod(env, bmp, recycle);
+        (*env)->DeleteLocalRef(env, bmp);
+        return -1;
+    }
+    pixels = (*env)->NewIntArray(env, sw * sh);
+    (*env)->CallVoidMethod(env, bmp, get_px, pixels, 0, sw, 0, 0, sw, sh);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, pixels);
+        if (recycle) (*env)->CallVoidMethod(env, bmp, recycle);
+        (*env)->DeleteLocalRef(env, bmp);
+        return -1;
+    }
+    px = (*env)->GetIntArrayElements(env, pixels, NULL);
+    for (y = 0; y < h; y++) {
+        int sy = y * sh / h;
+        if (sy >= sh) sy = sh - 1;
+        for (x = 0; x < w; x++) {
+            int sx = x * sw / w;
+            unsigned p;
+            if (sx >= sw) sx = sw - 1;
+            p = (unsigned)px[sy * sw + sx];
+            dst[y * w + x] = (uint8_t)((((p >> 16) & 255) * 77 + ((p >> 8) & 255) * 150 + (p & 255) * 29) >> 8);
+        }
+    }
+    (*env)->ReleaseIntArrayElements(env, pixels, px, JNI_ABORT);
+    (*env)->DeleteLocalRef(env, pixels);
+    if (recycle) (*env)->CallVoidMethod(env, bmp, recycle);
+    (*env)->DeleteLocalRef(env, bmp);
+    return 0;
+}
+
+static int grab_gray(JNIEnv *env, openscan_cam *cam, jbyteArray out) {
+    int w = openscan_cam_width(cam);
+    int h = openscan_cam_height(cam);
+    size_t cap = (size_t)w * (size_t)h * 4;
+    uint8_t *raw = NULL, *gray = NULL;
+    size_t n = 0;
+    int rc = -1;
+    if (w < 2 || h < 2 || (*env)->GetArrayLength(env, out) < w * h) return -1;
+    raw = malloc(cap);
+    gray = malloc((size_t)w * (size_t)h);
+    if (!raw || !gray) goto done;
+    if (openscan_cam_grab_latest(cam, raw, cap, &n, NULL) != 0 || n < 16) goto done;
+    if (openscan_cam_mjpeg(cam)) {
+        if (jpeg_gray(env, raw, n, w, h, gray) != 0) goto done;
+    } else {
+        if (n < (size_t)w * (size_t)h) goto done;
+        memcpy(gray, raw, (size_t)w * (size_t)h);
+    }
+    (*env)->SetByteArrayRegion(env, out, 0, w * h, (const jbyte *)gray);
+    rc = 0;
+done:
+    free(raw);
+    free(gray);
+    return rc;
+}
+
 JNIEXPORT jint JNICALL
 Java_dev_lab_openscan_Engine_nativeScannerGrab(JNIEnv *env, jclass cls, jlong handle, jbyteArray ya, jbyteArray yb) {
+    OsCams *cams;
     (void)cls;
-    (void)env; (void)handle; (void)ya; (void)yb;
-    /* Phone frames arrive through nativePush. This path is the desktop cameras. */
-    return -1;
+    if (!handle || !ya || !yb) return -1;
+    cams = (OsCams *)handle;
+    if (grab_gray(env, cams->a, ya) != 0) return -1;
+    if (grab_gray(env, cams->b, yb) != 0) return -1;
+    return 0;
 }
 
 JNIEXPORT jint JNICALL

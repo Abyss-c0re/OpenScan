@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 struct os_surf {
     NSWindow *win;
@@ -148,10 +149,10 @@ int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit, int *held) {
         } else if (ev.type == NSEventTypeKeyDown) {
             int ch = 0;
             if (ev.keyCode == 53) ch = 27;
+            else if (ev.keyCode == 51) ch = 8;
+            else if (ev.keyCode == 36 || ev.keyCode == 76) ch = '\n';
             else if (ev.charactersIgnoringModifiers.length > 0)
                 ch = [ev.charactersIgnoringModifiers characterAtIndex:0];
-            if (ch == 'Q') ch = 'q';
-            if (ch == 'S') ch = 's';
             if (key) *key = ch;
         }
         [NSApp sendEvent:ev];
@@ -208,4 +209,26 @@ void os_surf_flush(os_surf *s) {
     [s->view setNeedsDisplay:YES];
     [s->view displayIfNeeded];
     s->nlab = 0;
+}
+
+int os_surf_save_dialog(os_surf *s, const char *suggested, char *out, size_t n) {
+    (void)s;
+    if (!out || n < 2) return -1;
+    out[0] = 0;
+    if (!suggested || !suggested[0]) suggested = "openscan-last.stl";
+    @autoreleasepool {
+        NSSavePanel *panel = [NSSavePanel savePanel];
+        char cwd[360];
+        NSString *name = [NSString stringWithUTF8String:suggested];
+        panel.title = @"Export";
+        panel.canCreateDirectories = YES;
+        panel.allowedFileTypes = @[ @"stl", @"obj", @"ply" ];
+        panel.allowsOtherFileTypes = NO;
+        if (name) panel.nameFieldStringValue = name;
+        if (getcwd(cwd, sizeof cwd))
+            panel.directoryURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:cwd]];
+        if ([panel runModal] != NSModalResponseOK || !panel.URL.path) return -1;
+        snprintf(out, n, "%s", panel.URL.path.UTF8String);
+        return out[0] ? 0 : -1;
+    }
 }

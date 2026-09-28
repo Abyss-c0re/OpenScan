@@ -81,8 +81,8 @@ else()
 endif()
 
 if(WIN32)
-    target_link_libraries(openscan_core PUBLIC ole32 uuid mfplat mfreadwrite mfuuid windowscodecs)
-    target_link_libraries(openscan PRIVATE openscan_core user32 gdi32)
+    target_link_libraries(openscan_core PUBLIC ole32 uuid mfplat mf mfreadwrite mfuuid windowscodecs)
+    target_link_libraries(openscan PRIVATE openscan_core user32 gdi32 comdlg32)
 elseif(APPLE)
     set_source_files_properties(src/device/openscan_cam_mac.m src/ui/os_surf_mac.m
         PROPERTIES COMPILE_FLAGS "-fno-objc-arc")

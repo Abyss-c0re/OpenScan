@@ -4,8 +4,11 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 struct os_surf {
     Display *dpy;
@@ -74,12 +77,14 @@ int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit, int *held) {
         return 1;
     }
     if (ev.type == KeyPress) {
-        KeySym ks = XLookupKeysym(&ev.xkey, 0);
+        char buf[8];
+        KeySym ks = 0;
+        int n = XLookupString(&ev.xkey, buf, (int)sizeof buf, &ks, NULL);
         int ch = 0;
-        if (ks == XK_q || ks == XK_Q) ch = 'q';
-        else if (ks == XK_Escape) ch = 27;
-        else if (ks == XK_s || ks == XK_S) ch = 's';
-        else if (ks == XK_space) ch = ' ';
+        if (ks == XK_Escape) ch = 27;
+        else if (ks == XK_BackSpace) ch = 8;
+        else if (ks == XK_Return || ks == XK_KP_Enter) ch = '\n';
+        else if (n == 1 && (unsigned char)buf[0] >= 32 && (unsigned char)buf[0] < 127) ch = (unsigned char)buf[0];
         if (key) *key = ch;
         return 1;
     }
@@ -132,4 +137,61 @@ void os_surf_text(os_surf *s, int x, int y, const char *text, unsigned rgb) {
 
 void os_surf_flush(os_surf *s) {
     if (s) XFlush(s->dpy);
+}
+
+/* 0 confirmed, -1 cancelled or failed, -2 program missing. */
+static int dialog_exec(char *const argv[], char *out, size_t n) {
+    int fd[2];
+    pid_t pid;
+    if (pipe(fd) != 0) return -1;
+    pid = fork();
+    if (pid < 0) {
+        close(fd[0]);
+        close(fd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        dup2(fd[1], STDOUT_FILENO);
+        close(fd[0]);
+        close(fd[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(fd[1]);
+    size_t got = 0;
+    while (got + 1 < n) {
+        ssize_t r = read(fd[0], out + got, n - 1 - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    out[got] = 0;
+    close(fd[0]);
+    int st = 0;
+    if (waitpid(pid, &st, 0) < 0 || !WIFEXITED(st)) return -1;
+    if (WEXITSTATUS(st) == 127) return -2;
+    if (WEXITSTATUS(st) != 0) return -1;
+    while (got > 0 && (out[got - 1] == '\n' || out[got - 1] == '\r')) out[--got] = 0;
+    return got > 0 ? 0 : -1;
+}
+
+int os_surf_save_dialog(os_surf *s, const char *suggested, char *out, size_t n) {
+    char cwd[360], suggest[512];
+    char *kargv[] = {
+        "kdialog", "--title", "Export", "--getsavefilename", suggest,
+        "STL (*.stl)|OBJ (*.obj)|PLY (*.ply)", NULL};
+    char *zargv[] = {
+        "zenity", "--file-selection", "--save", "--title=Export", "--filename", suggest,
+        "--file-filter=STL | *.stl", "--file-filter=OBJ | *.obj", "--file-filter=PLY | *.ply", NULL};
+    int rc;
+    (void)s;
+    if (!out || n < 2) return -1;
+    out[0] = 0;
+    if (!suggested || !suggested[0]) suggested = "openscan-last.stl";
+    if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+    if (suggested[0] == '/') snprintf(suggest, sizeof suggest, "%s", suggested);
+    else snprintf(suggest, sizeof suggest, "%s/%s", cwd, suggested);
+    rc = dialog_exec(kargv, out, n);
+    if (rc != -2) return rc;
+    rc = dialog_exec(zargv, out, n);
+    return rc == 0 ? 0 : -1;
 }
