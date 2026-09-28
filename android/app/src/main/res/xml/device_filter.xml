@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Sonix UVC pair inside the 3DMakerpro Fox. 0x0c45 / 0x636a and 0x636b. -->
+    <usb-device vendor-id="3141" product-id="25450" />
+    <usb-device vendor-id="3141" product-id="25451" />
+</resources>

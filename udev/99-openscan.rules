@@ -1,0 +1,15 @@
+# Handheld scanner, serial prefix JMM8. Two Sonix UVC cameras behind one USB 2 hub.
+# OpenScan is not affiliated with the scanner maker.
+# 0c45:636a is camera A, 0c45:636b is camera B.
+#
+# The video nodes are what Linux streaming uses. The raw USB nodes are what
+# other programs use to read the camera serial. Without write access they
+# can report an empty serial.
+
+# Capture nodes only. Index 1 is UVC metadata.
+SUBSYSTEM=="video4linux", ATTR{index}=="0", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="636a", GROUP="video", MODE="0660", TAG+="uaccess", SYMLINK+="openscan-a"
+SUBSYSTEM=="video4linux", ATTR{index}=="0", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="636b", GROUP="video", MODE="0660", TAG+="uaccess", SYMLINK+="openscan-b"
+
+# Raw USB devices, so userspace and Wine can open them.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="636a", GROUP="video", MODE="0660", TAG+="uaccess", SYMLINK+="openscan-usb-a"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="636b", GROUP="video", MODE="0660", TAG+="uaccess", SYMLINK+="openscan-usb-b"

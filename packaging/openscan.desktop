@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OpenScan
+GenericName=3D scanner
+Comment=Scan with a 3DMakerpro handheld scanner. Tested on the Fox.
+Exec=openscan
+Icon=openscan
+Terminal=false
+Categories=Graphics;3DGraphics;
+StartupWMClass=openscan
