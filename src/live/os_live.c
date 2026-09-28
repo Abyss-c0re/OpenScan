@@ -30,6 +30,7 @@ struct openscan_live {
     int nmodel, cap;
     unsigned *cell;
     int ncell;
+    unsigned shell_gen;
     int scanned_bins;
     uint8_t seen[72];
     uint8_t *preview;
@@ -38,10 +39,22 @@ struct openscan_live {
     int quit_flag;
     int save_flag;
     os_turn turn;
-    float prev_cx;
+    float prev_cx, prev_top;
     int have_prev;
     float axis_x, axis_y, axis_z;
     int have_axis;
+    float orbit_yaw, orbit_pitch;
+    uint8_t *view_front;
+    uint8_t *view_side;
+    int view_fw, view_fh, view_sw, view_sh;
+    float *zbuf;
+    int zcap;
+    int cache_n, cache_yq, cache_pq, cache_ok;
+    Tri *held_preview;
+    int nheld, hold_tick;
+    int *row_mid;
+    int row_n;
+    int have_rows;
     int fused, lost;
 };
 
@@ -77,10 +90,10 @@ openscan_live *openscan_live_create(const openscan_calib *calib, const openscan_
     L->mode = OPENSCAN_MODE_STOP;
     L->cap = 60000;
     L->model = calloc((size_t)L->cap, sizeof(Tri));
-    L->ncell = 1 << 16;
+    L->ncell = 1 << 18;
     L->cell = calloc((size_t)L->ncell, sizeof(unsigned));
-    L->pw = 960;
-    L->ph = 540;
+    L->pw = 1180;
+    L->ph = 520;
     L->preview = calloc((size_t)L->pw * L->ph * 3, 1);
     for (int i = 0; i < 5; i++) L->panel[i] = calloc((size_t)L->pw * L->ph * 3, 1);
     if (!L->model || !L->cell || !L->preview) {
@@ -96,6 +109,11 @@ void openscan_live_destroy(openscan_live *live) {
     free(live->model);
     free(live->cell);
     free(live->preview);
+    free(live->view_front);
+    free(live->view_side);
+    free(live->zbuf);
+    free(live->held_preview);
+    free(live->row_mid);
     for (int i = 0; i < 5; i++) free(live->panel[i]);
     free(live);
 }
@@ -109,6 +127,9 @@ void openscan_live_reset(openscan_live *live) {
     live->scanned_bins = 0;
     live->fused = 0;
     live->lost = 0;
+    live->nheld = 0;
+    live->cache_ok = 0;
+    live->have_rows = 0;
     memset(live->seen, 0, sizeof live->seen);
     memset(live->cell, 0, (size_t)live->ncell * sizeof(unsigned));
 }
@@ -143,6 +164,13 @@ void openscan_live_get_build(const openscan_live *live, openscan_build *build) {
 int openscan_live_points(const openscan_live *live) { return live ? live->nmodel : 0; }
 void openscan_live_mouse(openscan_live *live, int event, int x, int y, int flags) {
     (void)live; (void)event; (void)x; (void)y; (void)flags;
+}
+void openscan_live_orbit(openscan_live *live, float dyaw, float dpitch) {
+    if (!live) return;
+    live->orbit_yaw += dyaw;
+    live->orbit_pitch += dpitch;
+    if (live->orbit_pitch > 1.2f) live->orbit_pitch = 1.2f;
+    if (live->orbit_pitch < -1.2f) live->orbit_pitch = -1.2f;
 }
 void openscan_live_key(openscan_live *live, int key) {
     if (!live) return;
@@ -305,19 +333,30 @@ static void rot_y(float yaw, float ax, float az, float *x, float *z) {
     *z = az - s * dx + c * dz;
 }
 
+static void rot_x(float pitch, float *y, float *z) {
+    float c = os_cos(pitch), s = os_sin(pitch);
+    float y0 = *y, z0 = *z;
+    *y = y0 * c - z0 * s;
+    *z = y0 * s + z0 * c;
+}
+
 static int cell_new(openscan_live *L, float x, float y, float z) {
-    int ix = os_lround(x / 3.f);
-    int iy = os_lround(y / 3.f);
-    int iz = os_lround(z / 3.f);
+    int ix = os_lround(x / 0.75f);
+    int iy = os_lround(y / 0.75f);
+    int iz = os_lround(z / 0.75f);
     unsigned h = (unsigned)(ix * 73856093 ^ iy * 19349663 ^ iz * 83492791);
-    h &= (unsigned)(L->ncell - 1);
+    unsigned key = (L->shell_gen << 16) | (h & 0xFFFFu);
+    unsigned slot = h & (unsigned)(L->ncell - 1);
     for (int n = 0; n < 32; n++) {
-        unsigned i = (h + (unsigned)n) & (unsigned)(L->ncell - 1);
-        if (L->cell[i] == 0) {
-            L->cell[i] = h + 1;
+        unsigned i = (slot + (unsigned)n) & (unsigned)(L->ncell - 1);
+        unsigned got = L->cell[i];
+        if (got == 0) {
+            L->cell[i] = key;
             return 1;
         }
-        if (L->cell[i] == h + 1) return 0;
+        if ((got & 0xFFFFu) != (h & 0xFFFFu)) continue;
+        /* Same spot in this shell still gets its triangle. An older shell blocks it. */
+        return (got >> 16) == L->shell_gen;
     }
     return 0;
 }
@@ -366,23 +405,22 @@ static void gray_bgr(uint8_t *dst, int dw, int dh, const uint8_t *src, int sw, i
     }
 }
 
-static void paint_model(uint8_t *dst, int dw, int dh, const Tri *tris, int n,
-                        float yaw, float ax, float ay, float az) {
+static void paint_model(uint8_t *dst, float *zbuf, int dw, int dh, const Tri *tris, int n,
+                        float yaw, float pitch, float ax, float ay, float az) {
     memset(dst, 12, (size_t)dw * dh * 3);
-    float *zbuf = malloc((size_t)dw * dh * sizeof(float));
     if (!zbuf) return;
     for (int i = 0; i < dw * dh; i++) zbuf[i] = 1e9f;
     float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
     for (int i = 0; i < n; i++) {
         const float *p[3] = {tris[i].a, tris[i].b, tris[i].c};
         for (int k = 0; k < 3; k++) {
-            float x = p[k][0], z = p[k][2];
+            float x = p[k][0], y = p[k][1], z = p[k][2];
             rot_y(yaw, ax, az, &x, &z);
+            rot_x(pitch, &y, &z);
             if (x < minx) minx = x;
             if (x > maxx) maxx = x;
-            if (p[k][1] < miny) miny = p[k][1];
-            if (p[k][1] > maxy) maxy = p[k][1];
-            (void)z;
+            if (y < miny) miny = y;
+            if (y > maxy) maxy = y;
         }
     }
     float ext = maxx - minx;
@@ -395,10 +433,11 @@ static void paint_model(uint8_t *dst, int dw, int dh, const Tri *tris, int n,
         float xs[3], ys[3], zs[3];
         const float *p[3] = {tris[i].a, tris[i].b, tris[i].c};
         for (int k = 0; k < 3; k++) {
-            float x = p[k][0], z = p[k][2];
+            float x = p[k][0], y = p[k][1], z = p[k][2];
             rot_y(yaw, ax, az, &x, &z);
+            rot_x(pitch, &y, &z);
             xs[k] = dw * 0.5f + (x - cx) * scale;
-            ys[k] = dh * 0.5f - (p[k][1] - cy) * scale;
+            ys[k] = dh * 0.5f - (y - cy) * scale;
             zs[k] = z;
         }
         float area = (xs[1] - xs[0]) * (ys[2] - ys[0]) - (ys[1] - ys[0]) * (xs[2] - xs[0]);
@@ -407,43 +446,74 @@ static void paint_model(uint8_t *dst, int dw, int dh, const Tri *tris, int n,
         int maxpx = (int)os_max(xs[0], os_max(xs[1], xs[2]));
         int minpy = (int)os_min(ys[0], os_min(ys[1], ys[2]));
         int maxpy = (int)os_max(ys[0], os_max(ys[1], ys[2]));
-        minpx = clampi(minpx, 0, dw - 1);
-        maxpx = clampi(maxpx, 0, dw - 1);
-        minpy = clampi(minpy, 0, dh - 1);
-        maxpy = clampi(maxpy, 0, dh - 1);
+        if (minpx < 0) minpx = 0;
+        if (minpy < 0) minpy = 0;
+        if (maxpx >= dw) maxpx = dw - 1;
+        if (maxpy >= dh) maxpy = dh - 1;
+        if (minpx > maxpx || minpy > maxpy) {
+            int cxp = clampi((int)((xs[0] + xs[1] + xs[2]) / 3.f), 0, dw - 1);
+            int cyp = clampi((int)((ys[0] + ys[1] + ys[2]) / 3.f), 0, dh - 1);
+            int id = cyp * dw + cxp;
+            dst[id * 3] = dst[id * 3 + 1] = dst[id * 3 + 2] = 180;
+            continue;
+        }
         float e1x = xs[1] - xs[0], e1y = ys[1] - ys[0], e1z = zs[1] - zs[0];
         float e2x = xs[2] - xs[0], e2y = ys[2] - ys[0], e2z = zs[2] - zs[0];
         float nx = e1y * e2z - e1z * e2y;
         float ny = e1z * e2x - e1x * e2z;
         float nz = e1x * e2y - e1y * e2x;
         float ln = os_sqrt(nx * nx + ny * ny + nz * nz) + 1e-6f;
-        float lam = os_fabs((-0.2f * nx + 0.35f * ny - 0.9f * nz) / ln);
-        lam = lam * 0.75f + 0.25f;
-        int shade = (int)(255.f * (tris[i].tone * 0.45f + lam * 0.55f));
+        float lam = ((-0.2f * nx + 0.35f * ny - 0.9f * nz) / ln);
+        if (lam < 0.f) lam = 0.f;
+        if (lam > 1.f) lam = 1.f;
+        int shade = (int)(255.f * (tris[i].tone * 0.82f + lam * 0.18f));
         if (shade < 0) shade = 0;
         if (shade > 255) shade = 255;
+        float x0 = xs[0], y0 = ys[0], x1 = xs[1], y1 = ys[1], x2 = xs[2], y2 = ys[2];
+        float dw0 = y1 - y2, dw1 = y2 - y0, dw2 = y0 - y1;
+        float dh0 = x2 - x1, dh1 = x0 - x2, dh2 = x1 - x0;
+        float py0 = (float)minpy + 0.5f, px0 = (float)minpx + 0.5f;
+        float w0r = (x1 - px0) * (y2 - py0) - (y1 - py0) * (x2 - px0);
+        float w1r = (x2 - px0) * (y0 - py0) - (y2 - py0) * (x0 - px0);
+        float w2r = (x0 - px0) * (y1 - py0) - (y0 - py0) * (x1 - px0);
+        float inv = 1.f / area;
+        float z0 = zs[0], z1 = zs[1], z2 = zs[2];
+        float eps = 0.6f * (os_fabs(dw0) + os_fabs(dw1) + os_fabs(dw2) + os_fabs(dh0) + os_fabs(dh1) + os_fabs(dh2)) / 6.f;
         for (int py = minpy; py <= maxpy; py++) {
+            float w0 = w0r, w1 = w1r, w2 = w2r;
+            int row = py * dw;
             for (int px = minpx; px <= maxpx; px++) {
-                float w0 = (xs[1] - px) * (ys[2] - py) - (ys[1] - py) * (xs[2] - px);
-                float w1 = (xs[2] - px) * (ys[0] - py) - (ys[2] - py) * (xs[0] - px);
-                float w2 = (xs[0] - px) * (ys[1] - py) - (ys[0] - py) * (xs[1] - px);
-                int pos = w0 >= 0 && w1 >= 0 && w2 >= 0;
-                int neg = w0 <= 0 && w1 <= 0 && w2 <= 0;
-                if (!pos && !neg) continue;
-                float zc = (w0 * zs[0] + w1 * zs[1] + w2 * zs[2]) / area;
-                int id = py * dw + px;
-                if (zc < zbuf[id]) {
-                    zbuf[id] = zc;
-                    dst[id * 3] = dst[id * 3 + 1] = dst[id * 3 + 2] = (uint8_t)shade;
+                int pos = w0 >= -eps && w1 >= -eps && w2 >= -eps;
+                int neg = w0 <= eps && w1 <= eps && w2 <= eps;
+                if (pos || neg) {
+                    float zc = (w0 * z0 + w1 * z1 + w2 * z2) * inv;
+                    int id = row + px;
+                    if (zc < zbuf[id]) {
+                        zbuf[id] = zc;
+                        dst[id * 3] = dst[id * 3 + 1] = dst[id * 3 + 2] = (uint8_t)shade;
+                    }
                 }
+                w0 += dw0;
+                w1 += dw1;
+                w2 += dw2;
             }
+            w0r += dh0;
+            w1r += dh1;
+            w2r += dh2;
         }
     }
-    free(zbuf);
     (void)ay;
 }
 
-static int build_shell(openscan_live *L, const uint8_t *gray, int w, int h, int *ntri_out) {
+static void copy_tri(Tri *t, const Vert *a, const Vert *b, const Vert *c) {
+    t->a[0] = a->x; t->a[1] = a->y; t->a[2] = a->z;
+    t->b[0] = b->x; t->b[1] = b->y; t->b[2] = b->z;
+    t->c[0] = c->x; t->c[1] = c->y; t->c[2] = c->z;
+    t->tone = (a->tone + b->tone + c->tone) / 3.f;
+}
+
+static int build_shell(openscan_live *L, const uint8_t *gray, int w, int h, int *ntri_out,
+                       Tri *preview, int preview_cap, int *preview_n, int commit) {
     uint8_t *mask = malloc((size_t)w * h);
     uint8_t *blur = malloc((size_t)w * h);
     int *left = malloc((size_t)h * sizeof(int));
@@ -516,13 +586,19 @@ static int build_shell(openscan_live *L, const uint8_t *gray, int w, int h, int 
         }
     }
     int ntri = 0;
-    if (nok > 80 && L->build.solid) {
-        if (!L->have_axis) {
-            L->axis_x = sx / (float)nok;
-            L->axis_y = sy / (float)nok;
-            L->axis_z = z0;
-            L->have_axis = 1;
+    if (commit) {
+        if (++L->shell_gen >= 65535u) {
+            memset(L->cell, 0, (size_t)L->ncell * sizeof(unsigned));
+            L->shell_gen = 1;
         }
+    }
+    if (commit && nok > 80 && L->build.solid && !L->have_axis) {
+        L->axis_x = sx / (float)nok;
+        L->axis_y = sy / (float)nok;
+        L->axis_z = z0;
+        L->have_axis = 1;
+    }
+    if ((commit && nok > 80 && L->build.solid) || preview) {
         for (int iy = 0; iy < gh - 1; iy++) {
             for (int ix = 0; ix < gw - 1; ix++) {
                 Vert *v00 = &grid[iy * gw + ix];
@@ -530,12 +606,20 @@ static int build_shell(openscan_live *L, const uint8_t *gray, int w, int h, int 
                 Vert *v01 = &grid[(iy + 1) * gw + ix];
                 Vert *v11 = &grid[(iy + 1) * gw + ix + 1];
                 if (v00->ok && v10->ok && v01->ok) {
-                    add_tri(L, v00, v10, v01, L->turn.yaw);
-                    ntri++;
+                    if (commit && L->build.solid) {
+                        add_tri(L, v00, v10, v01, L->turn.yaw);
+                        ntri++;
+                    }
+                    if (preview && preview_n && *preview_n < preview_cap)
+                        copy_tri(&preview[(*preview_n)++], v00, v10, v01);
                 }
                 if (v10->ok && v11->ok && v01->ok) {
-                    add_tri(L, v10, v11, v01, L->turn.yaw);
-                    ntri++;
+                    if (commit && L->build.solid) {
+                        add_tri(L, v10, v11, v01, L->turn.yaw);
+                        ntri++;
+                    }
+                    if (preview && preview_n && *preview_n < preview_cap)
+                        copy_tri(&preview[(*preview_n)++], v10, v11, v01);
                 }
             }
         }
@@ -554,18 +638,116 @@ static int build_shell(openscan_live *L, const uint8_t *gray, int w, int h, int 
     return nok;
 }
 
-static void draw_panels(openscan_live *L, const uint8_t *clean, const uint8_t *pattern, int w, int h) {
+static void paste(uint8_t *dst, int dw, int dh, const uint8_t *src, int sw, int sh, int x0, int y0) {
+    for (int y = 0; y < sh && y0 + y < dh; y++) {
+        if (y0 + y < 0) continue;
+        int n = sw;
+        if (x0 + n > dw) n = dw - x0;
+        if (n <= 0 || x0 < 0) continue;
+        memcpy(dst + ((y0 + y) * dw + x0) * 3, src + y * sw * 3, (size_t)n * 3);
+    }
+}
+
+static void scale_bgr(uint8_t *dst, int dw, int dh, const uint8_t *src, int sw, int sh) {
+    if (sw < 1 || sh < 1) return;
+    for (int y = 0; y < dh; y++) {
+        int sy = y * sh / dh;
+        if (sy >= sh) sy = sh - 1;
+        const uint8_t *row = src + sy * sw * 3;
+        uint8_t *out = dst + y * dw * 3;
+        for (int x = 0; x < dw; x++) {
+            int sx = x * sw / dw;
+            if (sx >= sw) sx = sw - 1;
+            out[x * 3] = row[sx * 3];
+            out[x * 3 + 1] = row[sx * 3 + 1];
+            out[x * 3 + 2] = row[sx * 3 + 2];
+        }
+    }
+}
+
+static int ensure_view(openscan_live *L, int fw, int fh, int sw, int sh) {
+    int zneed = fw * fh;
+    if (sw * sh > zneed) zneed = sw * sh;
+    if (L->view_fw != fw || L->view_fh != fh || !L->view_front) {
+        free(L->view_front);
+        L->view_front = malloc((size_t)fw * fh * 3);
+        L->view_fw = fw;
+        L->view_fh = fh;
+        L->cache_ok = 0;
+    }
+    if (L->view_sw != sw || L->view_sh != sh || !L->view_side) {
+        free(L->view_side);
+        L->view_side = malloc((size_t)sw * sh * 3);
+        L->view_sw = sw;
+        L->view_sh = sh;
+        L->cache_ok = 0;
+    }
+    if (L->zcap < zneed || !L->zbuf) {
+        free(L->zbuf);
+        L->zbuf = malloc((size_t)zneed * sizeof(float));
+        L->zcap = zneed;
+    }
+    return L->view_front && L->view_side && L->zbuf;
+}
+
+static void draw_panels(openscan_live *L, const uint8_t *clean, const uint8_t *pattern, int w, int h,
+                        const Tri *show, int nshow) {
     int dw = L->pw / 2, dh = L->ph;
     gray_bgr(L->panel[0], dw, dh, clean, w, h);
     gray_bgr(L->panel[2], dw, dh, pattern, w, h);
     gray_bgr(L->panel[3], dw, dh, clean, w, h);
-    paint_model(L->panel[1], dw, dh, L->model, L->nmodel, L->turn.yaw, L->axis_x, L->axis_y, L->axis_z);
-    paint_model(L->panel[4], dw, dh, L->model, L->nmodel, L->turn.yaw + 1.15f, L->axis_x, L->axis_y, L->axis_z);
-    memset(L->preview, 16, (size_t)L->pw * L->ph * 3);
-    for (int y = 0; y < dh; y++) {
-        memcpy(L->preview + (y * L->pw) * 3, L->panel[0] + (y * dw) * 3, (size_t)dw * 3);
-        memcpy(L->preview + (y * L->pw + dw) * 3, L->panel[1] + (y * dw) * 3, (size_t)dw * 3);
+    const Tri *tris = nshow > 0 ? show : L->model;
+    int ntris = nshow > 0 ? nshow : L->nmodel;
+    float yaw = nshow > 0 ? L->orbit_yaw : L->turn.yaw + L->orbit_yaw;
+    float ax = nshow > 0 ? 0.f : L->axis_x;
+    float az = nshow > 0 ? 0.f : L->axis_z;
+    int cam_w = L->pw * 42 / 100;
+    int mid_w = L->pw * 42 / 100;
+    int side_w = L->pw - cam_w - mid_w;
+    int side_h = dh / 3;
+    if (side_h < 8) side_h = 8;
+    /* Half size turns each triangle into one speck when the picture is scaled up. */
+    int fw = mid_w;
+    int fh = dh;
+    if (fw < 32) fw = 32;
+    if (fh < 32) fh = 32;
+    int yq = (int)(yaw * 500.f);
+    int pq = (int)(L->orbit_pitch * 500.f);
+    int same = L->cache_ok && L->cache_n == ntris && L->cache_yq == yq && L->cache_pq == pq;
+    if (!same && ensure_view(L, fw, fh, fw, fh)) {
+        paint_model(L->view_front, L->zbuf, fw, fh, tris, ntris, yaw, L->orbit_pitch, ax, L->axis_y, az);
+        paint_model(L->view_side, L->zbuf, fw, fh, tris, ntris, yaw + 1.15f, L->orbit_pitch,
+                    ax, L->axis_y, az);
+        scale_bgr(L->panel[1], dw, dh, L->view_front, fw, fh);
+        scale_bgr(L->panel[4], dw, dh, L->view_side, fw, fh);
+        L->cache_n = ntris;
+        L->cache_yq = yq;
+        L->cache_pq = pq;
+        L->cache_ok = 1;
     }
+    uint8_t *cam = malloc((size_t)cam_w * dh * 3);
+    uint8_t *mid = malloc((size_t)mid_w * dh * 3);
+    uint8_t *sa = malloc((size_t)side_w * side_h * 3);
+    uint8_t *sb = malloc((size_t)side_w * side_h * 3);
+    uint8_t *sc = malloc((size_t)side_w * side_h * 3);
+    memset(L->preview, 18, (size_t)L->pw * L->ph * 3);
+    if (cam && mid && sa && sb && sc && L->view_front && L->view_side) {
+        gray_bgr(cam, cam_w, dh, clean, w, h);
+        scale_bgr(mid, mid_w, dh, L->view_front, L->view_fw, L->view_fh);
+        gray_bgr(sa, side_w, side_h, pattern, w, h);
+        gray_bgr(sb, side_w, side_h, clean, w, h);
+        scale_bgr(sc, side_w, side_h, L->view_side, L->view_sw, L->view_sh);
+        paste(L->preview, L->pw, L->ph, cam, cam_w, dh, 0, 0);
+        paste(L->preview, L->pw, L->ph, mid, mid_w, dh, cam_w + 4, 0);
+        paste(L->preview, L->pw, L->ph, sa, side_w, side_h, cam_w + mid_w + 8, 0);
+        paste(L->preview, L->pw, L->ph, sb, side_w, side_h, cam_w + mid_w + 8, side_h + 4);
+        paste(L->preview, L->pw, L->ph, sc, side_w, side_h, cam_w + mid_w + 8, side_h * 2 + 8);
+    }
+    free(sc);
+    free(cam);
+    free(mid);
+    free(sa);
+    free(sb);
 }
 
 int openscan_live_push(openscan_live *live, const uint8_t *ya, const uint8_t *yb,
@@ -586,34 +768,84 @@ int openscan_live_push(openscan_live *live, const uint8_t *ya, const uint8_t *yb
         flip180(clean, (int)n);
         flip180(pattern, (int)n);
     }
-    /* Centroid of the bright object. A sideways move is a turn. */
-    double sx = 0, sn = 0;
+    /* The top of the outline moves farther in the picture than the middle
+     * when the object turns. The middle alone stays put on a centered spin. */
+    if (live->row_n != height || !live->row_mid) {
+        free(live->row_mid);
+        live->row_mid = malloc((size_t)height * sizeof(int));
+        live->row_n = height;
+        live->have_rows = 0;
+    }
+    double sx = 0, sn = 0, topx = 0;
+    int ntop = 0, ymin = height, ymax = -1, wide = 0;
     for (int y = 0; y < height; y += 2) {
-        for (int x = 0; x < width; x += 2) {
-            if (clean[y * width + x] > 28) {
-                sx += x;
-                sn += 1;
-            }
+        int l = -1, r = -1;
+        const uint8_t *row = clean + y * width;
+        for (int x = 0; x < width; x++)
+            if (row[x] > 28) { l = x; break; }
+        if (l >= 0) {
+            for (int x = width - 1; x >= 0; x--)
+                if (row[x] > 28) { r = x; break; }
+        }
+        int mid = l >= 0 ? (l + r) / 2 : -1;
+        if (mid >= 0) {
+            if (y < ymin) ymin = y;
+            if (y > ymax) ymax = y;
+            if (r - l > wide) wide = r - l;
+            sx += mid;
+            sn += 1;
+        }
+        if (live->row_mid) live->row_mid[y] = mid;
+        if ((y & 1) == 0 && y + 1 < height && live->row_mid) live->row_mid[y + 1] = mid;
+    }
+    int span = ymax - ymin;
+    float cx = sn > 8 ? (float)(sx / sn) : width * 0.5f;
+    if (live->row_mid && span > 16) {
+        int y1 = ymin + span / 5;
+        for (int y = ymin; y < y1; y += 2) {
+            int mid = live->row_mid[y];
+            if (mid < 0) continue;
+            topx += mid;
+            ntop++;
         }
     }
-    float cx = sn > 20 ? (float)(sx / sn) : width * 0.5f;
+    float cx_top = ntop > 4 ? (float)(topx / ntop) : cx;
     int scanning = live->mode == OPENSCAN_MODE_SCAN;
     int fuse = 0;
-    if (live->have_prev && sn > 20) {
-        float radius = os_sqrt((float)sn) * 2.f;
-        os_turn_step(&live->turn, cx - live->prev_cx, radius, scanning, &fuse);
+    if (live->have_prev && sn > 8 && live->have_rows) {
+        float dx_body = cx - live->prev_cx;
+        float dx_top = cx_top - live->prev_top;
+        float dx = os_fabs(dx_top) > os_fabs(dx_body) ? dx_top : dx_body;
+        float radius = wide * 0.5f;
+        os_turn_step(&live->turn, dx, radius, scanning, &fuse);
     }
     live->prev_cx = cx;
-    live->have_prev = sn > 20;
+    live->prev_top = cx_top;
+    live->have_prev = sn > 8;
+    live->have_rows = live->row_mid != NULL;
     int before = live->nmodel;
     int added = 0;
     int nok = 0;
-    if (scanning && (before == 0 || fuse))
-        nok = build_shell(live, clean, width, height, &added);
+    int commit = scanning && (before == 0 || fuse);
+    Tri *shown = NULL;
+    int nshown = 0;
+    if (commit)
+        nok = build_shell(live, clean, width, height, &added, NULL, 0, NULL, 1);
+    if (live->nmodel < 80) {
+        if (!live->held_preview) live->held_preview = malloc(sizeof(Tri) * 12000);
+        live->hold_tick++;
+        if (live->held_preview && (live->nheld == 0 || (live->hold_tick % 3) == 1)) {
+            live->nheld = 0;
+            nok = build_shell(live, clean, width, height, &added, live->held_preview, 12000,
+                              &live->nheld, 0);
+        }
+        shown = live->held_preview;
+        nshown = live->nheld;
+    }
     if (scanning && before == 0) live->fused++;
     else if (scanning && added > 0) live->fused++;
     else if (scanning && nok < 80 && before == 0) live->lost++;
-    draw_panels(live, clean, pattern, width, height);
+    draw_panels(live, clean, pattern, width, height, shown, nshown);
     int covered = os_scanned_deg(live->build.sweep_deg, live->turn.yaw, count_bins(live), live->nmodel);
     if (status) {
         status->fused = live->fused;
@@ -645,29 +877,132 @@ const uint8_t *openscan_live_panel_bgr(const openscan_live *live, int panel, int
     return live->panel[panel];
 }
 
-int openscan_live_write(openscan_live *live, const char *stl_path, int *triangles_out) {
-    if (!live || !stl_path || live->nmodel < 1) return -1;
-    FILE *f = fopen(stl_path, "wb");
-    if (!f) return -1;
-    char hdr[80];
-    memset(hdr, 0, sizeof hdr);
-    snprintf(hdr, sizeof hdr, "OpenScan mold");
-    fwrite(hdr, 1, 80, f);
-    uint32_t n = (uint32_t)live->nmodel;
-    fwrite(&n, 4, 1, f);
-    for (int i = 0; i < live->nmodel; i++) {
-        float rec[12];
-        memset(rec, 0, sizeof rec);
-        rec[3] = live->model[i].a[0]; rec[4] = live->model[i].a[1]; rec[5] = live->model[i].a[2];
-        rec[6] = live->model[i].b[0]; rec[7] = live->model[i].b[1]; rec[8] = live->model[i].b[2];
-        rec[9] = live->model[i].c[0]; rec[10] = live->model[i].c[1]; rec[11] = live->model[i].c[2];
-        fwrite(rec, 4, 12, f);
-        uint16_t attr = 0;
-        fwrite(&attr, 2, 1, f);
+static void tri_normal(const Tri *t, float n[3]) {
+    float ux = t->b[0] - t->a[0], uy = t->b[1] - t->a[1], uz = t->b[2] - t->a[2];
+    float vx = t->c[0] - t->a[0], vy = t->c[1] - t->a[1], vz = t->c[2] - t->a[2];
+    float len;
+    n[0] = uy * vz - uz * vy;
+    n[1] = uz * vx - ux * vz;
+    n[2] = ux * vy - uy * vx;
+    len = os_sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len < 1e-12f) {
+        n[0] = 0.f;
+        n[1] = 0.f;
+        n[2] = 1.f;
+        return;
     }
-    fclose(f);
-    if (triangles_out) *triangles_out = live->nmodel;
+    n[0] /= len;
+    n[1] /= len;
+    n[2] /= len;
+}
+
+static int suffix_is(const char *path, const char *ext) {
+    size_t n = strlen(path), e = strlen(ext), i;
+    if (n < e) return 0;
+    for (i = 0; i < e; i++) {
+        char a = path[n - e + i], b = ext[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* Geometry only. No serial, no calibration text. */
+static int write_stl(const char *path, const Tri *tris, int count) {
+    FILE *f = fopen(path, "wb");
+    char header[80];
+    uint32_t n;
+    int i;
+    if (!f) return -1;
+    memset(header, 0, sizeof header);
+    memcpy(header, "openscan mesh", 13);
+    if (fwrite(header, 1, 80, f) != 80) {
+        fclose(f);
+        return -1;
+    }
+    n = (uint32_t)count;
+    if (fwrite(&n, 4, 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+    for (i = 0; i < count; i++) {
+        float nn[3], rec[12];
+        uint16_t attr = 0;
+        tri_normal(&tris[i], nn);
+        rec[0] = nn[0]; rec[1] = nn[1]; rec[2] = nn[2];
+        rec[3] = tris[i].a[0]; rec[4] = tris[i].a[1]; rec[5] = tris[i].a[2];
+        rec[6] = tris[i].b[0]; rec[7] = tris[i].b[1]; rec[8] = tris[i].b[2];
+        rec[9] = tris[i].c[0]; rec[10] = tris[i].c[1]; rec[11] = tris[i].c[2];
+        if (fwrite(rec, 4, 12, f) != 12 || fwrite(&attr, 2, 1, f) != 1) {
+            fclose(f);
+            return -1;
+        }
+    }
+    if (fclose(f) != 0) return -1;
     return 0;
+}
+
+static int write_obj(const char *path, const Tri *tris, int count) {
+    FILE *f = fopen(path, "w");
+    int i, k, idx = 1;
+    if (!f) return -1;
+    fprintf(f, "# openscan mesh\n");
+    for (i = 0; i < count; i++) {
+        float nn[3];
+        const float *p[3] = {tris[i].a, tris[i].b, tris[i].c};
+        tri_normal(&tris[i], nn);
+        for (k = 0; k < 3; k++) {
+            fprintf(f, "v %.6f %.6f %.6f\n", p[k][0], p[k][1], p[k][2]);
+            fprintf(f, "vn %.6f %.6f %.6f\n", nn[0], nn[1], nn[2]);
+        }
+        fprintf(f, "f %d//%d %d//%d %d//%d\n", idx, idx, idx + 1, idx + 1, idx + 2, idx + 2);
+        idx += 3;
+    }
+    if (fclose(f) != 0) return -1;
+    return 0;
+}
+
+static int write_ply(const char *path, const Tri *tris, int count) {
+    FILE *f = fopen(path, "w");
+    int i, k;
+    if (!f) return -1;
+    fprintf(f, "ply\nformat ascii 1.0\n");
+    fprintf(f, "element vertex %d\n", count * 3);
+    fprintf(f, "property float x\nproperty float y\nproperty float z\n");
+    fprintf(f, "property float nx\nproperty float ny\nproperty float nz\n");
+    fprintf(f, "element face %d\n", count);
+    fprintf(f, "property list uchar int vertex_indices\n");
+    fprintf(f, "end_header\n");
+    for (i = 0; i < count; i++) {
+        float nn[3];
+        const float *p[3] = {tris[i].a, tris[i].b, tris[i].c};
+        tri_normal(&tris[i], nn);
+        for (k = 0; k < 3; k++)
+            fprintf(f, "%.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    p[k][0], p[k][1], p[k][2], nn[0], nn[1], nn[2]);
+    }
+    for (i = 0; i < count; i++)
+        fprintf(f, "3 %d %d %d\n", i * 3, i * 3 + 1, i * 3 + 2);
+    if (fclose(f) != 0) return -1;
+    return 0;
+}
+
+static int write_mesh(const char *path, const Tri *tris, int count, int *triangles_out) {
+    int rc;
+    if (!path || !tris || count < 1) return -1;
+    if (suffix_is(path, ".obj")) rc = write_obj(path, tris, count);
+    else if (suffix_is(path, ".ply")) rc = write_ply(path, tris, count);
+    else if (suffix_is(path, ".stl") || !strrchr(path, '.')) rc = write_stl(path, tris, count);
+    else return -1;
+    if (rc == 0 && triangles_out) *triangles_out = count;
+    return rc;
+}
+
+int openscan_live_write(openscan_live *live, const char *path, int *triangles_out) {
+    if (!live || !path) return -1;
+    if (live->nmodel > 0) return write_mesh(path, live->model, live->nmodel, triangles_out);
+    return write_mesh(path, live->held_preview, live->nheld, triangles_out);
 }
 
 int openscan_mesh_self_test(void) {
@@ -706,6 +1041,60 @@ int openscan_turn_self_test(void) {
         fprintf(stderr, "c mold: front %d tris %d°\n", st.points, st.scanned_deg);
         return 1;
     }
+    {
+        int pw = 0, ph = 0, lit = 0;
+        const uint8_t *pv = openscan_live_preview_bgr(L, &pw, &ph);
+        int cam_w = pw * 42 / 100;
+        int mid_w = pw * 42 / 100;
+        for (int y = 0; y < ph; y++)
+            for (int x = cam_w; x < cam_w + mid_w && x < pw; x++)
+                if (pv[(y * pw + x) * 3] > 30) lit++;
+        int minx = pw, miny = ph, maxx = 0, maxy = 0;
+        for (int y = 0; y < ph; y++) {
+            for (int x = cam_w; x < cam_w + mid_w && x < pw; x++) {
+                if (pv[(y * pw + x) * 3] <= 30) continue;
+                if (x < minx) minx = x;
+                if (y < miny) miny = y;
+                if (x > maxx) maxx = x;
+                if (y > maxy) maxy = y;
+            }
+        }
+        int box = (maxx - minx) * (maxy - miny);
+        if (lit < 400 || box < 1 || lit * 100 / box < 45) {
+            fprintf(stderr, "c view lit %d box %d\n", lit, box);
+            return 1;
+        }
+        {
+            int nt = 0;
+            char buf[24];
+            FILE *fp;
+            if (openscan_live_write(L, "/tmp/os-fmt.stl", &nt) != 0 || nt < 400) return 1;
+            if (openscan_live_write(L, "/tmp/os-fmt.obj", &nt) != 0) return 1;
+            if (openscan_live_write(L, "/tmp/os-fmt.ply", &nt) != 0) return 1;
+            if (openscan_live_write(L, "/tmp/os-fmt.xyz", &nt) == 0) return 1;
+            fp = fopen("/tmp/os-fmt.obj", "r");
+            if (!fp || !fgets(buf, sizeof buf, fp) || strncmp(buf, "# openscan", 10) != 0) {
+                if (fp) fclose(fp);
+                return 1;
+            }
+            fclose(fp);
+            fp = fopen("/tmp/os-fmt.ply", "r");
+            if (!fp || !fgets(buf, sizeof buf, fp) || strncmp(buf, "ply", 3) != 0) {
+                if (fp) fclose(fp);
+                return 1;
+            }
+            fclose(fp);
+            fp = fopen("/tmp/os-fmt.stl", "rb");
+            if (!fp || fread(buf, 1, 13, fp) != 13 || memcmp(buf, "openscan mesh", 13) != 0) {
+                if (fp) fclose(fp);
+                return 1;
+            }
+            fclose(fp);
+            remove("/tmp/os-fmt.stl");
+            remove("/tmp/os-fmt.obj");
+            remove("/tmp/os-fmt.ply");
+        }
+    }
     int n0 = st.points;
     float y0 = L->turn.yaw;
     if (openscan_live_push(L, g, g, 320, 240, &st) != 0 || st.points > n0 + 40 || os_fabs(L->turn.yaw - y0) > 1e-4f) {
@@ -729,6 +1118,41 @@ int openscan_turn_self_test(void) {
     }
     fprintf(stderr, "c mold: front %d tris %d°, turn yaw %.1f° tris %d\n",
             n0, 160, L->turn.yaw * 180.f / 3.14159265f, st.points);
+    openscan_live *R = openscan_live_create(&cal, NULL);
+    if (!R) return 1;
+    R->build.flip = 0;
+    R->build.sweep_deg = 80;
+    openscan_live_set_mode(R, OPENSCAN_MODE_SCAN);
+    uint8_t *base = calloc(320 * 240, 1);
+    uint8_t *spin = calloc(320 * 240, 1);
+    if (!base || !spin) return 1;
+    for (int y = 40; y < 200; y++) {
+        for (int x = 70; x < 250; x++) {
+            float nx = (x - 160) / 80.f, ny = (y - 120) / 70.f;
+            if (nx * nx + ny * ny < 1.f) base[y * 320 + x] = 180;
+        }
+    }
+    if (openscan_live_push(R, base, base, 320, 240, &st) != 0 || st.points < 400) return 1;
+    int nr = st.points;
+    for (int y = 40; y < 200; y++) {
+        int shift = y < 120 ? 18 : -18;
+        for (int x = 70; x < 250; x++) {
+            float nx = (x - 160) / 80.f, ny = (y - 120) / 70.f;
+            if (nx * nx + ny * ny >= 1.f) continue;
+            int xx = x + shift;
+            if (xx >= 0 && xx < 320) spin[y * 320 + xx] = 180;
+        }
+    }
+    if (openscan_live_push(R, spin, spin, 320, 240, &st) != 0 ||
+        os_fabs(R->turn.yaw) < 2.f * 3.14159265f / 180.f || st.points < nr) {
+        fprintf(stderr, "c mold: spin not tracked yaw %.3f tris %d -> %d\n",
+                R->turn.yaw, nr, st.points);
+        return 1;
+    }
+    fprintf(stderr, "c mold: spin yaw %.1f° tris %d\n", R->turn.yaw * 180.f / 3.14159265f, st.points);
+    free(base);
+    free(spin);
+    openscan_live_destroy(R);
     free(g);
     free(s);
     openscan_live_destroy(L);

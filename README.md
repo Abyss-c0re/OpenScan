@@ -1,6 +1,6 @@
 # OpenScan
 
-![OpenScan 0.6.14, a scan of a small plush](docs/screenshot.png)
+![OpenScan, mold of a small plush: camera, 3D view, and the side cameras](docs/screenshot.png)
 
 OpenScan 0.6.14 is a personal scanner tool. It was vibe-coded for one job. It is not actively maintained, and it is not a product.
 
@@ -8,9 +8,9 @@ Use your own assistant and tailor the code to what you need.
 
 ## What it does, and what it does not
 
-Mold wraps the camera outline into a solid. With Mold sweep at 60, a front view covers 120° of that solid. At 80 it covers 160°. Mold relief turns the photo into bumps on that shape. Measured tries to build a sheet from the projector stripes. That sheet is rough.
+Mold wraps the camera outline into a solid. With Mold sweep at 60, a front view covers 120° of that solid. At 80 it covers 160°. Mold relief turns the photo into bumps on that shape. Measured keeps that outline as a flat sheet.
 
-Turning the object does not reliably finish a full circle. The degree dial has claimed a partial arc while the object went all the way around. Expect to fix that yourself if you need it.
+The window shows the clean camera, the 3D solid, the pattern camera, the clean camera again, and a side view. Export writes STL, OBJ, and PLY. A still picture does not add another shell. A turn is taken from the top of the outline, so a centered spin of a round object can still be missed. A full circle is not guaranteed.
 
 One USB camera pair was used. Other scanners are untested. There is no factory calibration in this tree. You bring `calib/<serial>.txt` for your own unit.
 
@@ -82,14 +82,13 @@ cmake -S . -B build
 cmake --build build
 ```
 
-The program is `build/openscan`.
+The program is `build/openscan`. The engine is `build/libopenscan.a`. A program that wants the scanner without the window includes `openscan/openscan.h` and links that library.
 
 ```bash
-./build/openscan mesh-test
+./build/openscan help
 ./build/openscan devices
+./build/openscan turn-test
 ```
-
-`turn-test` checks the mold sweep and that a shifted outline adds to the solid. `devices` prints the connected cameras.
 
 ### Small package
 
@@ -130,7 +129,7 @@ Plug in the Fox and start:
 ./build/openscan
 ```
 
-The window opens idle. Start begins the mold. Stop holds it. Reset clears it. `q` or Esc quits. On quit, a model is written to `openscan-last.stl` in the current directory.
+The window opens idle. The settings row is exposure, gain, distance, near, far, stride, smooth, mold sweep, and mold relief, plus Mold, Measured, Auto calibrate, and Export. Under that, the camera is on the left, the 3D view is in the middle, and stereo A, stereo B, and the side view are on the right. Drag the 3D view to turn it. Start begins the mold. Stop holds it. Reset clears it. `q` or Esc quits. On quit, the model is written as `openscan-last.stl`, `openscan-last.obj`, and `openscan-last.ply`.
 
 Turn the object. The status line shows triangle count and degrees. A front view covers twice the mold sweep (160° at the default of 80). A real turn adds to that when the outline moves.
 
@@ -139,15 +138,17 @@ Closing the window quits.
 ### Command line
 
 ```text
-openscan
-openscan devices
-openscan grab -o DIR [--exposure-a N --exposure-b N --gain-a N --gain-b N]
-openscan scan --no-window -o FILE.stl --seconds N
+openscan                         window
+openscan devices                 the camera pair
+openscan grab -o DIR             camA.pgm and camB.pgm
+openscan scan -o object.stl --seconds 8
 openscan turn-test
-openscan mesh-test
+openscan help
 ```
 
-`scan --no-window` writes an STL. Without `--no-window`, `scan` opens the window.
+`scan` records without a window. `--shape mold` is the solid. `--shape measured` is the sheet. `--distance` is 100–500 mm. `--sweep 80` covers 160° of the object from the front. Exposure flags are `--exposure-a`, `--gain-a`, `--exposure-b`, and `--gain-b`.
+
+Export in the window saves `openscan-last.stl`, `openscan-last.obj`, and `openscan-last.ply` in the directory you started the program from, and leaves that path on the status line. `scan -o` uses the suffix the same way: `.stl`, `.obj`, or `.ply`.
 
 Exposure is the UVC absolute exposure in units of 100 microseconds. If the camera API cannot turn manual exposure off, the status line says the sliders were not applied and the camera stays on auto. Gain is 0..100, the value written to the camera. Android's camera API uses that same number when the sensor's ISO range covers 0..100. Otherwise 0 is the bottom of that range and 100 is the top. A useful starting point on this Fox is camera A exposure 22 gain 6, camera B exposure 16 gain 4.
 
@@ -157,10 +158,9 @@ Each scanner has its own calibration file, `calib/<serial>.txt`. The serial is r
 
 Search order:
 
-1. A path passed with `--calib`
-2. `calib/<serial>.txt` in the current directory
-3. `calib/<serial>.txt` next to the sources
-4. `$XDG_DATA_HOME/openscan/calib/<serial>.txt`, or `~/.local/share/openscan/calib/<serial>.txt`
+1. `calib/<serial>.txt` in the current directory
+2. `calib/<serial>.txt` next to the sources
+3. `$XDG_DATA_HOME/openscan/calib/<serial>.txt`, or `~/.local/share/openscan/calib/<serial>.txt`
 
 A vendor lookup runs only when you set `OPENSCAN_CALIB_SIGN` or `calib/sign.local` yourself. That key is not in the source tree. If it is unset, OpenScan stops and you place the file yourself. A calibration file is never uploaded.
 

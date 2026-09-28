@@ -105,8 +105,9 @@ float os_turn_step(os_turn *t, float dx, float radius, int scanning, int *fuse) 
         t->sign = sgn;
     }
     t->carry += raw;
-    float gate = 0.4f * OS_PI / 180.f;
-    int big = adx >= 1.5f;
+    /* A couple of pixels is camera noise. That must not lay another shell. */
+    float gate = 2.f * OS_PI / 180.f;
+    int big = adx >= 6.f;
     if (!big && (t->agree < 3 || os_fabs(t->carry) < gate)) return 0.f;
     float applied = t->carry;
     if (applied > 0.35f) applied = 0.35f;
@@ -161,7 +162,12 @@ int os_logic_self_test(void) {
         os_turn_step(&slow, 1.2f, 124.f, 1, &fuse);
         fused += fuse;
     }
-    if (fused != 1 || os_fabs(slow.yaw) < 0.4f * OS_PI / 180.f) return 15;
+    if (fused != 0 || slow.yaw != 0.f) return 15;
+    for (int i = 0; i < 3; i++) {
+        os_turn_step(&slow, 4.f, 124.f, 1, &fuse);
+        fused += fuse;
+    }
+    if (fused != 1 || os_fabs(slow.yaw) < 2.f * OS_PI / 180.f) return 15;
 
     if (os_scanned_deg(80, 0.f, 0, 100) != 160) return 16;
     if (os_scanned_deg(80, 4.f, 0, 100) < 220) return 17;

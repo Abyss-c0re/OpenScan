@@ -327,6 +327,8 @@ void openscan_live_get_build(const openscan_live *live, openscan_build *build);
 int openscan_live_points(const openscan_live *live);
 
 void openscan_live_mouse(openscan_live *live, int event, int x, int y, int flags);
+/* Drag on the 3D picture. Yaw and pitch are radians added to the view. */
+void openscan_live_orbit(openscan_live *live, float dyaw, float dpitch);
 /* S saves, Space toggles scan/pause, Q or Esc closes. */
 void openscan_live_key(openscan_live *live, int key);
 
@@ -335,9 +337,11 @@ int openscan_live_take_save(openscan_live *live);
 /* Close button, Q, or Esc. The window must exit and stay closed. */
 int openscan_live_quit(const openscan_live *live);
 
-/* Marching-cubes the fused model and write a binary STL in millimetres.
+/* Write the solid in millimetres. The suffix picks the file:
+ * .stl binary, .obj, or ASCII .ply. No suffix is STL.
+ * Geometry only: no serial and no calibration text.
  * Camera frame of the first fused view: X right, Y down, Z forward. */
-int openscan_live_write(openscan_live *live, const char *stl_path, int *triangles_out);
+int openscan_live_write(openscan_live *live, const char *path, int *triangles_out);
 
 /* Analytic sphere. Returns 0 when the mesher is producing a closed shell. */
 int openscan_mesh_self_test(void);

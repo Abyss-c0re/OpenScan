@@ -7,10 +7,11 @@ Personal tool, not a maintained product. Tested on one handheld scanner. Bring y
 ## A scan
 
 1. Plug in the scanner. `./build/openscan devices` prints the serial and the two camera paths when both names belong to one unit.
-2. Start `./build/openscan`.
-3. Press **Start**. Turn the object. The status line shows triangle count and degrees.
-4. Press **Stop** to hold the model. **Reset** drops it.
-5. Quit with `q` or Esc. A model is written to `openscan-last.stl` in the current directory.
+2. Start `./build/openscan`. The window has the settings row, the camera on the left, the 3D view in the middle, and stereo A, stereo B, and the side view on the right.
+3. Drag a slider to set exposure, gain, distance, near, far, stride, smooth, mold sweep, or mold relief. **Mold** and **Measured** switch the solid. **Auto calibrate** picks an exposure. Drag the 3D view to turn it.
+4. Press **Start**. Turn the object. The status line shows triangle count and degrees.
+5. Press **Stop** to hold the model. **Pause** holds it and keeps the turn. **Reset** drops it. **Export** writes `openscan-last.stl`.
+6. Quit with `q` or Esc. A model is written to `openscan-last.stl` in the current directory.
 
 A front view covers twice the mold sweep. The default sweep is 80, so that front shell is 160° of the object. A later turn is added when the outline moves.
 
@@ -18,16 +19,16 @@ A front view covers twice the mold sweep. The default sweep is 80, so that front
 
 ```text
 openscan
+openscan help
 openscan devices
-openscan grab -o DIR [--exposure-a N --exposure-b N --gain-a N --gain-b N]
-openscan scan --no-window -o FILE.stl --seconds N
+openscan grab -o DIR
+openscan scan -o FILE.stl --seconds N --shape mold --distance 220 --sweep 80
 openscan turn-test
-openscan mesh-test
 ```
 
 Exposure is in units of 100 microseconds. Gain is 0..100. A useful starting point on the scanner used here is camera A exposure 22 gain 6, and camera B exposure 16 gain 4.
 
-`scan --no-window` writes an STL for the number of seconds you pass.
+`scan -o` writes `.stl`, `.obj`, or `.ply` from the file name. The window's Export button writes all three as `openscan-last` in the current directory and shows that path.
 
 ## Calibration
 

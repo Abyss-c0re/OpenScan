@@ -24,10 +24,14 @@ static LRESULT CALLBACK os_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         s->quit = 1;
         return 0;
     }
-    if (msg == WM_LBUTTONDOWN) {
+    if (msg == WM_LBUTTONDOWN || msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP) {
+        if (msg == WM_MOUSEMOVE && !(wp & MK_LBUTTON) && !s->hit) 
+            return DefWindowProcA(hwnd, msg, wp, lp);
         s->mx = (short)LOWORD(lp);
         s->my = (short)HIWORD(lp);
-        s->hit = 1;
+        s->hit = msg == WM_LBUTTONUP ? 2 : 1;
+        if (msg == WM_LBUTTONDOWN) SetCapture(hwnd);
+        if (msg == WM_LBUTTONUP) ReleaseCapture();
         return 0;
     }
     if (msg == WM_KEYDOWN) {
@@ -76,11 +80,12 @@ void os_surf_close(os_surf *s) {
     free(s);
 }
 
-int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit) {
+int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit, int *held) {
     if (mx) *mx = -1;
     if (my) *my = -1;
     if (key) *key = 0;
     if (quit) *quit = 0;
+    if (held) *held = 0;
     if (!s) return 0;
     MSG msg;
     if (!PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -93,6 +98,7 @@ int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit) {
     if (s->hit) {
         if (mx) *mx = s->mx;
         if (my) *my = s->my;
+        if (held) *held = s->hit == 2 ? 0 : 1;
         s->hit = 0;
     }
     if (s->key) {

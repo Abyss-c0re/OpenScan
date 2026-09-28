@@ -30,7 +30,8 @@ os_surf *os_surf_open(int w, int h) {
     s->win = XCreateSimpleWindow(dpy, RootWindow(dpy, s->screen), 40, 40, (unsigned)w, (unsigned)h, 0,
                                  BlackPixel(dpy, s->screen), 0x12141a);
     XStoreName(dpy, s->win, "OpenScan");
-    XSelectInput(dpy, s->win, ExposureMask | ButtonPressMask | KeyPressMask | StructureNotifyMask);
+    XSelectInput(dpy, s->win, ExposureMask | ButtonPressMask | ButtonReleaseMask |
+                 ButtonMotionMask | KeyPressMask | StructureNotifyMask);
     Atom wm = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, s->win, &wm, 1);
     XMapWindow(dpy, s->win);
@@ -47,11 +48,12 @@ void os_surf_close(os_surf *s) {
     free(s);
 }
 
-int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit) {
+int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit, int *held) {
     if (mx) *mx = -1;
     if (my) *my = -1;
     if (key) *key = 0;
     if (quit) *quit = 0;
+    if (held) *held = 0;
     if (!s || !XPending(s->dpy)) return 0;
     XEvent ev;
     XNextEvent(s->dpy, &ev);
@@ -59,9 +61,16 @@ int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit) {
         if (quit) *quit = 1;
         return 1;
     }
-    if (ev.type == ButtonPress) {
+    if (ev.type == ButtonPress || ev.type == MotionNotify) {
+        if (mx) *mx = ev.type == ButtonPress ? ev.xbutton.x : ev.xmotion.x;
+        if (my) *my = ev.type == ButtonPress ? ev.xbutton.y : ev.xmotion.y;
+        if (held) *held = 1;
+        return 1;
+    }
+    if (ev.type == ButtonRelease) {
         if (mx) *mx = ev.xbutton.x;
         if (my) *my = ev.xbutton.y;
+        if (held) *held = 0;
         return 1;
     }
     if (ev.type == KeyPress) {

@@ -17,7 +17,7 @@ struct os_surf {
         int x, y;
         unsigned rgb;
         char text[160];
-    } lab[8];
+    } lab[40];
 };
 
 @interface OSView : NSView
@@ -123,11 +123,12 @@ void os_surf_close(os_surf *s) {
     free(s);
 }
 
-int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit) {
+int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit, int *held) {
     if (mx) *mx = -1;
     if (my) *my = -1;
     if (key) *key = 0;
     if (quit) *quit = 0;
+    if (held) *held = 0;
     if (!s) return 0;
     @autoreleasepool {
         NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -138,10 +139,12 @@ int os_surf_pump(os_surf *s, int *mx, int *my, int *key, int *quit) {
             if (s->quit && quit) *quit = 1;
             return 0;
         }
-        if (ev.type == NSEventTypeLeftMouseDown) {
+        if (ev.type == NSEventTypeLeftMouseDown || ev.type == NSEventTypeLeftMouseDragged ||
+            ev.type == NSEventTypeLeftMouseUp) {
             NSPoint p = [s->view convertPoint:ev.locationInWindow fromView:nil];
             if (mx) *mx = (int)p.x;
             if (my) *my = (int)p.y;
+            if (held) *held = ev.type == NSEventTypeLeftMouseUp ? 0 : 1;
         } else if (ev.type == NSEventTypeKeyDown) {
             int ch = 0;
             if (ev.keyCode == 53) ch = 27;
@@ -192,7 +195,7 @@ void os_surf_bar(os_surf *s, int x, int y, int w, int h, unsigned rgb) {
 }
 
 void os_surf_text(os_surf *s, int x, int y, const char *text, unsigned rgb) {
-    if (!s || !text || s->nlab >= 8) return;
+    if (!s || !text || s->nlab >= 40) return;
     s->lab[s->nlab].x = x;
     s->lab[s->nlab].y = y;
     s->lab[s->nlab].rgb = rgb;
