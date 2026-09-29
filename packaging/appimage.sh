@@ -23,6 +23,24 @@ if [ -f calib/README.md ]; then
 fi
 cp packaging/openscan.desktop build/AppDir/openscan.desktop
 cp packaging/openscan.png build/AppDir/openscan.png
+cat > build/AppDir/README.txt << EOF
+OpenScan ${ver} for Linux
+
+Unpack this archive. Open a terminal in the OpenScan-${ver}-x86_64 folder and run:
+
+    ./openscan
+
+That opens the window. Plug the scanner in first. Your user must be allowed to open the cameras. On most Linux systems that is the video group.
+
+This archive does not include a calibration file. Copy yours to:
+
+    ~/.local/share/openscan/calib/
+
+Name the file with the scanner serial and .txt, for example SERIAL.txt.
+
+    ./openscan help
+    ./openscan devices
+EOF
 
 skip_lib() {
     case $(basename "$1") in
@@ -62,16 +80,19 @@ while [ "$new" -eq 1 ] && [ "$pass" -lt 6 ]; do
     done
 done
 
-cat > build/AppDir/AppRun << 'EOF'
+cat > build/AppDir/openscan << 'EOF'
 #!/bin/sh
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 export LD_LIBRARY_PATH="$here/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$here/usr/bin/openscan" "$@"
 EOF
-chmod +x build/AppDir/AppRun
+cp build/AppDir/openscan build/AppDir/AppRun
+chmod +x build/AppDir/openscan build/AppDir/AppRun
 
-mkdir -p dist
+mkdir -p dist build/pack
+rm -rf "build/pack/OpenScan-${ver}-x86_64"
+cp -a build/AppDir "build/pack/OpenScan-${ver}-x86_64"
 out="$root/dist/OpenScan-${ver}-x86_64.tar.gz"
-tar -C build/AppDir -czf "$out" .
+tar -C build/pack -czf "$out" "OpenScan-${ver}-x86_64"
 echo "$out"
 du -h "$out" | awk '{print $1}'

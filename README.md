@@ -98,7 +98,7 @@ The program is `build/openscan`. The engine is `build/libopenscan.a`. A program 
 ./packaging/appimage.sh
 ```
 
-That writes `dist/OpenScan-<version>-x86_64.tar.gz`: the binary, libX11, libjpeg, and the few libraries those two need.
+That writes `dist/OpenScan-<version>-x86_64.tar.gz`. Unpacking it creates one folder. Open a terminal there and run `./openscan`. The folder also contains `README.txt` with those steps. `AppRun` starts the same program.
 
 ### Android APK
 

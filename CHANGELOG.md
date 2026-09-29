@@ -10,5 +10,6 @@ OpenScan is a small C program for one handheld scanner. It is a personal tool, n
 - No factory calibration is included. Bring your own `calib/<serial>.txt`.
 - The window has the settings row, the camera, the 3D view, and the side cameras.
 - Export opens the system save dialog. The file name chooses STL, OBJ, or ASCII PLY. Quit still writes `openscan-last.stl`, `.obj`, and `.ply`. `scan -o` follows the file suffix.
+- The Linux archive unpacks to one folder. `./openscan` opens the window. `README.txt` in that folder says so.
 - The engine is `libopenscan`. Include `openscan/openscan.h`.
 - A still frame does not add a second shell. A turn uses the top of the outline.
