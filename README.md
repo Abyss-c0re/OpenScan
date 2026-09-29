@@ -6,6 +6,43 @@ OpenScan 0.6.14 is a personal scanner tool. It was vibe-coded for one job. It is
 
 Use your own assistant and tailor the code to what you need.
 
+## Run a download
+
+Each download is one file.
+
+**Linux.** In the folder where you saved `OpenScan-0.6.14-linux-x86_64`:
+
+```bash
+chmod +x OpenScan-0.6.14-linux-x86_64
+./OpenScan-0.6.14-linux-x86_64
+```
+
+The window opens. Plug the scanner in first. Your user must be in the `video` group so the cameras can open. A normal desktop already has the X11 library this file uses.
+
+The AppImage is the same program:
+
+```bash
+chmod +x OpenScan-0.6.14-x86_64.AppImage
+./OpenScan-0.6.14-x86_64.AppImage
+```
+
+If Linux cannot mount the AppImage, add `--appimage-extract-and-run` before any command.
+
+**Windows.** Open `OpenScan-0.6.14-windows-x86_64.exe`.
+
+**Android.** Install `OpenScan-0.6.14.apk`. Android warns that the file is signed with a debug key. That warning is expected.
+
+There is no macOS file.
+
+The download does not include a calibration file. Copy yours to `~/.local/share/openscan/calib/` and name it with the scanner serial and `.txt`, for example `SERIAL.txt`.
+
+```bash
+./OpenScan-0.6.14-linux-x86_64 help
+./OpenScan-0.6.14-linux-x86_64 devices
+```
+
+`help` lists the commands. `devices` prints the cameras.
+
 ## What it does, and what it does not
 
 Mold wraps the camera outline into a solid. With Mold sweep at 60, a front view covers 120° of that solid. At 80 it covers 160°. Mold relief turns the photo into bumps on that shape. Measured keeps that outline as a flat sheet.
@@ -63,7 +100,7 @@ cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=packaging/mingw-w64.cmake
 cmake --build build-win
 ```
 
-On Windows itself, the same `cmake -S . -B build` with MinGW or MSVC. macOS uses the same command and links Cocoa and AVFoundation. `openscan --version` prints the host (`linux`, `windows`, or `mac`).
+On Windows itself, the same `cmake -S . -B build` with MinGW or MSVC. macOS uses the same command and links Cocoa and AVFoundation. `openscan --version` prints the host (`linux`, `windows`, or `mac`). The Windows download is `build-win/openscan.exe`, published as `OpenScan-<version>-windows-x86_64.exe`.
 
 ### What is not required
 
@@ -90,15 +127,20 @@ The program is `build/openscan`. The engine is `build/libopenscan.a`. A program 
 ./build/openscan turn-test
 ```
 
-### Small package
+### Linux download
 
-`build/openscan` is the program. Camera access still needs the `video` group.
+`build/openscan` is the program you just built. Camera access still needs the `video` group.
 
 ```bash
 ./packaging/appimage.sh
 ```
 
-That writes `dist/OpenScan-<version>-x86_64.tar.gz`. Unpacking it creates one folder. Open a terminal there and run `./openscan`. The folder also contains `README.txt` with those steps. `AppRun` starts the same program.
+That writes two files in `dist/`:
+
+- `OpenScan-<version>-linux-x86_64` is one program. `chmod +x` it and run it. When `libjpeg.a` is installed, or `OPENSCAN_LIBJPEG_A` points at that archive, JPEG is built into the file and it needs `libX11` only. Otherwise it also needs `libjpeg.so.8`.
+- `OpenScan-<version>-x86_64.AppImage` is the same program with its libraries packed in, apart from the C library. This step needs `appimagetool` on `PATH`, or `APPIMAGETOOL` set to that program.
+
+Neither file contains a calibration.
 
 ### Android APK
 
@@ -164,7 +206,7 @@ Search order:
 
 A vendor lookup runs only when you set `OPENSCAN_CALIB_SIGN` or `calib/sign.local` yourself. That key is not in the source tree. If it is unset, OpenScan stops and you place the file yourself. A calibration file is never uploaded.
 
-Both camera names have to carry the same serial. A mixed pair is not opened, and a factory file is used only when its DevID is that serial. A path passed with `--calib` is loaded as given.
+Both camera names have to carry the same serial. A mixed pair is not opened, and a factory file is used only when its DevID is that serial.
 
 Android reads the serial from the same `KYT Camera A/B` name and keeps the pair only when both names have that serial. When that name is hidden, it reads the USB serial on the same two cameras and still requires both. It uses the file already stored for that serial, then a shipped asset of that name, then the same two servers. A connected unit is not scanned with a different serial's file. If Android blocks those video devices, the camera API is used only when both Fox USB cameras share the loaded serial. A camera id that names a Fox video node is that camera, even if another camera is also connected. That named pair uses camera A as the pattern camera unless Swap is on. The button reads Swapped while that exchange is on, including the next time the app opens. Opaque ids are used only when they are the only pair and no other USB camera is plugged in, and those still choose the pattern by which picture has more contrast, then Swap. The camera API streams only at the calibration size. A different size is not stretched over the factory intrinsics. Frames must already be that size. A different picture is not scaled. Both images are required. One image is not scanned. A loaded pair is measured only after a scanner's calibration is loaded, and the status line names that serial. The shipped file is not used to measure pictures while no scanner has been seen. A device that streams isochronous video without the video class still counts as another camera. With no Fox plugged in, other cameras stay closed.
 

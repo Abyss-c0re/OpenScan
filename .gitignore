@@ -19,4 +19,3 @@ android/build/
 # Per-scanner files. Never commit a factory calibration or a lookup key.
 calib/*.txt
 calib/sign.local
-New Folder/

@@ -4,10 +4,25 @@ OpenScan scans one object. The window starts idle so you can frame it before any
 
 Personal tool, not a maintained product. Tested on one handheld scanner. Bring your own calibration file. None is shipped.
 
+## Download
+
+The release is one file per system. On Linux, mark it executable and run it:
+
+```bash
+chmod +x OpenScan-0.6.14-linux-x86_64
+./OpenScan-0.6.14-linux-x86_64
+```
+
+`OpenScan-0.6.14-x86_64.AppImage` runs the same way. If Linux cannot mount it, add `--appimage-extract-and-run`. On Windows, open `OpenScan-0.6.14-windows-x86_64.exe`. On Android, install `OpenScan-0.6.14.apk`.
+
+Plug the scanner in first. On Linux your user must be in the `video` group. Copy your calibration to `~/.local/share/openscan/calib/<serial>.txt`. The download does not include that file.
+
+Built from source, the same program is `./build/openscan`.
+
 ## A scan
 
-1. Plug in the scanner. `./build/openscan devices` prints the serial and the two camera paths when both names belong to one unit.
-2. Start `./build/openscan`. The window has the settings row, the camera on the left, the 3D view in the middle, and stereo A, stereo B, and the side view on the right.
+1. Plug in the scanner. `openscan devices` prints the serial and the two camera paths when both names belong to one unit. From a source build that command is `./build/openscan devices`.
+2. Start the program. The window has the settings row, the camera on the left, the 3D view in the middle, and stereo A, stereo B, and the side view on the right.
 3. Drag a slider to set exposure, gain, distance, near, far, stride, smooth, mold sweep, or mold relief. **Mold** and **Measured** switch the solid. **Auto calibrate** picks an exposure. Drag the 3D view to turn it.
 4. Press **Start**. Turn the object. The status line shows triangle count and degrees.
 5. Press **Stop** to hold the model. **Pause** holds it and keeps the turn. **Reset** drops it. **Export** opens the system save dialog. The file name's ending chooses STL, OBJ, or PLY.

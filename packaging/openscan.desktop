@@ -2,7 +2,7 @@
 Type=Application
 Name=OpenScan
 GenericName=3D scanner
-Comment=Scan with a 3DMakerpro handheld scanner. Tested on the Fox.
+Comment=Personal scanner for a USB camera pair.
 Exec=openscan
 Icon=openscan
 Terminal=false
