@@ -37,7 +37,9 @@ public final class OpenScanPrefs {
         solid = p.getBoolean("solid", true);
         flip = p.getBoolean("flip", true);
         int sh = p.getInt("shape", Engine.SHAPE_MOLD);
-        shape = sh == Engine.SHAPE_MEASURED ? Engine.SHAPE_MEASURED : Engine.SHAPE_MOLD;
+        if (sh == Engine.SHAPE_MEASURED) shape = Engine.SHAPE_MEASURED;
+        else if (sh == Engine.SHAPE_CLOUD) shape = Engine.SHAPE_CLOUD;
+        else shape = Engine.SHAPE_MOLD;
     }
 
     public static SharedPreferences store(Context context) {

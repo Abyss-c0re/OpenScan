@@ -2,9 +2,11 @@ package dev.lab.openscan;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
@@ -84,6 +86,7 @@ public class MainActivity extends Activity {
     private ImageView sideView;
     private Button moldBtn;
     private Button measuredBtn;
+    private Button cloudBtn;
     private Button scanBtn;
     private Button swapBtn;
     private int orbitX = 120;
@@ -110,12 +113,14 @@ public class MainActivity extends Activity {
     private volatile String cameraNote = "";
     private volatile boolean alive = true;
     private boolean pushed;
+    /** Depth samples from the last push. A live surface must not be shortened away. */
+    private volatile int lastValid;
     private boolean usbRegistered;
     private boolean resumed;
     private boolean usbDenied;
     private boolean usbAskPending;
     private int calibEpoch;
-    private final int[] scanStatus = new int[9];
+    private final int[] scanStatus = new int[10];
     private final Object framesLock = new Object();
     private final Object engineLock = new Object();
     private final Object camLock = new Object();
@@ -134,6 +139,14 @@ public class MainActivity extends Activity {
     private final List<LiveCam> liveCams = new ArrayList<>();
     /** Bumped when exposure or gain is saved, so an open scanner picks it up. */
     private volatile int exposureGen;
+    /** Format chosen before DocumentsUI. The file name can still override it. */
+    private String exportExt = "stl";
+    private final Object rescueLock = new Object();
+    private long lastRescueNs;
+    private volatile long expHoldUntilNs;
+    private volatile boolean rescuePush;
+    private volatile int patternCols = -1;
+    private volatile int patternEa = -1;
     private volatile boolean scannerRun;
     private Thread scannerThread;
     private String scannerPathA;
@@ -181,6 +194,7 @@ public class MainActivity extends Activity {
         sideView = findViewById(R.id.sideView);
         moldBtn = findViewById(R.id.mold);
         measuredBtn = findViewById(R.id.measured);
+        cloudBtn = findViewById(R.id.cloud);
         scanBtn = findViewById(R.id.scan);
         swapBtn = findViewById(R.id.swap);
         for (ImageView card : new ImageView[]{cameraView, modelView, camAView, camBView, sideView}) {
@@ -197,6 +211,7 @@ public class MainActivity extends Activity {
         applyPrefs();
         moldBtn.setOnClickListener(v -> chooseShape(Engine.SHAPE_MOLD));
         measuredBtn.setOnClickListener(v -> chooseShape(Engine.SHAPE_MEASURED));
+        cloudBtn.setOnClickListener(v -> chooseShape(Engine.SHAPE_CLOUD));
         scanBtn.setOnClickListener(v -> mode(scanMode == Engine.MODE_SCAN ? Engine.MODE_PAUSE : Engine.MODE_SCAN));
         findViewById(R.id.stop).setOnClickListener(v -> mode(Engine.MODE_STOP));
         findViewById(R.id.reset).setOnClickListener(v -> reset());
@@ -542,13 +557,16 @@ public class MainActivity extends Activity {
                     Toast.makeText(this, "Nothing to export yet. Start a scan first.", Toast.LENGTH_LONG).show();
                     return;
                 }
-                String modeName = shape == Engine.SHAPE_MEASURED ? "measured" : "mold";
-                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType("application/octet-stream");
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                intent.putExtra(Intent.EXTRA_TITLE, "openscan-" + modeName + ".stl");
-                startActivityForResult(intent, REQ_EXPORT);
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Export")
+                        .setItems(new String[]{"STL", "OBJ", "PLY"}, new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface dialog, int which) {
+                                exportExt = which == 1 ? "obj" : which == 2 ? "ply" : "stl";
+                                openExportDocument();
+                            }
+                        })
+                        .show();
             });
         });
     }
@@ -639,11 +657,26 @@ public class MainActivity extends Activity {
         });
     }
 
-    private static String exportTempName(String display) {
-        if (display == null) return "export.stl";
-        String lower = display.toLowerCase(java.util.Locale.US);
-        if (lower.endsWith(".obj")) return "export.obj";
-        if (lower.endsWith(".ply")) return "export.ply";
+    private void openExportDocument() {
+        String modeName = shape == Engine.SHAPE_MEASURED ? "measured"
+                : shape == Engine.SHAPE_CLOUD ? "cloud" : "mold";
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/octet-stream");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        intent.putExtra(Intent.EXTRA_TITLE, "openscan-" + modeName + "." + exportExt);
+        startActivityForResult(intent, REQ_EXPORT);
+    }
+
+    private String exportTempName(String display) {
+        if (display != null) {
+            String lower = display.toLowerCase(java.util.Locale.US);
+            if (lower.endsWith(".obj")) return "export.obj";
+            if (lower.endsWith(".ply")) return "export.ply";
+            if (lower.endsWith(".stl")) return "export.stl";
+        }
+        if ("obj".equals(exportExt)) return "export.obj";
+        if ("ply".equals(exportExt)) return "export.ply";
         return "export.stl";
     }
 
@@ -698,6 +731,7 @@ public class MainActivity extends Activity {
         if (a.length != engine.frameW * engine.frameH || b.length != a.length) return;
         int rc = engine.push(a, b, scanStatus);
         pushed = rc == 0;
+        lastValid = rc == 0 && scanStatus.length > 2 ? scanStatus[2] : 0;
         if (rc != 0) cameraNote = "Frame size does not match the calibration.";
     }
 
@@ -711,12 +745,15 @@ public class MainActivity extends Activity {
         int deg = pushed ? scanStatus[6] : 0;
         int tracking = pushed ? scanStatus[3] : -1;
         int pts = engine.points();
+        int cloudPts = pushed ? scanStatus[2] : 0;
+        int cover = pushed ? scanStatus[7] : 0;
+        int shapes = pushed && scanStatus.length > 9 ? scanStatus[9] : 0;
         int distanceMm = OpenScanPrefs.load(this).distanceMm;
-        ui.post(() -> paint(camera, model, a, b, side, distanceMm, deg, tracking, pts));
+        ui.post(() -> paint(camera, model, a, b, side, distanceMm, deg, tracking, pts, cloudPts, cover, shapes));
     }
 
     private void paint(Bitmap camera, Bitmap model, Bitmap a, Bitmap b, Bitmap side,
-                       int distanceMm, int deg, int tracking, int pts) {
+                       int distanceMm, int deg, int tracking, int pts, int cloudPts, int cover, int shapes) {
         if (!alive) {
             recycle(camera);
             recycle(model);
@@ -730,16 +767,22 @@ public class MainActivity extends Activity {
         setPanel(camAView, a);
         setPanel(camBView, b);
         setPanel(sideView, side);
-        modeChip.setText(shape == Engine.SHAPE_MEASURED ? "Measured" : "Mold");
+        modeChip.setText(shape == Engine.SHAPE_MEASURED ? "Measured"
+                : shape == Engine.SHAPE_CLOUD ? "Cloud" : "Mold");
         distanceChip.setText(CameraRoute.distanceLabel(distanceMm));
         if (cameraNote != null && !cameraNote.isEmpty()) trackChip.setText(cameraNote);
         else if (scanMode == Engine.MODE_SCAN && tracking == 0)
-            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto,
-                    shape == Engine.SHAPE_MOLD ? "Molding  ·  tracking lost" : "Tracking lost"));
+            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto, withPattern(
+                    shape == Engine.SHAPE_MOLD ? "Molding  ·  tracking lost" : "Tracking lost")));
         else if (scanMode == Engine.MODE_SCAN && shape == Engine.SHAPE_MOLD)
-            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto, "Molding  ·  " + deg + "°  ·  " + pts + " tris"));
+            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto,
+                    withPattern("Molding  ·  " + deg + "°  ·  " + pts + " tris")));
+        else if (scanMode == Engine.MODE_SCAN && shape == Engine.SHAPE_CLOUD)
+            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto, withPattern(
+                    "Cloud  ·  " + cloudPts + " pts  ·  " + shapes + " shapes  ·  " + cover + "%  ·  "
+                            + deg + "°  ·  " + pts + " tris")));
         else if (scanMode == Engine.MODE_SCAN)
-            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto, deg + "°  ·  " + pts + " tris"));
+            trackChip.setText(CameraRoute.trackLine(exposureHeldAuto, withPattern(deg + "°  ·  " + pts + " tris")));
         else if (scanMode == Engine.MODE_PAUSE)
             trackChip.setText(CameraRoute.trackLine(exposureHeldAuto, "Paused"));
         else if (exposureHeldAuto)
@@ -750,6 +793,7 @@ public class MainActivity extends Activity {
         int on = 0xFF3D8BFD;
         moldBtn.setBackgroundTintList(ColorStateList.valueOf(shape == Engine.SHAPE_MOLD ? on : idle));
         measuredBtn.setBackgroundTintList(ColorStateList.valueOf(shape == Engine.SHAPE_MEASURED ? on : idle));
+        cloudBtn.setBackgroundTintList(ColorStateList.valueOf(shape == Engine.SHAPE_CLOUD ? on : idle));
         showSwap();
         if (scanMode == Engine.MODE_SCAN) {
             scanBtn.setText("Pause");
@@ -917,6 +961,9 @@ public class MainActivity extends Activity {
                     OpenScanPrefs now = OpenScanPrefs.load(this);
                     int held = engine.scannerExposure(cams, now.exposureA, now.gainA, now.exposureB, now.gainB);
                     setExposureAuto(CameraRoute.exposureStayedAuto(held));
+                    if (!rescuePush && seenExposure >= 0)
+                        expHoldUntilNs = System.nanoTime() + 12_000_000_000L;
+                    rescuePush = false;
                     seenExposure = gen;
                 }
                 int rc = engine.scannerGrab(cams, a, b);
@@ -932,11 +979,12 @@ public class MainActivity extends Activity {
                 }
                 misses = 0;
                 frames++;
+                boolean aIsPattern = CameraRoute.hardwareAisPattern(swapCameras);
+                maybeRescuePattern(aIsPattern ? a : b, engine.frameW);
                 byte[] ca = a.clone();
                 byte[] cb = b.clone();
                 synchronized (framesLock) {
                     fromFiles = false;
-                    boolean aIsPattern = CameraRoute.hardwareAisPattern(swapCameras);
                     patternIsFirst = aIsPattern;
                     assigned = true;
                     frameA = aIsPattern ? ca : cb;
@@ -1478,7 +1526,52 @@ public class MainActivity extends Activity {
                 frameB = patternIsFirst ? raw1 : raw0;
             }
         }
+        byte[] pattern;
+        synchronized (framesLock) { pattern = frameA; }
+        if (pattern != null) maybeRescuePattern(pattern, engine.frameW);
         postFrame();
+    }
+
+    /** Keeps camera A in the lattice window. Does not touch gain or camera B. */
+    private void maybeRescuePattern(byte[] pattern, int w) {
+        if (pattern == null || w < 32 || engine == null || calibrating || exposureHeldAuto) return;
+        if (scanMode != Engine.MODE_SCAN) return;
+        long now = System.nanoTime();
+        synchronized (rescueLock) {
+            if (now < expHoldUntilNs || now - lastRescueNs < 1_000_000_000L) return;
+        }
+        int[] meter = engine.patternMeter(pattern, w);
+        if (meter == null || meter.length < 2) return;
+        patternCols = meter[0];
+        int p50 = meter.length > 2 ? meter[2] : 0;
+        int p95 = meter.length > 3 ? meter[3] : 0;
+        OpenScanPrefs prefs = OpenScanPrefs.load(this);
+        patternEa = prefs.exposureA;
+        /* Lamp-off frames are black with a bright tail. They are not a vote,
+         * and they must not consume the one-second slot. */
+        if (p50 < 12) return;
+        synchronized (rescueLock) {
+            if (now - lastRescueNs < 1_000_000_000L) return;
+            lastRescueNs = now;
+        }
+        int next = engine.patternRescue(meter[0], meter[1], p95, prefs.exposureA);
+        if (next <= 0 || next == prefs.exposureA) return;
+        if (next < prefs.exposureA && lastValid >= 80) {
+            Log.i("openscan", "exp hold A " + prefs.exposureA + " pts " + lastValid
+                    + " cols " + meter[0] + " p95 " + p95);
+            return;
+        }
+        patternEa = next;
+        OpenScanPrefs.saveCameras(this, next, prefs.gainA, prefs.exposureB, prefs.gainB);
+        rescuePush = true;
+        exposureGen++;
+        refreshCamera2Exposure();
+        Log.i("openscan", "exp rescue A " + next + " cols " + meter[0] + " clip " + meter[1]);
+    }
+
+    private String withPattern(String body) {
+        if (patternCols < 0 || patternEa < 0) return body;
+        return body + "  ·  A " + patternEa + "  cols " + patternCols;
     }
 
     private static long contrast(byte[] y, int w) {
@@ -1591,6 +1684,7 @@ public class MainActivity extends Activity {
         byte[] y = new byte[n];
         for (int i = 0; i < n; i++) {
             int c = px[i];
+            /* Full range. Studio swing shrinks the lattice until the stripe gate drops it. */
             y[i] = (byte) ((((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 150 + (c & 255) * 29) >> 8);
         }
         return y;

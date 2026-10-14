@@ -87,6 +87,7 @@ public class SettingsActivity extends Activity {
         hint.setText("Near, Far, Stride, Smooth and Solid mesh change the points and the triangles on the next frame. "
                 + "Far stays at least 40 mm past Near. "
                 + "Sweep and Relief change the Mold solid only. Measured stays the stripe surface. "
+                + "Cloud keeps those points, tracks the object from the cluster shapes, and fills holes until the shapes mesh. "
                 + "Flip scanner turns the picture and the model together. "
                 + "Bring your own calibration file. None is shipped. "
                 + "This is an unmaintained personal tool.");

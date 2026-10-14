@@ -174,24 +174,88 @@ static int dialog_exec(char *const argv[], char *out, size_t n) {
     return got > 0 ? 0 : -1;
 }
 
+static int pick_format(char *ext, size_t n) {
+    char got[64];
+    char *kargv[] = {"kdialog", "--title", "Export format", "--radiolist", "Format",
+                     "stl", "STL", "on", "obj", "OBJ", "off", "ply", "PLY", "off", NULL};
+    char *zargv[] = {"zenity", "--list", "--radiolist", "--title=Export format",
+                     "--column=pick", "--column=Format", "--print-column=2",
+                     "TRUE", "STL", "FALSE", "OBJ", "FALSE", "PLY", NULL};
+    int rc = dialog_exec(kargv, got, sizeof got);
+    if (rc == 0) {
+        if (!strcmp(got, "stl") || !strcmp(got, "obj") || !strcmp(got, "ply")) {
+            ext[0] = got[0];
+            ext[1] = got[1];
+            ext[2] = got[2];
+            ext[3] = 0;
+            (void)n;
+            return 0;
+        }
+        return -1;
+    }
+    if (rc != -2) return -1;
+    rc = dialog_exec(zargv, got, sizeof got);
+    if (rc == -2) return -2;
+    if (rc != 0) return -1;
+    if (!strcmp(got, "OBJ") || !strcmp(got, "obj")) snprintf(ext, n, "obj");
+    else if (!strcmp(got, "PLY") || !strcmp(got, "ply")) snprintf(ext, n, "ply");
+    else snprintf(ext, n, "stl");
+    return 0;
+}
+
+static void force_ext(char *path, size_t n, const char *ext) {
+    size_t len = strlen(path);
+    int match = 0;
+    if (!ext || !ext[0] || !ext[1] || !ext[2] || ext[3]) return;
+    if (len >= 4 && path[len - 4] == '.') {
+        const char *e = path + len - 3;
+        if (!strcmp(e, "stl") || !strcmp(e, "STL") || !strcmp(e, "obj") || !strcmp(e, "OBJ") ||
+            !strcmp(e, "ply") || !strcmp(e, "PLY")) {
+            match = 1;
+            if (strcmp(e, ext) != 0) {
+                path[len - 3] = 0;
+                if (strlen(path) + 3 < n) memcpy(path + strlen(path), ext, 4);
+            }
+        }
+    }
+    if (!match && len + 4 < n) {
+        path[len] = '.';
+        path[len + 1] = ext[0];
+        path[len + 2] = ext[1];
+        path[len + 3] = ext[2];
+        path[len + 4] = 0;
+    }
+}
+
 int os_surf_save_dialog(os_surf *s, const char *suggested, char *out, size_t n) {
-    char cwd[360], suggest[512];
+    char cwd[360], suggest[512], name[256], ext[8];
     char *kargv[] = {
         "kdialog", "--title", "Export", "--getsavefilename", suggest,
         "STL (*.stl)|OBJ (*.obj)|PLY (*.ply)", NULL};
     char *zargv[] = {
         "zenity", "--file-selection", "--save", "--title=Export", "--filename", suggest,
         "--file-filter=STL | *.stl", "--file-filter=OBJ | *.obj", "--file-filter=PLY | *.ply", NULL};
-    int rc;
+    const char *base;
+    int rc, fmt;
     (void)s;
     if (!out || n < 2) return -1;
     out[0] = 0;
     if (!suggested || !suggested[0]) suggested = "openscan-last.stl";
+    fmt = pick_format(ext, sizeof ext);
+    if (fmt == -1) return -1;
+    if (fmt == -2) snprintf(ext, sizeof ext, "stl");
+    base = strrchr(suggested, '/');
+    base = base ? base + 1 : suggested;
+    snprintf(name, sizeof name, "%s", base);
+    {
+        size_t len = strlen(name);
+        if (len >= 4 && name[len - 4] == '.') name[len - 4] = 0;
+    }
     if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
-    if (suggested[0] == '/') snprintf(suggest, sizeof suggest, "%s", suggested);
-    else snprintf(suggest, sizeof suggest, "%s/%s", cwd, suggested);
+    snprintf(suggest, sizeof suggest, "%s/%s.%s", cwd, name, ext);
     rc = dialog_exec(kargv, out, n);
-    if (rc != -2) return rc;
-    rc = dialog_exec(zargv, out, n);
-    return rc == 0 ? 0 : -1;
+    if (rc == -2) rc = dialog_exec(zargv, out, n);
+    if (rc != 0) return -1;
+    force_ext(out, n, ext);
+    return out[0] ? 0 : -1;
 }

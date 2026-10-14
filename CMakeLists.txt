@@ -21,12 +21,15 @@ endif()
 # The engine. Link this from another program and include openscan/openscan.h.
 set(OPENSCAN_LIB_SRC
     src/live/os_logic.c
+    src/live/os_stripe.c
+    src/live/os_cloud.c
     src/live/os_live.c
     src/calib/openscan_calib.c
     src/calib/openscan_calib_fetch.c
     src/device/openscan_cam_name.c
     src/image/os_jpeg.c
     src/image/os_frame.c
+    src/image/os_pattern.c
 )
 set(OPENSCAN_APP_SRC
     src/main.c

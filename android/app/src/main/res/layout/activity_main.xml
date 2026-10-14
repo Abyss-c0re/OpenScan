@@ -219,6 +219,13 @@
             android:text="Measured" />
 
         <Button
+            android:id="@+id/cloud"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Cloud" />
+
+        <Button
             android:id="@+id/scan"
             style="@style/OpenScanPrimary"
             android:layout_width="0dp"

@@ -224,6 +224,7 @@ int os_surf_save_dialog(os_surf *s, const char *suggested, char *out, size_t n) 
         panel.canCreateDirectories = YES;
         panel.allowedFileTypes = @[ @"stl", @"obj", @"ply" ];
         panel.allowsOtherFileTypes = NO;
+        panel.extensionHidden = NO;
         if (name) panel.nameFieldStringValue = name;
         if (getcwd(cwd, sizeof cwd))
             panel.directoryURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:cwd]];

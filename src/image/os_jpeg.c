@@ -115,6 +115,7 @@ int os_jpeg_gray(const uint8_t *jpg, size_t n, int w, int h, uint8_t *dst) {
         jpeg_destroy_decompress(&cinfo);
         return -1;
     }
+    /* Full-range gray. Studio swing would shrink the lattice peaks. */
     cinfo.out_color_space = JCS_GRAYSCALE;
     jpeg_start_decompress(&cinfo);
     int sw = (int)cinfo.output_width, sh = (int)cinfo.output_height;

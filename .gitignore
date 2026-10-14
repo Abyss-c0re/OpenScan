@@ -1,5 +1,8 @@
 # Generated builds. The source tree stays free of these.
 build/
+build-host/
+build-ndk/
+build-apk/
 build-win/
 dist/
 android/.gradle/

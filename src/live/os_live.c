@@ -1,7 +1,11 @@
-/* Mold solid and the live session. No image library: the outline, the
- * sweep, and the picture are ordinary arrays. */
+/* Live model. Mold and cloud keep confirmed projector points. Shapes in a
+ * 3D matrix locate the turn, so a new side can join without the silhouette.
+ * Measured is the projector sheet in front of the scanner. A photograph is
+ * not wrapped around the turn axis. No image library. */
 #include "openscan/openscan_live.h"
 #include "os_logic.h"
+#include "os_stripe.h"
+#include "os_cloud.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +37,7 @@ struct openscan_live {
     unsigned shell_gen;
     int scanned_bins;
     uint8_t seen[72];
+    uint8_t seen_hold[72];
     uint8_t *preview;
     uint8_t *panel[5];
     int pw, ph;
@@ -56,6 +61,9 @@ struct openscan_live {
     int row_n;
     int have_rows;
     int fused, lost;
+    uint8_t *prev_gray;
+    int prev_gw, prev_gh, prev_ready;
+    os_cloud *cloud;
 };
 
 static int clampi(int v, int lo, int hi) {
@@ -96,7 +104,8 @@ openscan_live *openscan_live_create(const openscan_calib *calib, const openscan_
     L->ph = 520;
     L->preview = calloc((size_t)L->pw * L->ph * 3, 1);
     for (int i = 0; i < 5; i++) L->panel[i] = calloc((size_t)L->pw * L->ph * 3, 1);
-    if (!L->model || !L->cell || !L->preview) {
+    L->cloud = os_cloud_create();
+    if (!L->model || !L->cell || !L->preview || !L->cloud) {
         openscan_live_destroy(L);
         return NULL;
     }
@@ -114,6 +123,8 @@ void openscan_live_destroy(openscan_live *live) {
     free(live->zbuf);
     free(live->held_preview);
     free(live->row_mid);
+    free(live->prev_gray);
+    os_cloud_free(live->cloud);
     for (int i = 0; i < 5; i++) free(live->panel[i]);
     free(live);
 }
@@ -131,7 +142,9 @@ void openscan_live_reset(openscan_live *live) {
     live->cache_ok = 0;
     live->have_rows = 0;
     memset(live->seen, 0, sizeof live->seen);
+    memset(live->seen_hold, 0, sizeof live->seen_hold);
     memset(live->cell, 0, (size_t)live->ncell * sizeof(unsigned));
+    os_cloud_reset(live->cloud);
 }
 
 void openscan_live_set_mode(openscan_live *live, int mode) {
@@ -140,9 +153,12 @@ void openscan_live_set_mode(openscan_live *live, int mode) {
 int openscan_live_mode(const openscan_live *live) { return live ? live->mode : OPENSCAN_MODE_STOP; }
 
 void openscan_live_set_shape(openscan_live *live, int shape) {
+    int next = OPENSCAN_SHAPE_MOLD;
     if (!live) return;
-    if (live->shape != shape) openscan_live_reset(live);
-    live->shape = shape == OPENSCAN_SHAPE_MEASURED ? OPENSCAN_SHAPE_MEASURED : OPENSCAN_SHAPE_MOLD;
+    if (shape == OPENSCAN_SHAPE_MEASURED) next = OPENSCAN_SHAPE_MEASURED;
+    else if (shape == OPENSCAN_SHAPE_CLOUD) next = OPENSCAN_SHAPE_CLOUD;
+    if (live->shape != next) openscan_live_reset(live);
+    live->shape = next;
 }
 int openscan_live_shape(const openscan_live *live) {
     return live ? live->shape : OPENSCAN_SHAPE_MOLD;
@@ -361,12 +377,16 @@ static int cell_new(openscan_live *L, float x, float y, float z) {
     return 0;
 }
 
-static void mark_bin(openscan_live *L, float x, float z) {
+static int bin_of(const openscan_live *L, float x, float z) {
     float ang = os_atan2(x - L->axis_x, -(z - L->axis_z));
     int b = (int)((ang + 3.14159265f) / (2.f * 3.14159265f) * 72.f);
     if (b < 0) b = 0;
     if (b > 71) b = 71;
-    L->seen[b] = 1;
+    return b;
+}
+
+static void mark_bin(openscan_live *L, float x, float z) {
+    L->seen[bin_of(L, x, z)] = 1;
 }
 
 static int count_bins(const openscan_live *L) {
@@ -387,6 +407,8 @@ static void add_tri(openscan_live *L, const Vert *a, const Vert *b, const Vert *
     float mx = (t.a[0] + t.b[0] + t.c[0]) / 3.f;
     float my = (t.a[1] + t.b[1] + t.c[1]) / 3.f;
     float mz = (t.a[2] + t.b[2] + t.c[2]) / 3.f;
+    /* A side already kept is not drawn again as a second sheet. */
+    if (L->shape == OPENSCAN_SHAPE_MEASURED && L->seen_hold[bin_of(L, mx, mz)]) return;
     if (!cell_new(L, mx, my, mz)) return;
     t.tone = (a->tone + b->tone + c->tone) / 3.f;
     L->model[L->nmodel++] = t;
@@ -430,12 +452,15 @@ static void paint_model(uint8_t *dst, float *zbuf, int dw, int dh, const Tri *tr
     float cx = 0.5f * (minx + maxx);
     float cy = 0.5f * (miny + maxy);
     for (int i = 0; i < n; i++) {
-        float xs[3], ys[3], zs[3];
+        float xs[3], ys[3], zs[3], xm[3], ym[3], zm[3];
         const float *p[3] = {tris[i].a, tris[i].b, tris[i].c};
         for (int k = 0; k < 3; k++) {
             float x = p[k][0], y = p[k][1], z = p[k][2];
             rot_y(yaw, ax, az, &x, &z);
             rot_x(pitch, &y, &z);
+            xm[k] = x;
+            ym[k] = y;
+            zm[k] = z;
             xs[k] = dw * 0.5f + (x - cx) * scale;
             ys[k] = dh * 0.5f - (y - cy) * scale;
             zs[k] = z;
@@ -457,16 +482,30 @@ static void paint_model(uint8_t *dst, float *zbuf, int dw, int dh, const Tri *tr
             dst[id * 3] = dst[id * 3 + 1] = dst[id * 3 + 2] = 180;
             continue;
         }
-        float e1x = xs[1] - xs[0], e1y = ys[1] - ys[0], e1z = zs[1] - zs[0];
-        float e2x = xs[2] - xs[0], e2y = ys[2] - ys[0], e2z = zs[2] - zs[0];
-        float nx = e1y * e2z - e1z * e2y;
-        float ny = e1z * e2x - e1x * e2z;
-        float nz = e1x * e2y - e1y * e2x;
-        float ln = os_sqrt(nx * nx + ny * ny + nz * nz) + 1e-6f;
-        float lam = ((-0.2f * nx + 0.35f * ny - 0.9f * nz) / ln);
+        float e1x, e1y, e1z, e2x, e2y, e2z, nx, ny, nz, ln, lam;
+        if (tris[i].tone > 1.5f) {
+            e1x = xm[1] - xm[0]; e1y = ym[1] - ym[0]; e1z = zm[1] - zm[0];
+            e2x = xm[2] - xm[0]; e2y = ym[2] - ym[0]; e2z = zm[2] - zm[0];
+        } else {
+            e1x = xs[1] - xs[0]; e1y = ys[1] - ys[0]; e1z = zs[1] - zs[0];
+            e2x = xs[2] - xs[0]; e2y = ys[2] - ys[0]; e2z = zs[2] - zs[0];
+        }
+        nx = e1y * e2z - e1z * e2y;
+        ny = e1z * e2x - e1x * e2z;
+        nz = e1x * e2y - e1y * e2x;
+        if (tris[i].tone > 1.5f && nz > 0.f) {
+            nx = -nx;
+            ny = -ny;
+            nz = -nz;
+        }
+        ln = os_sqrt(nx * nx + ny * ny + nz * nz) + 1e-6f;
+        lam = ((-0.2f * nx + 0.35f * ny - 0.9f * nz) / ln);
         if (lam < 0.f) lam = 0.f;
         if (lam > 1.f) lam = 1.f;
-        int shade = (int)(255.f * (tris[i].tone * 0.82f + lam * 0.18f));
+        /* tone above 1 is a measured skin: light the shape. A photograph is not the model. */
+        int shade = tris[i].tone > 1.5f
+                        ? (int)(255.f * (0.15f + 0.85f * lam))
+                        : (int)(255.f * (tris[i].tone * 0.82f + lam * 0.18f));
         if (shade < 0) shade = 0;
         if (shade > 255) shade = 255;
         float x0 = xs[0], y0 = ys[0], x1 = xs[1], y1 = ys[1], x2 = xs[2], y2 = ys[2];
@@ -502,6 +541,62 @@ static void paint_model(uint8_t *dst, float *zbuf, int dw, int dh, const Tri *tr
             w2r += dh2;
         }
     }
+    /* Shade the measured skin from the depth of the finished picture.
+     * A 3 px triangle's own normal is the crease, not the head.
+     * The sample is wide enough that a one-millimetre stripe step is not a ditch. */
+    if (n > 0 && tris[0].tone > 1.5f) {
+        int k = 24;
+        for (int py = 0; py < dh; py++) {
+            for (int px = 0; px < dw; px++) {
+                float zc, zl, zr, zu, zd, gx, gy, nx, ny, nz, ln, lam;
+                int id = py * dw + px;
+                int xl, xr, yu, yd;
+                if (zbuf[id] > 1e8f) continue;
+                zc = zbuf[id];
+                xl = px - k;
+                xr = px + k;
+                yu = py - k;
+                yd = py + k;
+                zl = zr = zu = zd = zc;
+                if (xl >= 0 && zbuf[py * dw + xl] < 1e8f && os_fabs(zbuf[py * dw + xl] - zc) < 12.f)
+                    zl = zbuf[py * dw + xl];
+                else
+                    xl = px;
+                if (xr < dw && zbuf[py * dw + xr] < 1e8f && os_fabs(zbuf[py * dw + xr] - zc) < 12.f)
+                    zr = zbuf[py * dw + xr];
+                else
+                    xr = px;
+                if (yu >= 0 && zbuf[yu * dw + px] < 1e8f && os_fabs(zbuf[yu * dw + px] - zc) < 12.f)
+                    zu = zbuf[yu * dw + px];
+                else
+                    yu = py;
+                if (yd < dh && zbuf[yd * dw + px] < 1e8f && os_fabs(zbuf[yd * dw + px] - zc) < 12.f)
+                    zd = zbuf[yd * dw + px];
+                else
+                    yd = py;
+                gx = (xr != xl) ? (zr - zl) * scale / (float)(xr - xl) : 0.f;
+                gy = (yd != yu) ? (zd - zu) * scale / (float)(yu - yd) : 0.f;
+                nx = -gx;
+                ny = -gy;
+                nz = 1.f;
+                if (nz > 0.f) {
+                    nx = -nx;
+                    ny = -ny;
+                    nz = -nz;
+                }
+                ln = os_sqrt(nx * nx + ny * ny + nz * nz) + 1e-6f;
+                lam = ((-0.2f * nx + 0.35f * ny - 0.9f * nz) / ln);
+                if (lam < 0.f) lam = 0.f;
+                if (lam > 1.f) lam = 1.f;
+                {
+                    int shade = (int)(255.f * (0.22f + 0.78f * lam));
+                    if (shade < 0) shade = 0;
+                    if (shade > 255) shade = 255;
+                    dst[id * 3] = dst[id * 3 + 1] = dst[id * 3 + 2] = (uint8_t)shade;
+                }
+            }
+        }
+    }
     (void)ay;
 }
 
@@ -512,7 +607,8 @@ static void copy_tri(Tri *t, const Vert *a, const Vert *b, const Vert *c) {
     t->tone = (a->tone + b->tone + c->tone) / 3.f;
 }
 
-static int build_shell(openscan_live *L, const uint8_t *gray, int w, int h, int *ntri_out,
+__attribute__((unused)) static int build_shell(openscan_live *L, const uint8_t *gray, int w, int h,
+                                                      int *ntri_out,
                        Tri *preview, int preview_cap, int *preview_n, int commit) {
     uint8_t *mask = malloc((size_t)w * h);
     uint8_t *blur = malloc((size_t)w * h);
@@ -572,7 +668,6 @@ static int build_shell(openscan_live *L, const uint8_t *gray, int w, int h, int 
             v->x = (x_geom - (float)cx) * z0 / (float)fx;
             v->y = -((float)y - (float)cy) * z0 / (float)fy;
             v->z = z0 - radius * os_cos(th);
-            if (L->shape == OPENSCAN_SHAPE_MEASURED) v->z = z0;
             if (v->z < L->build.near_mm || v->z > L->build.far_mm) continue;
             float bump = ((float)gray[y * w + x] - (float)blur[y * w + x]) / 40.f;
             bump *= L->build.relief / 40.f;
@@ -598,6 +693,8 @@ static int build_shell(openscan_live *L, const uint8_t *gray, int w, int h, int 
         L->axis_z = z0;
         L->have_axis = 1;
     }
+    if (commit && L->shape == OPENSCAN_SHAPE_MEASURED)
+        memcpy(L->seen_hold, L->seen, sizeof L->seen);
     if ((commit && nok > 80 && L->build.solid) || preview) {
         for (int iy = 0; iy < gh - 1; iy++) {
             for (int ix = 0; ix < gw - 1; ix++) {
@@ -750,6 +847,445 @@ static void draw_panels(openscan_live *L, const uint8_t *clean, const uint8_t *p
     free(sb);
 }
 
+
+/* Shift of the thing that moved, in pixels. A bright static background keeps
+ * the silhouette still while the object in front of it turns. The two changed
+ * clusters are where that object was and where it is now. */
+static float motion_shift(const uint8_t *prev, const uint8_t *gray, int w, int h,
+                          int *usable, int *wide) {
+    int step = 4, samples = 0, sn = 0, nl = 0, nr = 0;
+    int l0 = w, l1 = 0, r0 = w, r1 = 0;
+    double sx = 0, sln = 0, slo = 0, srn = 0, sro = 0;
+    float mid, lc, rc, travel, left_delta, right_delta, dx;
+    int span, spanr;
+    if (usable) *usable = 0;
+    if (wide) *wide = 0;
+    if (!prev || !gray || w < 16 || h < 16) return 0.f;
+    for (int y = 0; y < h; y += step) {
+        for (int x = 0; x < w; x += step) {
+            int d = (int)gray[y * w + x] - (int)prev[y * w + x];
+            samples++;
+            if (d < 0) d = -d;
+            if (d < 28) continue;
+            sn++;
+            sx += x;
+        }
+    }
+    if (sn < 40 || samples < 1 || sn * 3 > samples) return 0.f;
+    mid = (float)(sx / sn);
+    for (int y = 0; y < h; y += step) {
+        for (int x = 0; x < w; x += step) {
+            int i = y * w + x;
+            int d = (int)gray[i] - (int)prev[i];
+            if (d < 0) d = -d;
+            if (d < 28) continue;
+            if ((float)x < mid) {
+                sln += gray[i];
+                slo += prev[i];
+                nl++;
+                if (x < l0) l0 = x;
+                if (x > l1) l1 = x;
+            } else {
+                srn += gray[i];
+                sro += prev[i];
+                nr++;
+                if (x < r0) r0 = x;
+                if (x > r1) r1 = x;
+            }
+        }
+    }
+    if (nl < 12 || nr < 12) return 0.f;
+    left_delta = (float)((sln - slo) / nl);
+    right_delta = (float)((srn - sro) / nr);
+    lc = 0.5f * (float)(l0 + l1);
+    rc = 0.5f * (float)(r0 + r1);
+    travel = rc - lc;
+    if (travel < 4.f) return 0.f;
+    if (left_delta > 8.f && right_delta < -8.f) dx = travel;
+    else if (left_delta < -8.f && right_delta > 8.f) dx = -travel;
+    else return 0.f;
+    span = l1 - l0;
+    spanr = r1 - r0;
+    if (spanr > span) span = spanr;
+    if (wide) *wide = span;
+    if (usable) *usable = 1;
+    return dx;
+}
+
+static int cell_old(const openscan_live *L, int ix, int iy, int iz) {
+    unsigned h = (unsigned)(ix * 73856093 ^ iy * 19349663 ^ iz * 83492791);
+    unsigned slot = h & (unsigned)(L->ncell - 1);
+    for (int n = 0; n < 16; n++) {
+        unsigned got = L->cell[(slot + (unsigned)n) & (unsigned)(L->ncell - 1)];
+        if (got == 0) return 0;
+        if ((got & 0xFFFFu) != (h & 0xFFFFu)) continue;
+        return (got >> 16) != 0 && (got >> 16) != L->shell_gen;
+    }
+    return 0;
+}
+
+/* cells is the search radius in 0.75 mm steps. Earlier shells count. This one does not. */
+static int depth_near(const openscan_live *L, float x, float y, float z, int cells, int stride) {
+    int ix = os_lround(x / 0.75f);
+    int iy = os_lround(y / 0.75f);
+    int iz = os_lround(z / 0.75f);
+    if (stride < 1) stride = 1;
+    for (int dz = -cells; dz <= cells; dz += stride) {
+        for (int dy = -cells; dy <= cells; dy += stride) {
+            for (int dx = -cells; dx <= cells; dx += stride) {
+                if (cell_old(L, ix + dx, iy + dy, iz + dz)) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int depth_link(const os_stripe_pt *a, const os_stripe_pt *b) {
+    float dx, dy, dz;
+    if (!a || !b || !a->ok || !b->ok) return 0;
+    dx = a->x - b->x;
+    dy = a->y - b->y;
+    dz = a->z - b->z;
+    /* Nearby samples are one skin even when the stripe index drifted. */
+    return dx * dx + dy * dy + dz * dz < 22.f * 22.f;
+}
+
+static void yaw_into(const openscan_live *L, float yaw, float *x, float *z) {
+    if (L->have_axis) rot_y(-yaw, L->axis_x, L->axis_z, x, z);
+}
+
+static int emit_depth(openscan_live *L, const os_stripe_pt *a, const os_stripe_pt *b,
+                      const os_stripe_pt *c, float yaw, int commit, int filter, Tri *preview,
+                      int preview_cap, int *preview_n) {
+    float ax = a->x, ay = a->y, az = a->z;
+    float bx = b->x, by = b->y, bz = b->z;
+    float cx = c->x, cy = c->y, cz = c->z;
+    float mx, my, mz;
+    Tri t;
+    if (!depth_link(a, b) || !depth_link(b, c) || !depth_link(a, c)) return 0;
+    t.tone = 2.f;
+    if (!commit) {
+        if (!preview || !preview_n || *preview_n >= preview_cap) return 0;
+        t.a[0] = ax; t.a[1] = ay; t.a[2] = az;
+        t.b[0] = bx; t.b[1] = by; t.b[2] = bz;
+        t.c[0] = cx; t.c[1] = cy; t.c[2] = cz;
+        preview[(*preview_n)++] = t;
+        return 1;
+    }
+    yaw_into(L, yaw, &ax, &az);
+    yaw_into(L, yaw, &bx, &bz);
+    yaw_into(L, yaw, &cx, &cz);
+    mx = (ax + bx + cx) / 3.f;
+    my = (ay + by + cy) / 3.f;
+    mz = (az + bz + cz) / 3.f;
+    if (filter) {
+        int on = depth_near(L, mx, my, mz, 6, 2);
+        int touch = on || depth_near(L, mx, my, mz, 24, 4);
+        if (on || !touch) return 0;
+    }
+    if (L->nmodel >= L->cap || !cell_new(L, mx, my, mz)) return 0;
+    t.a[0] = ax; t.a[1] = ay; t.a[2] = az;
+    t.b[0] = bx; t.b[1] = by; t.b[2] = bz;
+    t.c[0] = cx; t.c[1] = cy; t.c[2] = cz;
+    L->model[L->nmodel++] = t;
+    mark_bin(L, mx, mz);
+    return 1;
+}
+
+static const os_stripe_pt *depth_ahead(const os_stripe_pt *p, const os_stripe_cloud *c, int r) {
+    const os_stripe_pt *best = NULL;
+    float best_d = 22.f * 22.f;
+    int last = r + 8;
+    if (last > c->rows) last = c->rows;
+    for (int rr = r + 1; rr < last; rr++) {
+        const os_stripe_pt *nrow = c->pt + rr * c->cols;
+        for (int t = 0; t < c->cols; t++) {
+            float dx, dy, dz, d;
+            if (!nrow[t].ok) continue;
+            dx = p->x - nrow[t].x;
+            dy = p->y - nrow[t].y;
+            dz = p->z - nrow[t].z;
+            d = dx * dx + dy * dy + dz * dz;
+            if (d < best_d) {
+                best_d = d;
+                best = &nrow[t];
+            }
+        }
+        if (best) break;
+    }
+    return best;
+}
+
+static int mesh_cloud(openscan_live *L, const os_stripe_cloud *c, float yaw, int commit,
+                      int filter, Tri *preview, int preview_cap, int *preview_n);
+
+/* Close a missed stripe when both sides are the same surface.
+ * One ridge on this frame is about 13 px, and a single miss is about 24.
+ * 32 px joins that miss. A wider hole, such as an eye, stays open. 14 mm. */
+static int mesh_sheet(openscan_live *L, const os_stripe_cloud *c, float yaw, int commit,
+                      int filter, Tri *preview, int preview_cap, int *preview_n) {
+    enum { STEP = 3, GAP = 32 };
+    int gw, gh, r, col, i, made = 0;
+    typedef struct {
+        float x, y, z, tone;
+        int ok;
+    } Cell;
+    Cell *g;
+    if (!c || !c->pt || c->n < 80) return 0;
+    gw = 0;
+    gh = 0;
+    for (i = 0; i < c->rows * c->cols; i++) {
+        if (!c->pt[i].ok) continue;
+        if (c->pt[i].u / STEP + 1 > gw) gw = c->pt[i].u / STEP + 1;
+        if (c->pt[i].v / STEP + 1 > gh) gh = c->pt[i].v / STEP + 1;
+    }
+    if (gw < 2 || gh < 2) return mesh_cloud(L, c, yaw, commit, filter, preview, preview_cap, preview_n);
+    g = calloc((size_t)gw * (size_t)gh, sizeof(Cell));
+    if (!g) return mesh_cloud(L, c, yaw, commit, filter, preview, preview_cap, preview_n);
+    for (i = 0; i < c->rows * c->cols; i++) {
+        const os_stripe_pt *p = &c->pt[i];
+        int col, row;
+        Cell *cell;
+        if (!p->ok) continue;
+        col = p->u / STEP;
+        row = p->v / STEP;
+        if (col < 0 || row < 0 || col >= gw || row >= gh) continue;
+        cell = &g[row * gw + col];
+        if (!cell->ok) {
+            cell->x = p->x;
+            cell->y = p->y;
+            cell->z = p->z;
+            cell->tone = p->tone;
+            cell->ok = 1;
+        } else if (os_fabs(p->z - cell->z) <= 14.f) {
+            cell->x = (cell->x + p->x) * 0.5f;
+            cell->y = (cell->y + p->y) * 0.5f;
+            cell->z = (cell->z + p->z) * 0.5f;
+            cell->tone = (cell->tone + p->tone) * 0.5f;
+        }
+    }
+    for (r = 0; r < gh; r++) {
+        int prev = -1;
+        for (col = 0; col < gw; col++) {
+            Cell *cell = &g[r * gw + col];
+            if (!cell->ok) continue;
+            if (prev >= 0 && (col - prev) * STEP <= GAP) {
+                Cell *a = &g[r * gw + prev];
+                if (os_fabs(cell->z - a->z) <= 14.f) {
+                    for (int k = prev + 1; k < col; k++) {
+                        float t = (float)(k - prev) / (float)(col - prev);
+                        Cell *d = &g[r * gw + k];
+                        if (d->ok) continue;
+                        d->x = a->x + (cell->x - a->x) * t;
+                        d->y = a->y + (cell->y - a->y) * t;
+                        d->z = a->z + (cell->z - a->z) * t;
+                        d->tone = a->tone + (cell->tone - a->tone) * t;
+                        d->ok = 1;
+                    }
+                }
+            }
+            prev = col;
+        }
+    }
+    for (col = 0; col < gw; col++) {
+        int prev = -1;
+        for (r = 0; r < gh; r++) {
+            Cell *cell = &g[r * gw + col];
+            if (!cell->ok) continue;
+            if (prev >= 0 && (r - prev) * STEP <= GAP) {
+                Cell *a = &g[prev * gw + col];
+                if (os_fabs(cell->z - a->z) <= 14.f) {
+                    for (int k = prev + 1; k < r; k++) {
+                        float t = (float)(k - prev) / (float)(r - prev);
+                        Cell *d = &g[k * gw + col];
+                        if (d->ok) continue;
+                        d->x = a->x + (cell->x - a->x) * t;
+                        d->y = a->y + (cell->y - a->y) * t;
+                        d->z = a->z + (cell->z - a->z) * t;
+                        d->tone = a->tone + (cell->tone - a->tone) * t;
+                        d->ok = 1;
+                    }
+                }
+            }
+            prev = r;
+        }
+    }
+    /* A stripe a millimetre off turns a 3 px triangle into a black crease.
+     * The face itself is many times wider than that step, so the blur
+     * has to outlast the step and leave the head. */
+    {
+        float *zz = malloc((size_t)gw * (size_t)gh * sizeof(float));
+        float *tmp = malloc((size_t)gw * (size_t)gh * sizeof(float));
+        if (zz && tmp) {
+            int pass;
+            for (r = 0; r < gh; r++)
+                for (col = 0; col < gw; col++)
+                    zz[r * gw + col] = g[r * gw + col].ok ? g[r * gw + col].z : 0.f;
+            for (pass = 0; pass < 36; pass++) {
+                for (r = 0; r < gh; r++) {
+                    for (col = 0; col < gw; col++) {
+                        float s = 0.f;
+                        int m = 0, rr, cc;
+                        if (!g[r * gw + col].ok) {
+                            tmp[r * gw + col] = 0.f;
+                            continue;
+                        }
+                        for (rr = r - 1; rr <= r + 1; rr++) {
+                            if (rr < 0 || rr >= gh) continue;
+                            for (cc = col - 1; cc <= col + 1; cc++) {
+                                if (cc < 0 || cc >= gw || !g[rr * gw + cc].ok) continue;
+                                s += zz[rr * gw + cc];
+                                m++;
+                            }
+                        }
+                        tmp[r * gw + col] = m ? s / (float)m : zz[r * gw + col];
+                    }
+                }
+                for (r = 0; r < gh; r++)
+                    for (col = 0; col < gw; col++)
+                        if (g[r * gw + col].ok) zz[r * gw + col] = tmp[r * gw + col];
+            }
+            for (r = 0; r < gh; r++)
+                for (col = 0; col < gw; col++)
+                    if (g[r * gw + col].ok) g[r * gw + col].z = zz[r * gw + col];
+        }
+        free(zz);
+        free(tmp);
+    }
+    for (r = 0; r < gh - 1; r++) {
+        for (col = 0; col < gw - 1; col++) {
+            Cell *a = &g[r * gw + col];
+            Cell *b = &g[r * gw + col + 1];
+            Cell *d = &g[(r + 1) * gw + col];
+            Cell *e = &g[(r + 1) * gw + col + 1];
+            os_stripe_pt pa, pb, pd, pe;
+            if (!a->ok || !b->ok || !d->ok) continue;
+            memset(&pa, 0, sizeof pa);
+            memset(&pb, 0, sizeof pb);
+            memset(&pd, 0, sizeof pd);
+            memset(&pe, 0, sizeof pe);
+            pa.ok = pb.ok = pd.ok = pe.ok = 1;
+            pa.x = a->x; pa.y = a->y; pa.z = a->z; pa.tone = a->tone;
+            pb.x = b->x; pb.y = b->y; pb.z = b->z; pb.tone = b->tone;
+            pd.x = d->x; pd.y = d->y; pd.z = d->z; pd.tone = d->tone;
+            pe.x = e->x; pe.y = e->y; pe.z = e->z; pe.tone = e->tone;
+            made += emit_depth(L, &pa, &pb, &pd, yaw, commit, filter, preview, preview_cap, preview_n);
+            if (e->ok)
+                made += emit_depth(L, &pb, &pe, &pd, yaw, commit, filter, preview, preview_cap,
+                                   preview_n);
+        }
+    }
+    free(g);
+    return made;
+}
+
+static int mesh_cloud(openscan_live *L, const os_stripe_cloud *c, float yaw, int commit,
+                      int filter, Tri *preview, int preview_cap, int *preview_n) {
+    int made = 0;
+    if (!c || !c->pt || c->rows < 2 || c->cols < 2) return 0;
+    for (int r = 0; r < c->rows - 1; r++) {
+        const os_stripe_pt *row = c->pt + r * c->cols;
+        for (int k = 0; k < c->cols - 1; k++) {
+            const os_stripe_pt *p = &row[k];
+            const os_stripe_pt *right = &row[k + 1];
+            const os_stripe_pt *down;
+            const os_stripe_pt *downr;
+            if (!depth_link(p, right)) continue;
+            down = depth_ahead(p, c, r);
+            downr = depth_ahead(right, c, r);
+            if (down && depth_link(right, down))
+                made += emit_depth(L, p, right, down, yaw, commit, filter, preview, preview_cap,
+                                   preview_n);
+            if (down && downr && down != downr && depth_link(right, downr) && depth_link(down, downr))
+                made += emit_depth(L, right, downr, down, yaw, commit, filter, preview, preview_cap,
+                                   preview_n);
+        }
+    }
+    return made;
+}
+
+static int cloud_touches(const openscan_live *L, const os_stripe_cloud *c, float yaw) {
+    int samples = 0, hit = 0;
+    if (L->nmodel < 80) return 1;
+    for (int i = 0; i < c->rows * c->cols && samples < 240; i += 2) {
+        float x, y, z;
+        if (!c->pt[i].ok) continue;
+        x = c->pt[i].x;
+        y = c->pt[i].y;
+        z = c->pt[i].z;
+        yaw_into(L, yaw, &x, &z);
+        samples++;
+        if (depth_near(L, x, y, z, 24, 4)) hit++;
+    }
+    return samples >= 30 && hit * 4 >= samples;
+}
+
+static int rebuild_cloud(openscan_live *L) {
+    os_cloud_tri *tris;
+    int n, i, cap;
+    if (!L->cloud) return 0;
+    cap = L->cap;
+    tris = malloc(sizeof(*tris) * (size_t)cap);
+    if (!tris) return 0;
+    n = L->build.solid ? os_cloud_body(L->cloud, tris, cap) : os_cloud_specks(L->cloud, tris, cap);
+    L->nmodel = 0;
+    memset(L->seen, 0, sizeof L->seen);
+    for (i = 0; i < n; i++) {
+        Tri t;
+        float mx, my, mz;
+        t.a[0] = tris[i].a[0];
+        t.a[1] = tris[i].a[1];
+        t.a[2] = tris[i].a[2];
+        t.b[0] = tris[i].b[0];
+        t.b[1] = tris[i].b[1];
+        t.b[2] = tris[i].b[2];
+        t.c[0] = tris[i].c[0];
+        t.c[1] = tris[i].c[1];
+        t.c[2] = tris[i].c[2];
+        t.tone = 2.f;
+        L->model[L->nmodel++] = t;
+        mx = (t.a[0] + t.b[0] + t.c[0]) / 3.f;
+        my = (t.a[1] + t.b[1] + t.c[1]) / 3.f;
+        mz = (t.a[2] + t.b[2] + t.c[2]) / 3.f;
+        (void)my;
+        mark_bin(L, mx, mz);
+    }
+    L->scanned_bins = count_bins(L);
+    L->cache_ok = 0;
+    free(tris);
+    return n;
+}
+
+/* Returns triangles written, or -1 when the view does not meet the body. */
+static int commit_depth(openscan_live *L, const os_stripe_cloud *c, float yaw, int commit,
+                        Tri *preview, int preview_cap, int *preview_n) {
+    if (!c || c->n < 80) return 0;
+    if (commit && !L->have_axis) {
+        double sx = 0, sy = 0, sz = 0;
+        int n = 0;
+        for (int i = 0; i < c->rows * c->cols; i++) {
+            if (!c->pt[i].ok) continue;
+            sx += c->pt[i].x;
+            sy += c->pt[i].y;
+            sz += c->pt[i].z;
+            n++;
+        }
+        if (n < 80) return 0;
+        L->axis_x = (float)(sx / n);
+        L->axis_y = (float)(sy / n);
+        L->axis_z = (float)(sz / n);
+        L->have_axis = 1;
+    }
+    if (commit && !cloud_touches(L, c, yaw)) return -1;
+    if (commit) {
+        if (++L->shell_gen >= 65535u) {
+            memset(L->cell, 0, (size_t)L->ncell * sizeof(unsigned));
+            L->shell_gen = 1;
+        }
+    }
+    return mesh_sheet(L, c, yaw, commit, commit && L->nmodel > 80, preview, preview_cap, preview_n);
+}
+
 int openscan_live_push(openscan_live *live, const uint8_t *ya, const uint8_t *yb,
                        int width, int height, openscan_live_status *status) {
     if (status) memset(status, 0, sizeof *status);
@@ -811,52 +1347,206 @@ int openscan_live_push(openscan_live *live, const uint8_t *ya, const uint8_t *yb
     }
     float cx_top = ntop > 4 ? (float)(topx / ntop) : cx;
     int scanning = live->mode == OPENSCAN_MODE_SCAN;
+    int measured = live->shape == OPENSCAN_SHAPE_MEASURED;
+    int cloud_mode = live->shape == OPENSCAN_SHAPE_CLOUD;
     int fuse = 0;
+    float dx = 0.f;
+    float radius = wide * 0.5f;
+    if (radius < 20.f) radius = 20.f;
     if (live->have_prev && sn > 8 && live->have_rows) {
         float dx_body = cx - live->prev_cx;
         float dx_top = cx_top - live->prev_top;
-        float dx = os_fabs(dx_top) > os_fabs(dx_body) ? dx_top : dx_body;
-        float radius = wide * 0.5f;
-        os_turn_step(&live->turn, dx, radius, scanning, &fuse);
+        dx = os_fabs(dx_top) > os_fabs(dx_body) ? dx_top : dx_body;
     }
+    if (measured && live->prev_ready) {
+        int mot = 0, mw = 0;
+        float mdx = motion_shift(live->prev_gray, clean, width, height, &mot, &mw);
+        if (mot && os_fabs(mdx) > os_fabs(dx)) {
+            dx = mdx;
+            if (mw > 16) radius = mw * 0.5f;
+        }
+    }
+    float yaw0 = live->turn.yaw;
+    if (live->have_prev && sn > 8 && live->have_rows)
+        os_turn_step(&live->turn, dx, radius, scanning, &fuse);
     live->prev_cx = cx;
     live->prev_top = cx_top;
     live->have_prev = sn > 8;
     live->have_rows = live->row_mid != NULL;
     int before = live->nmodel;
-    int added = 0;
     int nok = 0;
     int commit = scanning && (before == 0 || fuse);
+    int cloud_got = 0;
+    int cloud_tracked = -1;
     Tri *shown = NULL;
     int nshown = 0;
-    if (commit)
-        nok = build_shell(live, clean, width, height, &added, NULL, 0, NULL, 1);
-    if (live->nmodel < 80) {
-        if (!live->held_preview) live->held_preview = malloc(sizeof(Tri) * 12000);
-        live->hold_tick++;
-        if (live->held_preview && (live->nheld == 0 || (live->hold_tick % 3) == 1)) {
-            live->nheld = 0;
-            nok = build_shell(live, clean, width, height, &added, live->held_preview, 12000,
-                              &live->nheld, 0);
+    /* Measured meshes the projector surface. A moved view is kept only where
+     * it meets the body. Cloud and mold store the points. Shapes in the
+     * matrix locate the turn. A cell molds only after it is seen again. */
+    if (cloud_mode) {
+        os_stripe_cloud sc;
+        memset(&sc, 0, sizeof sc);
+        if (live->has_cal &&
+            os_stripe_make(&live->cal, pattern, clean, width, height, live->build.flip,
+                           live->distance, live->build.near_mm, live->build.far_mm,
+                           live->build.stride, &sc) == 0)
+            nok = sc.n;
+        if (scanning && nok >= 80 && live->cloud) {
+            if (!live->have_axis) {
+                double sx = 0, sy = 0, sz = 0;
+                int n = 0, i;
+                for (i = 0; i < sc.rows * sc.cols; i++) {
+                    if (!sc.pt[i].ok) continue;
+                    sx += sc.pt[i].x;
+                    sy += sc.pt[i].y;
+                    sz += sc.pt[i].z;
+                    n++;
+                }
+                if (n >= 80) {
+                    live->axis_x = (float)(sx / n);
+                    live->axis_y = (float)(sy / n);
+                    live->axis_z = (float)(sz / n);
+                    live->have_axis = 1;
+                }
+            }
+            if (live->have_axis) {
+                float yaw = live->turn.yaw;
+                cloud_got = os_cloud_integrate(live->cloud, sc.pt, sc.rows * sc.cols,
+                                               &yaw, live->axis_x, live->axis_z);
+                if (cloud_got < 0) {
+                    live->turn.yaw = yaw0;
+                    cloud_tracked = 0;
+                } else {
+                    live->turn.yaw = yaw;
+                    rebuild_cloud(live);
+                    cloud_tracked = 1;
+                }
+            }
+        } else if (os_cloud_points(live->cloud) > 0) {
+            cloud_tracked = 1;
         }
-        shown = live->held_preview;
-        nshown = live->nheld;
+        if (nok >= 80 && live->nmodel < 80) {
+            if (!live->held_preview) live->held_preview = malloc(sizeof(Tri) * 80000);
+            if (live->held_preview) {
+                live->nheld = 0;
+                commit_depth(live, &sc, 0.f, 0, live->held_preview, 80000, &live->nheld);
+                live->cache_ok = 0;
+                shown = live->held_preview;
+                nshown = live->nheld;
+            }
+        }
+        os_stripe_free(&sc);
+    } else if (measured) {
+        os_stripe_cloud cloud;
+        memset(&cloud, 0, sizeof cloud);
+        if (os_stripe_make(&live->cal, pattern, clean, width, height, live->build.flip,
+                           live->distance, live->build.near_mm, live->build.far_mm,
+                           live->build.stride, &cloud) == 0) {
+            nok = cloud.n;
+        }
+        if (live->nmodel < 80) {
+            /* The facing sheet is tens of thousands of triangles. 12000 kept
+             * only the top of the head and drew that band as the whole model. */
+            if (!live->held_preview) live->held_preview = malloc(sizeof(Tri) * 80000);
+            if (live->held_preview) {
+                live->nheld = 0;
+                commit_depth(live, &cloud, 0.f, 0, live->held_preview, 80000, &live->nheld);
+                live->cache_ok = 0;
+            }
+            shown = live->held_preview;
+            nshown = live->nheld;
+        }
+        if (commit && live->build.solid) {
+            int got = commit_depth(live, &cloud, live->turn.yaw, 1, NULL, 0, NULL);
+            if (got < 0) live->turn.yaw = yaw0;
+        }
+        os_stripe_free(&cloud);
+    } else {
+        os_stripe_cloud sc;
+        memset(&sc, 0, sizeof sc);
+        if (live->has_cal &&
+            os_stripe_make(&live->cal, pattern, clean, width, height, live->build.flip,
+                           live->distance, live->build.near_mm, live->build.far_mm,
+                           live->build.stride, &sc) == 0)
+            nok = sc.n;
+        if (scanning && nok >= 80 && live->cloud) {
+            if (!live->have_axis) {
+                double sx = 0, sy = 0, sz = 0;
+                int n = 0, i;
+                for (i = 0; i < sc.rows * sc.cols; i++) {
+                    if (!sc.pt[i].ok) continue;
+                    sx += sc.pt[i].x;
+                    sy += sc.pt[i].y;
+                    sz += sc.pt[i].z;
+                    n++;
+                }
+                if (n >= 80) {
+                    live->axis_x = (float)(sx / n);
+                    live->axis_y = (float)(sy / n);
+                    live->axis_z = (float)(sz / n);
+                    live->have_axis = 1;
+                }
+            }
+            if (live->have_axis) {
+                float yaw = live->turn.yaw;
+                int got = os_cloud_integrate(live->cloud, sc.pt, sc.rows * sc.cols, &yaw,
+                                             live->axis_x, live->axis_z);
+                if (got < 0) {
+                    live->turn.yaw = yaw0;
+                    cloud_tracked = 0;
+                } else {
+                    live->turn.yaw = yaw;
+                    rebuild_cloud(live);
+                    cloud_tracked = 1;
+                }
+            }
+        }
+        if (nok >= 80 && live->nmodel < 80) {
+            if (!live->held_preview) live->held_preview = malloc(sizeof(Tri) * 80000);
+            if (live->held_preview) {
+                live->nheld = 0;
+                commit_depth(live, &sc, 0.f, 0, live->held_preview, 80000, &live->nheld);
+                live->cache_ok = 0;
+                shown = live->held_preview;
+                nshown = live->nheld;
+            }
+        }
+        os_stripe_free(&sc);
     }
-    if (scanning && before == 0) live->fused++;
-    else if (scanning && added > 0) live->fused++;
+    if (commit) live->cache_ok = 0;
+    if (cloud_mode) {
+        if (scanning && cloud_tracked == 1 && nok >= 80) live->fused++;
+        else if (scanning && cloud_tracked == 0) live->lost++;
+    } else if (scanning && live->nmodel > before) live->fused++;
     else if (scanning && nok < 80 && before == 0) live->lost++;
     draw_panels(live, clean, pattern, width, height, shown, nshown);
-    int covered = os_scanned_deg(live->build.sweep_deg, live->turn.yaw, count_bins(live), live->nmodel);
+    /* Mold reports the sweep. Measured reports the kept turn.
+     * Cloud reports how far around the object the points reach. */
+    int covered = cloud_mode ? os_cloud_degrees(live->cloud)
+        : measured ? (int)(os_fabs(live->turn.yaw) * (180.f / 3.14159265f) + 0.5f)
+        : os_scanned_deg(live->build.sweep_deg, live->turn.yaw, count_bins(live), live->nmodel);
+    if (live->prev_gw != width || live->prev_gh != height || !live->prev_gray) {
+        free(live->prev_gray);
+        live->prev_gray = malloc(n);
+        live->prev_gw = width;
+        live->prev_gh = height;
+        live->prev_ready = 0;
+    }
+    if (live->prev_gray) {
+        memcpy(live->prev_gray, clean, n);
+        live->prev_ready = 1;
+    }
     if (status) {
         status->fused = live->fused;
         status->lost = live->lost;
-        status->valid_pixels = nok;
+        status->valid_pixels = cloud_mode ? os_cloud_points(live->cloud) : nok;
         status->median_mm = live->distance;
-        status->tracking = live->nmodel > 80 ? 1 : -1;
+        status->tracking = cloud_mode ? cloud_tracked : (live->nmodel > 80 ? 1 : -1);
         status->mode = live->mode;
         status->points = live->nmodel;
         status->scanned_deg = covered;
-        status->detail = 1;
+        status->detail = cloud_mode ? os_cloud_coverage(live->cloud) : 1;
+        status->shapes = cloud_mode ? os_cloud_shape_count(live->cloud) : 0;
     }
     free(clean);
     free(pattern);
@@ -1005,6 +1695,162 @@ int openscan_live_write(openscan_live *live, const char *path, int *triangles_ou
     return write_mesh(path, live->held_preview, live->nheld, triangles_out);
 }
 
+static void model_bounds(const openscan_live *L, float *zlo, float *zhi, float *meanx) {
+    float lo = 1e9f, hi = -1e9f;
+    double sx = 0;
+    int n = 0;
+    for (int i = 0; i < L->nmodel; i++) {
+        const float *p[3] = {L->model[i].a, L->model[i].b, L->model[i].c};
+        for (int k = 0; k < 3; k++) {
+            if (p[k][2] < lo) lo = p[k][2];
+            if (p[k][2] > hi) hi = p[k][2];
+            sx += p[k][0];
+            n++;
+        }
+    }
+    if (zlo) *zlo = n ? lo : 0;
+    if (zhi) *zhi = n ? hi : 0;
+    if (meanx) *meanx = n ? (float)(sx / n) : 0;
+}
+
+static void rig_cal(openscan_calib *cal) {
+    memset(cal, 0, sizeof *cal);
+    cal->width = 160;
+    cal->height = 120;
+    for (int i = 0; i < 3; i++) {
+        cal->cam[i].fx = cal->cam[i].fy = 400;
+        cal->cam[i].cx = 80;
+        cal->cam[i].cy = 60;
+    }
+    cal->cam[2].tvec[0] = 30;
+    cal->nplanes = 40;
+    for (int i = 0; i < 40; i++) {
+        cal->plane[i].index = i;
+        cal->plane[i].slope = 0;
+        cal->plane[i].offset = 10 + i * 3;
+    }
+}
+
+static void paint_disk(uint8_t *img, int w, int h, int cx) {
+    memset(img, 0, (size_t)w * (size_t)h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float nx = (x - cx) / 36.f;
+            float ny = (y - 60) / 30.f;
+            if (nx * nx + ny * ny < 1.f) img[y * w + x] = 140;
+        }
+    }
+}
+
+static int stripe_live_self_test(void) {
+    openscan_calib cal;
+    openscan_live *L;
+    openscan_live_status st;
+    uint8_t *disk;
+    float zlo = 0, zhi = 0, meanx = 0;
+    int n0;
+    if (os_stripe_self_test() != 0) return 1;
+    rig_cal(&cal);
+    disk = calloc(160 * 120, 1);
+    if (!disk) return 1;
+    paint_disk(disk, 160, 120, 80);
+    L = openscan_live_create(&cal, NULL);
+    if (!L) {
+        free(disk);
+        return 1;
+    }
+    L->build.flip = 0;
+    openscan_live_set_shape(L, OPENSCAN_SHAPE_MOLD);
+    openscan_live_set_distance_mm(L, 180.f);
+    openscan_live_set_mode(L, OPENSCAN_MODE_SCAN);
+    if (openscan_live_push(L, disk, disk, 160, 120, &st) != 0 || st.points != 0) {
+        fprintf(stderr, "c mold: unconfirmed molded %d tris\n", st.points);
+        openscan_live_destroy(L);
+        free(disk);
+        return 1;
+    }
+    if (openscan_live_push(L, disk, disk, 160, 120, &st) != 0) {
+        openscan_live_destroy(L);
+        free(disk);
+        return 1;
+    }
+    model_bounds(L, &zlo, &zhi, &meanx);
+    if (st.points > 0 && zhi - zlo > 8.f) {
+        fprintf(stderr, "c mold: outline came back span %.2f tris %d\n", zhi - zlo, st.points);
+        openscan_live_destroy(L);
+        free(disk);
+        return 1;
+    }
+    fprintf(stderr, "c mold: confirmed %d tris\n", st.points);
+    openscan_live_destroy(L);
+    L = openscan_live_create(&cal, NULL);
+    if (!L) {
+        free(disk);
+        return 1;
+    }
+    L->build.flip = 0;
+    openscan_live_set_shape(L, OPENSCAN_SHAPE_MEASURED);
+    openscan_live_set_distance_mm(L, 180.f);
+    openscan_live_set_mode(L, OPENSCAN_MODE_STOP);
+    /* A flat wall of projector ridges. Wrapping that picture would thicken it. */
+    os_stripe_paint_wall(disk, &cal, 180.f);
+    if (openscan_live_push(L, disk, disk, 160, 120, &st) != 0 || st.points != 0) {
+        fprintf(stderr, "c measured: idle committed %d\n", st.points);
+        openscan_live_destroy(L);
+        free(disk);
+        return 1;
+    }
+    openscan_live_set_mode(L, OPENSCAN_MODE_SCAN);
+    if (openscan_live_push(L, disk, disk, 160, 120, &st) != 0 || st.points < 400 ||
+        st.scanned_deg > 30 || st.fused != 1) {
+        fprintf(stderr, "c measured: first frame %d tris %d deg %d frames\n",
+                st.points, st.scanned_deg, st.fused);
+        openscan_live_destroy(L);
+        free(disk);
+        return 1;
+    }
+    model_bounds(L, &zlo, &zhi, &meanx);
+    if (zhi - zlo > 8.f) {
+        fprintf(stderr, "c measured: wall became a barrel span %.2f\n", zhi - zlo);
+        openscan_live_destroy(L);
+        free(disk);
+        return 1;
+    }
+    n0 = st.points;
+    if (openscan_live_push(L, disk, disk, 160, 120, &st) != 0 || st.points > n0 + 40 ||
+        st.fused != 1) {
+        fprintf(stderr, "c measured: still grew %d -> %d frames %d\n", n0, st.points, st.fused);
+        openscan_live_destroy(L);
+        free(disk);
+        return 1;
+    }
+    for (int y = 0; y < 120; y++) {
+        uint8_t *row = disk + y * 160;
+        memmove(row + 6, row, 154);
+        memset(row, 30, 6);
+    }
+    if (openscan_live_push(L, disk, disk, 160, 120, &st) != 0 || st.points > n0 + 40 ||
+        st.points >= n0 * 2) {
+        fprintf(stderr, "c measured: shifted wall stacked %d -> %d frames %d\n",
+                n0, st.points, st.fused);
+        openscan_live_destroy(L);
+        free(disk);
+        return 1;
+    }
+    model_bounds(L, &zlo, &zhi, &meanx);
+    if (zhi - zlo > 8.f) {
+        fprintf(stderr, "c measured: shift thickened span %.2f\n", zhi - zlo);
+        openscan_live_destroy(L);
+        free(disk);
+        return 1;
+    }
+    fprintf(stderr, "c measured: wall %d tris span %.1f\n", n0, zhi - zlo);
+    openscan_live_destroy(L);
+    free(disk);
+    return 0;
+}
+
+
 int openscan_mesh_self_test(void) {
     return openscan_turn_self_test();
 }
@@ -1037,8 +1883,8 @@ int openscan_turn_self_test(void) {
         }
     }
     openscan_live_status st;
-    if (openscan_live_push(L, g, g, 320, 240, &st) != 0 || st.points < 400 || st.scanned_deg < 120) {
-        fprintf(stderr, "c mold: front %d tris %d°\n", st.points, st.scanned_deg);
+    if (openscan_live_push(L, g, g, 320, 240, &st) != 0 || st.points != 0) {
+        fprintf(stderr, "c mold: silhouette molded %d tris\n", st.points);
         return 1;
     }
     {
@@ -1046,58 +1892,20 @@ int openscan_turn_self_test(void) {
         const uint8_t *pv = openscan_live_preview_bgr(L, &pw, &ph);
         int cam_w = pw * 42 / 100;
         int mid_w = pw * 42 / 100;
-        for (int y = 0; y < ph; y++)
-            for (int x = cam_w; x < cam_w + mid_w && x < pw; x++)
-                if (pv[(y * pw + x) * 3] > 30) lit++;
-        int minx = pw, miny = ph, maxx = 0, maxy = 0;
-        for (int y = 0; y < ph; y++) {
-            for (int x = cam_w; x < cam_w + mid_w && x < pw; x++) {
-                if (pv[(y * pw + x) * 3] <= 30) continue;
-                if (x < minx) minx = x;
-                if (y < miny) miny = y;
-                if (x > maxx) maxx = x;
-                if (y > maxy) maxy = y;
-            }
+        if (pv && pw > 8 && ph > 8) {
+            for (int y = 0; y < ph; y++)
+                for (int x = cam_w; x < cam_w + mid_w && x < pw; x++)
+                    if (pv[(y * pw + x) * 3] > 30) lit++;
         }
-        int box = (maxx - minx) * (maxy - miny);
-        if (lit < 400 || box < 1 || lit * 100 / box < 45) {
-            fprintf(stderr, "c view lit %d box %d\n", lit, box);
+        if (lit > 40) {
+            fprintf(stderr, "c view invented a solid lit %d\n", lit);
             return 1;
-        }
-        {
-            int nt = 0;
-            char buf[24];
-            FILE *fp;
-            if (openscan_live_write(L, "/tmp/os-fmt.stl", &nt) != 0 || nt < 400) return 1;
-            if (openscan_live_write(L, "/tmp/os-fmt.obj", &nt) != 0) return 1;
-            if (openscan_live_write(L, "/tmp/os-fmt.ply", &nt) != 0) return 1;
-            if (openscan_live_write(L, "/tmp/os-fmt.xyz", &nt) == 0) return 1;
-            fp = fopen("/tmp/os-fmt.obj", "r");
-            if (!fp || !fgets(buf, sizeof buf, fp) || strncmp(buf, "# openscan", 10) != 0) {
-                if (fp) fclose(fp);
-                return 1;
-            }
-            fclose(fp);
-            fp = fopen("/tmp/os-fmt.ply", "r");
-            if (!fp || !fgets(buf, sizeof buf, fp) || strncmp(buf, "ply", 3) != 0) {
-                if (fp) fclose(fp);
-                return 1;
-            }
-            fclose(fp);
-            fp = fopen("/tmp/os-fmt.stl", "rb");
-            if (!fp || fread(buf, 1, 13, fp) != 13 || memcmp(buf, "openscan mesh", 13) != 0) {
-                if (fp) fclose(fp);
-                return 1;
-            }
-            fclose(fp);
-            remove("/tmp/os-fmt.stl");
-            remove("/tmp/os-fmt.obj");
-            remove("/tmp/os-fmt.ply");
         }
     }
     int n0 = st.points;
     float y0 = L->turn.yaw;
-    if (openscan_live_push(L, g, g, 320, 240, &st) != 0 || st.points > n0 + 40 || os_fabs(L->turn.yaw - y0) > 1e-4f) {
+    if (openscan_live_push(L, g, g, 320, 240, &st) != 0 || st.points != 0 ||
+        os_fabs(L->turn.yaw - y0) > 1e-4f) {
         fprintf(stderr, "c mold: still grew %d -> %d\n", n0, st.points);
         return 1;
     }
@@ -1108,16 +1916,13 @@ int openscan_turn_self_test(void) {
             if (nx * nx + ny * ny < 1.f) s[y * 320 + x] = 180;
         }
     }
-    if (openscan_live_push(L, s, s, 320, 240, &st) != 0 || os_fabs(L->turn.yaw) < 2.f * 3.14159265f / 180.f) {
-        fprintf(stderr, "c mold: shift not tracked yaw %.3f\n", L->turn.yaw);
+    if (openscan_live_push(L, s, s, 320, 240, &st) != 0 ||
+        os_fabs(L->turn.yaw) < 2.f * 3.14159265f / 180.f || st.points != 0) {
+        fprintf(stderr, "c mold: shift not tracked yaw %.3f tris %d\n", L->turn.yaw, st.points);
         return 1;
     }
-    if (st.points < n0) {
-        fprintf(stderr, "c mold: turn dropped triangles\n");
-        return 1;
-    }
-    fprintf(stderr, "c mold: front %d tris %d°, turn yaw %.1f° tris %d\n",
-            n0, 160, L->turn.yaw * 180.f / 3.14159265f, st.points);
+    fprintf(stderr, "c mold: silhouette stays empty, turn yaw %.1f°\n",
+            L->turn.yaw * 180.f / 3.14159265f);
     openscan_live *R = openscan_live_create(&cal, NULL);
     if (!R) return 1;
     R->build.flip = 0;
@@ -1132,7 +1937,7 @@ int openscan_turn_self_test(void) {
             if (nx * nx + ny * ny < 1.f) base[y * 320 + x] = 180;
         }
     }
-    if (openscan_live_push(R, base, base, 320, 240, &st) != 0 || st.points < 400) return 1;
+    if (openscan_live_push(R, base, base, 320, 240, &st) != 0 || st.points != 0) return 1;
     int nr = st.points;
     for (int y = 40; y < 200; y++) {
         int shift = y < 120 ? 18 : -18;
@@ -1144,17 +1949,17 @@ int openscan_turn_self_test(void) {
         }
     }
     if (openscan_live_push(R, spin, spin, 320, 240, &st) != 0 ||
-        os_fabs(R->turn.yaw) < 2.f * 3.14159265f / 180.f || st.points < nr) {
+        os_fabs(R->turn.yaw) < 2.f * 3.14159265f / 180.f || st.points != 0) {
         fprintf(stderr, "c mold: spin not tracked yaw %.3f tris %d -> %d\n",
                 R->turn.yaw, nr, st.points);
         return 1;
     }
-    fprintf(stderr, "c mold: spin yaw %.1f° tris %d\n", R->turn.yaw * 180.f / 3.14159265f, st.points);
+    fprintf(stderr, "c mold: spin yaw %.1f°\n", R->turn.yaw * 180.f / 3.14159265f);
     free(base);
     free(spin);
     openscan_live_destroy(R);
     free(g);
     free(s);
     openscan_live_destroy(L);
-    return 0;
+    return stripe_live_self_test();
 }

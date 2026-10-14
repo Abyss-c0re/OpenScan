@@ -22,11 +22,13 @@ static void usage(const char *argv0) {
             "  %s grab -o DIR              save camA.pgm and camB.pgm\n"
             "  %s scan -o FILE.stl|.obj|.ply   record a solid, no window\n"
             "  %s turn-test                check that a turn grows the solid\n"
+            "  %s cloud-test               check the stored cloud, its shapes, and the mesh\n"
             "  %s help                     this text\n"
             "\n"
             "scan and the window accept:\n"
             "  --seconds N                 scan length, default 4, at least 1\n"
-            "  --shape mold|measured       mold is the solid, measured is the sheet\n"
+            "  --shape mold|measured|cloud mold sweeps one outline, measured uses the projector,\n"
+            "                              cloud keeps the points and meshes their shapes\n"
             "  --distance MM               100..500, default 220\n"
             "  --sweep DEG                 60..140, default 80 (160 degrees of the object)\n"
             "  --exposure-a N  --gain-a N  pattern camera, exposure is 100 microsecond steps\n"
@@ -34,7 +36,7 @@ static void usage(const char *argv0) {
             "\n"
             "Another program links libopenscan and includes openscan/openscan.h.\n",
             openscan_version(), openscan_host(),
-            argv0, argv0, argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static const char *arg_str(int argc, char **argv, const char *name) {
@@ -261,7 +263,11 @@ static int shape_arg(int argc, char **argv, int *shape) {
         *shape = OPENSCAN_SHAPE_MEASURED;
         return 0;
     }
-    fprintf(stderr, "--shape is mold or measured, not \"%s\".\n", s);
+    if (!strcmp(s, "cloud")) {
+        *shape = OPENSCAN_SHAPE_CLOUD;
+        return 0;
+    }
+    fprintf(stderr, "--shape is mold, measured, or cloud, not \"%s\".\n", s);
     return -1;
 }
 
@@ -276,8 +282,13 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 0;
     }
-    if (argc >= 2 && !strcmp(argv[1], "turn-test")) return openscan_turn_self_test();
+    if (argc >= 2 && !strcmp(argv[1], "turn-test")) {
+        int pattern = openscan_pattern_self_test();
+        if (pattern != 0) return pattern;
+        return openscan_turn_self_test();
+    }
     if (argc >= 2 && !strcmp(argv[1], "mesh-test")) return openscan_mesh_self_test();
+    if (argc >= 2 && !strcmp(argv[1], "cloud-test")) return openscan_cloud_self_test();
     if (opt_int(argc, argv, "--exposure-a", -1, &ea) || opt_int(argc, argv, "--gain-a", -1, &ga) ||
         opt_int(argc, argv, "--exposure-b", -1, &eb) || opt_int(argc, argv, "--gain-b", -1, &gb) ||
         opt_int(argc, argv, "--seconds", 4, &seconds) || opt_int(argc, argv, "--distance", 0, &distance) ||

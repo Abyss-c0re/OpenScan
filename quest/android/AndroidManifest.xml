@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.lab.lizard">
+  <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32"/>
+  <uses-feature android:glEsVersion="0x00030000" android:required="true"/>
+  <uses-feature android:name="android.hardware.vr.headtracking" android:required="true"/>
+  <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false"/>
+  <uses-feature android:name="oculus.software.handtracking" android:required="false"/>
+  <uses-feature android:name="android.hardware.camera" android:required="false"/>
+  <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
+  <uses-permission android:name="android.permission.CAMERA"/>
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+  <uses-permission android:name="horizonos.permission.USB_CAMERA"/>
+  <uses-permission android:name="horizonos.permission.HEADSET_CAMERA"/>
+  <uses-permission android:name="com.oculus.permission.HAND_TRACKING"/>
+  <uses-permission android:name="horizonos.permission.HAND_TRACKING"/>
+  <application android:allowBackup="false" android:label="LizardTech" android:hasCode="true"
+      android:debuggable="true" android:requestLegacyExternalStorage="true">
+    <meta-data android:name="com.oculus.supportedDevices" android:value="quest3|quest3s"/>
+    <meta-data android:name="com.oculus.vr.focusaware" android:value="true"/>
+    <meta-data android:name="com.oculus.handtracking.frequency" android:value="HIGH"/>
+    <meta-data android:name="com.oculus.handtracking.version" android:value="V2.0"/>
+    <activity
+        android:name="android.app.NativeActivity"
+        android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+        android:launchMode="singleTask"
+        android:screenOrientation="landscape"
+        android:excludeFromRecents="false"
+        android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode"
+        android:exported="true">
+      <meta-data android:name="android.app.lib_name" android:value="lizard_oxr"/>
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD"/>
+        <category android:name="com.oculus.intent.category.VR"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+    <activity
+        android:name="dev.lab.lizard.ExportActivity"
+        android:theme="@android:style/Theme.DeviceDefault.Dialog.NoActionBar"
+        android:exported="false"
+        android:excludeFromRecents="true"/>
+  </application>
+</manifest>

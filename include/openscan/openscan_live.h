@@ -18,10 +18,12 @@ typedef struct openscan_live openscan_live;
 #define OPENSCAN_MODE_SCAN  1
 #define OPENSCAN_MODE_PAUSE 2
 
-/* Mold is the solid body swept from the camera outline. Measured is the
- * projector-stripe surface of the face in front of the camera. */
+/* Mold is the outline sweep. Measured is the projector surface. A later view
+ * is added only where it meets that surface. Cloud keeps the measured points,
+ * tracks the turn from their shapes, and builds one skin around that turn. */
 #define OPENSCAN_SHAPE_MOLD     0
 #define OPENSCAN_SHAPE_MEASURED 1
+#define OPENSCAN_SHAPE_CLOUD    2
 
 /* Knobs that change the mesh, the same way Kinect near/far/stride change
  * the point cloud. They are read on every frame. */
@@ -144,15 +146,17 @@ static inline openscan_build openscan_build_clamped(const openscan_build *in) {
 
 /* Saved desktop keys. *_set is 0 when that key is absent.
  * Distance stays on 100..500. The build uses openscan_build_clamped.
- * Mold unless the saved shape is Measured. */
+ * Mold unless the saved shape is Measured or Cloud. */
 static inline int openscan_shape_resolve(int shape, int shape_set) {
-    if (shape_set && shape == OPENSCAN_SHAPE_MEASURED) return OPENSCAN_SHAPE_MEASURED;
+    if (!shape_set) return OPENSCAN_SHAPE_MOLD;
+    if (shape == OPENSCAN_SHAPE_MEASURED) return OPENSCAN_SHAPE_MEASURED;
+    if (shape == OPENSCAN_SHAPE_CLOUD) return OPENSCAN_SHAPE_CLOUD;
     return OPENSCAN_SHAPE_MOLD;
 }
 
 /* A command-line distance or shape wins over the saved value.
  * flag_set is 0 when that flag was omitted. Distance stays on 100..500.
- * Any shape other than Measured is Mold. */
+ * A shape other than Measured or Cloud is Mold. */
 static inline int openscan_distance_override(int resolved_mm, int flag_set, int flag_mm) {
     int d = flag_set ? flag_mm : resolved_mm;
     return (int)openscan_distance_clamped((float)d);
@@ -241,7 +245,7 @@ static inline void openscan_stereo_clamp(double *min_mm, double *max_mm) {
     if (*max_mm <= *min_mm) *max_mm = *min_mm + 50.0;
 }
 
-/* Pixel span for a disparity matcher that the live scanner does not build.
+/* Pixel span for a stereo check. The live scan does not build this disparity matcher.
  * min_disparity is the near end (negative on this rig). num_disparities is a
  * multiple of 16 and stops at the far end instead of at disparity 0.
  * The near end is a little closer than min_mm, and the far end a little
@@ -289,7 +293,8 @@ typedef struct openscan_live_status {
     int mode;           /* OPENSCAN_MODE_STOP, SCAN, or PAUSE */
     int points;         /* triangles in the 3D model */
     int scanned_deg;    /* degrees of the object that have a surface */
-    int detail;         /* average observations on the scanned surface */
+    int detail;         /* coverage 0..100 in Cloud, otherwise observations */
+    int shapes;         /* cluster shapes in Cloud, otherwise 0 */
 } openscan_live_status;
 
 openscan_live *openscan_live_create(const openscan_calib *calib, const openscan_scan_opts *opt);
@@ -313,13 +318,13 @@ void openscan_live_reset(openscan_live *live);
 void openscan_live_set_mode(openscan_live *live, int mode);
 int openscan_live_mode(const openscan_live *live);
 
-/* OPENSCAN_SHAPE_MOLD or OPENSCAN_SHAPE_MEASURED. Switching clears the current model. */
+/* OPENSCAN_SHAPE_MOLD, OPENSCAN_SHAPE_MEASURED, or OPENSCAN_SHAPE_CLOUD.
+ * Switching clears the current model. */
 void openscan_live_set_shape(openscan_live *live, int shape);
 int openscan_live_shape(const openscan_live *live);
 
 /* Working distance in millimetres, clamped to 100..500 like the sliders.
- * In Mold this is the size of the model. In Measured it identifies the
- * projector stripes. Reset after changing it. */
+ * Mold uses it as the outline size. Reset after changing it. */
 void openscan_live_set_distance_mm(openscan_live *live, float mm);
 float openscan_live_distance_mm(const openscan_live *live);
 void openscan_live_set_build(openscan_live *live, const openscan_build *build);
@@ -348,6 +353,10 @@ int openscan_mesh_self_test(void);
 
 /* Mold turn. Non-zero if a rotation is fused twice or not at all. */
 int openscan_turn_self_test(void);
+
+/* Cloud track, fill, and mesh. Non-zero when a stored view is stacked,
+ * a turn is lost, or the shape surface does not close. */
+int openscan_cloud_self_test(void);
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,7 @@ public final class Engine {
     public static final int MODE_PAUSE = 2;
     public static final int SHAPE_MOLD = 0;
     public static final int SHAPE_MEASURED = 1;
+    public static final int SHAPE_CLOUD = 2;
     public static final int PANEL_CAMERA = 0;
     public static final int PANEL_MODEL = 1;
     public static final int PANEL_A = 2;
@@ -76,7 +77,8 @@ public final class Engine {
 
     public void mouse(int event, int x, int y) { nativeMouse(handle, event, x, y, 0); }
 
-    /** status: fused, lost, valid, tracking, mode, points, scannedDeg, detail, medianMm */
+    /** status: fused, lost, valid, tracking, mode, points, scannedDeg, detail, medianMm, shapes.
+     *  In Cloud, valid is the stored point count and detail is how solid the patches are, 0..100. */
     public int push(byte[] a, byte[] b, int[] status) {
         return nativePush(handle, a, b, frameW, frameH, status);
     }
@@ -128,6 +130,14 @@ public final class Engine {
     /** Fills both buffers with luminance. Returns 0 when a pair was decoded. */
     public int scannerGrab(long cams, byte[] a, byte[] b) { return nativeScannerGrab(cams, a, b); }
 
+    /** cols, clip percent, median, p95. Null when the frame is too small. */
+    public int[] patternMeter(byte[] y, int w) { return nativePatternMeter(y, w); }
+
+    /** Next camera A exposure, or 0 when the lattice should be left alone. */
+    public int patternRescue(int cols, int clip, int p95, int exposure) {
+        return nativePatternRescue(cols, clip, p95, exposure);
+    }
+
     private static native long nativeCreate(String path);
     private static native void nativeDestroy(long handle);
     private static native void nativeSetShape(long handle, int shape);
@@ -148,4 +158,6 @@ public final class Engine {
     private static native int nativeScannerExposure(long cams, int exposureA, int gainA, int exposureB, int gainB);
     private static native int nativeScannerExposureAuto(long cams);
     private static native int nativeScannerGrab(long cams, byte[] a, byte[] b);
+    private static native int[] nativePatternMeter(byte[] y, int w);
+    private static native int nativePatternRescue(int cols, int clip, int p95, int exposure);
 }

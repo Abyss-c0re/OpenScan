@@ -11,7 +11,12 @@ extern "C" {
 /* Fox (3DMakerpro, serial JMM8*) shows up as two Sonix UVC cameras.
  * The kernel uvcvideo driver owns the USB interface. This is the
  * userspace half: open both sensors, lock the scan format, and pull
- * luminance frames. */
+ * luminance frames.
+ *
+ * Streaming camera A is the NIR projector control. openscan_cam_start
+ * sends VIDIOC_STREAMON, the camera's own sensor script pulses the lamp,
+ * and openscan_cam_stop turns it off. There is no projector packet.
+ * docs/projector.md. */
 
 typedef struct openscan_cam openscan_cam;
 

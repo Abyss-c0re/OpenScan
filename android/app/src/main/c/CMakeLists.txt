@@ -8,9 +8,12 @@ add_library(openscanjni SHARED
     openscan_jni.c
     "${OPENSCAN_SRC}/src/calib/openscan_calib.c"
     "${OPENSCAN_SRC}/src/live/os_logic.c"
+    "${OPENSCAN_SRC}/src/live/os_stripe.c"
+    "${OPENSCAN_SRC}/src/live/os_cloud.c"
     "${OPENSCAN_SRC}/src/live/os_live.c"
     "${OPENSCAN_SRC}/src/device/openscan_cam_name.c"
     "${OPENSCAN_SRC}/src/device/openscan_v4l2.c"
+    "${OPENSCAN_SRC}/src/image/os_pattern.c"
 )
 
 target_include_directories(openscanjni PRIVATE "${OPENSCAN_SRC}/include")

@@ -165,7 +165,8 @@ static void knobs_clamp(Knobs *k) {
     if (k->relief > 100) k->relief = 100;
     k->solid = k->solid ? 1 : 0;
     k->flip = k->flip ? 1 : 0;
-    k->shape = k->shape == OPENSCAN_SHAPE_MEASURED ? OPENSCAN_SHAPE_MEASURED : OPENSCAN_SHAPE_MOLD;
+    if (k->shape != OPENSCAN_SHAPE_MEASURED && k->shape != OPENSCAN_SHAPE_CLOUD)
+        k->shape = OPENSCAN_SHAPE_MOLD;
 }
 
 static void apply_knobs(openscan_live *live, const Knobs *k) {
@@ -264,8 +265,8 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
     }
     openscan_live_set_shape(live, kn.shape);
     apply_knobs(live, &kn);
-    openscan_live_set_mode(live, OPENSCAN_MODE_STOP);
-    const int win_w = 1280, win_h = 880, view_y = 340;
+    openscan_live_set_mode(live, OPENSCAN_MODE_SCAN);
+    const int win_w = 1280, win_h = 908, view_y = 340;
     os_surf *surf = os_surf_open(win_w, win_h);
     if (!surf) {
         fprintf(stderr, "no window\n");
@@ -286,6 +287,7 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
     int run = bufa && bufb && ya && yb;
     int was_held = 0, drag = -1, orbiting = 0, last_x = 0, last_y = 0;
     int sent_ea = kn.ea, sent_ga = kn.ga, sent_eb = kn.eb, sent_gb = kn.gb;
+    time_t rescue_next = 0, exp_hold = 0;
     static const char *names[] = {
         "Camera A exposure", "Camera A gain", "Camera B exposure", "Camera B gain",
         "Distance (mm)", "Near (mm)", "Far (mm)", "Stride", "Smooth",
@@ -315,7 +317,10 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
                 } else if (mx < 560) {
                     kn.shape = OPENSCAN_SHAPE_MEASURED;
                     openscan_live_set_shape(live, kn.shape);
-                } else if (mx < 720) {
+                } else if (mx < 660) {
+                    kn.shape = OPENSCAN_SHAPE_CLOUD;
+                    openscan_live_set_shape(live, kn.shape);
+                } else if (mx < 820) {
                     snprintf(status, sizeof status, "calibrating");
                     auto_exposure(a, bufa, ya, w, h, &kn.ea, kn.ga);
                     auto_exposure(b, bufb, yb, w, h, &kn.eb, kn.gb);
@@ -343,6 +348,7 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
                 }
             }
             if (held && drag >= 0) vals[drag][0] = slider_at(mx, los[drag], his[drag]);
+            if (held && (drag == 0 || drag == 2)) exp_hold = time(NULL) + 12;
             if (press && my >= view_y) orbiting = 1;
             if (held && orbiting && drag < 0 && !press && mx >= 0) {
                 openscan_live_orbit(live, (mx - last_x) * 0.01f, (my - last_y) * 0.01f);
@@ -372,19 +378,61 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
             grab_gray(b, bufb, (size_t)w * h * 4, yb) == 0) {
             openscan_live_status st;
             openscan_live_push(live, ya, yb, w, h, &st);
+            if (openscan_live_mode(live) == OPENSCAN_MODE_SCAN) {
+                time_t nowt = time(NULL);
+                int cols = 0, clip = 0, p50 = 0, p95 = 0, next_ea = kn.ea;
+                if (nowt >= exp_hold && nowt >= rescue_next) {
+                    int surface = st.valid_pixels >= 80;
+                    openscan_pattern_meter(ya, w, h, &cols, &clip, &p50, &p95);
+                    /* The lamp-off phase is half the frames. It must not move
+                     * the shutter, and a frame that already measured a surface
+                     * must not be shortened just because the crown is clipped. */
+                    if (p50 >= 12 && openscan_pattern_rescue(cols, clip, p95, kn.ea, &next_ea)) {
+                        if (next_ea < kn.ea && surface) {
+                            snprintf(note, sizeof note, "Pattern hold A %d   %d pts   cols %d", kn.ea,
+                                     st.valid_pixels, cols);
+                            note_until = nowt + 4;
+                            fprintf(stderr, "exp hold A %d pts %d cols %d clip %d p95 %d\n", kn.ea,
+                                    st.valid_pixels, cols, clip, p95);
+                        } else {
+                            kn.ea = next_ea;
+                            knobs_clamp(&kn);
+                            knobs_save(&kn);
+                            snprintf(note, sizeof note, "Pattern exposure A %d   cols %d", kn.ea, cols);
+                            note_until = nowt + 4;
+                            fprintf(stderr, "exp rescue A %d cols %d clip %d p95 %d\n", kn.ea, cols, clip, p95);
+                        }
+                    }
+                    if (p50 >= 12) rescue_next = nowt + 1;
+                }
+            }
             const char *mode = "idle";
             if (openscan_live_mode(live) == OPENSCAN_MODE_SCAN) mode = "scan";
             else if (openscan_live_mode(live) == OPENSCAN_MODE_PAUSE) mode = "pause";
-            const char *shape = openscan_live_shape(live) == OPENSCAN_SHAPE_MEASURED ? "measured" : "mold";
+            const char *shape = "mold";
+            if (openscan_live_shape(live) == OPENSCAN_SHAPE_MEASURED) shape = "measured";
+            else if (openscan_live_shape(live) == OPENSCAN_SHAPE_CLOUD) shape = "cloud";
             if (time(NULL) < note_until)
                 snprintf(status, sizeof status, "%s", note);
             else if (openscan_live_mode(live) == OPENSCAN_MODE_SCAN &&
                      openscan_live_shape(live) == OPENSCAN_SHAPE_MOLD)
                 snprintf(status, sizeof status, "MOLDING — turn the object   %d tris   %d deg",
                          st.points, st.scanned_deg);
+            else if (openscan_live_mode(live) == OPENSCAN_MODE_SCAN &&
+                     openscan_live_shape(live) == OPENSCAN_SHAPE_MEASURED)
+                snprintf(status, sizeof status, "SCANNING   measured   %d tris   %d deg   %d frames",
+                         st.points, st.scanned_deg, st.fused);
+            else if (openscan_live_mode(live) == OPENSCAN_MODE_SCAN &&
+                     openscan_live_shape(live) == OPENSCAN_SHAPE_CLOUD)
+                snprintf(status, sizeof status,
+                         "CLOUD — %d pts, %d shapes, %d%% solid, %d tris, %d deg",
+                         st.valid_pixels, st.shapes, st.detail, st.points, st.scanned_deg);
             else if (openscan_live_mode(live) == OPENSCAN_MODE_SCAN)
                 snprintf(status, sizeof status, "SCANNING   %s   %d tris   %d deg",
                          shape, st.points, st.scanned_deg);
+            else if (openscan_live_shape(live) == OPENSCAN_SHAPE_CLOUD)
+                snprintf(status, sizeof status, "%s  cloud  %d pts  %d%% solid  %d tris  %d deg",
+                         mode, st.valid_pixels, st.detail, st.points, st.scanned_deg);
             else
                 snprintf(status, sizeof status, "%s  %s  %d mm  %d tris  %d deg",
                          mode, shape, kn.distance, st.points, st.scanned_deg);
@@ -402,20 +450,22 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
         os_surf_bar(surf, 248, 6, 84, 26, 0x3a3e48);
         os_surf_bar(surf, 344, 6, 80, 26, kn.shape == OPENSCAN_SHAPE_MOLD ? 0x2a6f9d : 0x3a3e48);
         os_surf_bar(surf, 430, 6, 120, 26, kn.shape == OPENSCAN_SHAPE_MEASURED ? 0x2a6f9d : 0x3a3e48);
-        os_surf_bar(surf, 558, 6, 150, 26, 0x2a6f9d);
+        os_surf_bar(surf, 560, 6, 92, 26, kn.shape == OPENSCAN_SHAPE_CLOUD ? 0x2a6f9d : 0x3a3e48);
+        os_surf_bar(surf, 660, 6, 150, 26, 0x2a6f9d);
         os_surf_bar(surf, 1108, 6, 150, 26, 0xc4892a);
-        os_surf_text(surf, 22, 24,
-                     openscan_live_mode(live) == OPENSCAN_MODE_SCAN &&
-                             openscan_live_shape(live) == OPENSCAN_SHAPE_MOLD
-                         ? "Molding"
-                         : "Start",
+        os_surf_text(surf, 16, 24,
+                     openscan_live_mode(live) != OPENSCAN_MODE_SCAN ? "Start"
+                     : openscan_live_shape(live) == OPENSCAN_SHAPE_MOLD ? "Molding"
+                     : openscan_live_shape(live) == OPENSCAN_SHAPE_CLOUD ? "Cloud"
+                                                                        : "Scanning",
                      0xf2f2f2);
         os_surf_text(surf, 104, 24, "Pause", 0xf2f2f2);
         os_surf_text(surf, 188, 24, "Stop", 0xf2f2f2);
         os_surf_text(surf, 264, 24, "Reset", 0xf2f2f2);
         os_surf_text(surf, 362, 24, "Mold", 0xf2f2f2);
         os_surf_text(surf, 448, 24, "Measured", 0xf2f2f2);
-        os_surf_text(surf, 574, 24, "Auto calibrate", 0xf2f2f2);
+        os_surf_text(surf, 578, 24, "Cloud", 0xf2f2f2);
+        os_surf_text(surf, 676, 24, "Auto calibrate", 0xf2f2f2);
         os_surf_text(surf, 1148, 24, "Export", 0xf2f2f2);
         for (int i = 0; i < 11; i++) {
             int y = 46 + i * 22;
@@ -448,7 +498,7 @@ int os_ui_main(const openscan_calib *cal, int exp_a, int gain_a, int exp_b, int 
             os_surf_text(surf, 16 + cam_w + mid_w, view_y + ph / 3 + 16, "stereo B", 0xf2f2f2);
             os_surf_text(surf, 16 + cam_w + mid_w, view_y + 2 * ph / 3 + 16, "side", 0xf2f2f2);
         }
-        os_surf_text(surf, 12, view_y + ph + 22, status, 0xf2f2f2);
+        os_surf_text(surf, 12, view_y + (ph > 8 ? ph : 0) + 18, status, 0xf2f2f2);
         os_surf_flush(surf);
         os_host_sleep_ms(30);
     }

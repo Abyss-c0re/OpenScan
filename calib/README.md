@@ -9,3 +9,6 @@ calibration, and it does not include a key for a vendor download service.
 
 A lookup key, if you are allowed to use one, stays in `calib/sign.local` or
 in the `OPENSCAN_CALIB_SIGN` environment variable. Both are gitignored.
+When no calibration file is found, that key is what makes desktop OpenScan
+download this scanner's file through the `curl` program. The calibration
+text is not uploaded. The Android app has no key and does not send the request.

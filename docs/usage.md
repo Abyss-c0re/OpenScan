@@ -6,14 +6,14 @@ Personal tool, not a maintained product. Tested on one handheld scanner. Bring y
 
 ## Download
 
-The release is one file per system. On Linux, mark it executable and run it:
+The release is one file per system. On Linux, mark it executable and run it. The `*` is the version in the filename:
 
 ```bash
-chmod +x OpenScan-0.6.14-linux-x86_64
-./OpenScan-0.6.14-linux-x86_64
+chmod +x OpenScan-*-linux-x86_64
+./OpenScan-*-linux-x86_64
 ```
 
-`OpenScan-0.6.14-x86_64.AppImage` runs the same way. If Linux cannot mount it, add `--appimage-extract-and-run`. On Windows, open `OpenScan-0.6.14-windows-x86_64.exe`. On Android, install `OpenScan-0.6.14.apk`.
+`OpenScan-*.AppImage` runs the same way. If Linux cannot mount it, add `--appimage-extract-and-run`. On Windows, open the `.exe`. On Android, install the `.apk`.
 
 Plug the scanner in first. On Linux your user must be in the `video` group. Copy your calibration to `~/.local/share/openscan/calib/<serial>.txt`. The download does not include that file.
 
@@ -28,7 +28,7 @@ Built from source, the same program is `./build/openscan`.
 5. Press **Stop** to hold the model. **Pause** holds it and keeps the turn. **Reset** drops it. **Export** opens the system save dialog. The file name's ending chooses STL, OBJ, or PLY.
 6. Quit with `q` or Esc. A model is written to `openscan-last.stl` in the current directory.
 
-A front view covers twice the mold sweep. The default sweep is 80, so that front shell is 160° of the object. A later turn is added when the outline moves.
+Mold keeps a projector point only after a second view lands on that same spot, then builds the solid from those confirmed cells. The stored shapes locate the object, so the scanner can move around it. Measured is the projector surface. Turn the object and a new view is kept where it meets that surface. A still frame leaves the body as it is. The lamp is on while camera A streams. [Projector](projector.md) is that hardware path.
 
 ## Command line
 
@@ -41,7 +41,7 @@ openscan scan -o FILE.stl --seconds N --shape mold --distance 220 --sweep 80
 openscan turn-test
 ```
 
-Exposure is in units of 100 microseconds. Gain is 0..100. A useful starting point on the scanner used here is camera A exposure 22 gain 6, and camera B exposure 16 gain 4.
+Exposure is in units of 100 microseconds. Gain is 0..100. A starting point that worked here is camera A exposure 12 gain 4, and camera B exposure 16 gain 4.
 
 `scan -o` writes `.stl`, `.obj`, or `.ply` from the file name. The window's Export button opens the system save dialog, starting from `openscan-last.stl`, and shows the saved path.
 
@@ -54,7 +54,7 @@ The file for a unit is `calib/<serial>.txt`. Search order:
 3. On Windows, `%APPDATA%/openscan/calib/<serial>.txt`
 4. On macOS, `~/Library/Application Support/openscan/calib/<serial>.txt`
 
-Both cameras have to carry the same serial. A vendor lookup runs only when you set `OPENSCAN_CALIB_SIGN` or `calib/sign.local` yourself. That key is not in the source tree. The saved mesh does not contain the serial or the calibration text.
+Both cameras have to carry the same serial. When no file is found, desktop OpenScan downloads this scanner's calibration if `OPENSCAN_CALIB_SIGN` or `calib/sign.local` is set. The request uses the `curl` program, asks for this serial only, and does not upload the calibration text. The file is kept only when its DevID matches. Without the key, you place the file yourself. The Android app does not send that request. The saved mesh does not contain the serial or the calibration text.
 
 ## Capture
 

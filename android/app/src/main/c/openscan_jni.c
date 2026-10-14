@@ -1,3 +1,4 @@
+#include "openscan/openscan.h"
 #include "openscan/openscan_calib.h"
 #include "openscan/openscan_live.h"
 #include "openscan/openscan_v4l2.h"
@@ -116,9 +117,11 @@ Java_dev_lab_openscan_Engine_nativePush(JNIEnv *env, jclass cls, jlong handle, j
     (*env)->ReleaseByteArrayElements(env, ja, a, JNI_ABORT);
     (*env)->ReleaseByteArrayElements(env, jb, b, JNI_ABORT);
     if (status && (*env)->GetArrayLength(env, status) >= 9) {
-        jint out[9] = {st.fused, st.lost, st.valid_pixels, st.tracking, st.mode,
-                       st.points, st.scanned_deg, st.detail, (jint)st.median_mm};
-        (*env)->SetIntArrayRegion(env, status, 0, 9, out);
+        jsize n = (*env)->GetArrayLength(env, status);
+        jint out[10] = {st.fused, st.lost, st.valid_pixels, st.tracking, st.mode,
+                        st.points, st.scanned_deg, st.detail, (jint)st.median_mm, st.shapes};
+        if (n > 10) n = 10;
+        (*env)->SetIntArrayRegion(env, status, 0, n, out);
     }
     return rc;
 }
@@ -271,6 +274,8 @@ static int jpeg_gray(JNIEnv *env, const uint8_t *jpg, size_t n, int w, int h, ui
             unsigned p;
             if (sx >= sw) sx = sw - 1;
             p = (unsigned)px[sy * sw + sx];
+            /* Full range. 77+150+29 = 256, so a gray sample stays itself.
+             * Studio swing (220/256 plus 16) drops the lattice gate. */
             dst[y * w + x] = (uint8_t)((((p >> 16) & 255) * 77 + ((p >> 8) & 255) * 150 + (p & 255) * 29) >> 8);
         }
     }
@@ -327,4 +332,41 @@ Java_dev_lab_openscan_Engine_nativeWrite(JNIEnv *env, jclass cls, jlong handle, 
     int rc = openscan_live_write((openscan_live *)handle, p, &tris);
     (*env)->ReleaseStringUTFChars(env, path, p);
     return rc == 0 ? tris : -1;
+}
+
+JNIEXPORT jintArray JNICALL
+Java_dev_lab_openscan_Engine_nativePatternMeter(JNIEnv *env, jclass cls, jbyteArray y, jint w) {
+    jint *outv;
+    jintArray out;
+    jbyte *pix;
+    int cols = 0, clip = 0, p50 = 0, p95 = 0, h, n;
+    (void)cls;
+    if (!y || w < 32) return NULL;
+    n = (*env)->GetArrayLength(env, y);
+    if (n < w * 32) return NULL;
+    h = n / w;
+    pix = (*env)->GetByteArrayElements(env, y, NULL);
+    if (!pix) return NULL;
+    openscan_pattern_meter((const uint8_t *)pix, w, h, &cols, &clip, &p50, &p95);
+    (*env)->ReleaseByteArrayElements(env, y, pix, JNI_ABORT);
+    out = (*env)->NewIntArray(env, 4);
+    if (!out) return NULL;
+    outv = (*env)->GetIntArrayElements(env, out, NULL);
+    if (!outv) return NULL;
+    outv[0] = cols;
+    outv[1] = clip;
+    outv[2] = p50;
+    outv[3] = p95;
+    (*env)->ReleaseIntArrayElements(env, out, outv, 0);
+    return out;
+}
+
+JNIEXPORT jint JNICALL
+Java_dev_lab_openscan_Engine_nativePatternRescue(JNIEnv *env, jclass cls, jint cols, jint clip, jint p95,
+                                                 jint exposure) {
+    int next = 0;
+    (void)env;
+    (void)cls;
+    if (!openscan_pattern_rescue(cols, clip, p95, exposure, &next)) return 0;
+    return next;
 }
