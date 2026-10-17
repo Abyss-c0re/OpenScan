@@ -1,9 +1,8 @@
 /* Projector-plane depth. A bright column in the pattern camera is one stripe.
  * Streaming camera A is what turns that pattern on.
- * On a full frame the plane index is the column's rank times one period.
- * The period is the pixel gap divided by the calibrated plane pitch.
- * The distance hint is only the depth of the center column. A wider gap is
- * the surface moving, so the ray keeps its plane and the depth stays.
+ * When the calibration has a spatial code, the stripe's phase selects the
+ * projector plane. The lattice rank remains when that match fails, and the
+ * distance hint is only that lattice's center column.
  * The synthetic wall is a small frame: each painted stripe is one plane
  * at the hint. docs/projector.md. */
 #include "os_stripe.h"
@@ -1659,6 +1658,541 @@ static void continue_stripes(const openscan_calib *cal, const Peq *peq, int npla
     free(pis);
 }
 
+/* One code step is sx raw projector pixels. Code pattern_w lies on the
+ * projector principal point, so the line for code k is
+ * offset = cx + pattern_w * sx - sx * k.
+ * Slope is the factory line at that offset, extended past either end. */
+static double db_slope(const double *off, const double *sl, int n, double o) {
+    int i, k;
+    double dsl, t;
+    if (n < 2) return 0.0;
+    if (o <= off[0]) {
+        k = n >= 8 ? 7 : 1;
+        dsl = (sl[k] - sl[0]) / (off[k] - off[0]);
+        return sl[0] + (o - off[0]) * dsl;
+    }
+    if (o >= off[n - 1]) {
+        k = n >= 8 ? n - 8 : 0;
+        dsl = (sl[n - 1] - sl[k]) / (off[n - 1] - off[k]);
+        return sl[n - 1] + (o - off[n - 1]) * dsl;
+    }
+    for (i = 1; i < n; i++) {
+        if (o > off[i]) continue;
+        t = (o - off[i - 1]) / (off[i] - off[i - 1]);
+        return sl[i - 1] * (1.0 - t) + sl[i] * t;
+    }
+    return sl[n - 1];
+}
+
+static int db_slope_table(const openscan_calib *cal, double *off, double *sl, int *index) {
+    int n, i, j;
+    n = cal->nplanes;
+    if (n < 4) return 0;
+    if (n > OPENSCAN_MAX_PLANES) n = OPENSCAN_MAX_PLANES;
+    for (i = 0; i < n; i++) {
+        off[i] = cal->plane[i].offset;
+        sl[i] = cal->plane[i].slope;
+        index[i] = cal->plane[i].index;
+    }
+    for (i = 1; i < n; i++) {
+        double oo = off[i], ss = sl[i];
+        int ii = index[i];
+        j = i;
+        while (j > 0 && off[j - 1] > oo) {
+            off[j] = off[j - 1];
+            sl[j] = sl[j - 1];
+            index[j] = index[j - 1];
+            j--;
+        }
+        off[j] = oo;
+        sl[j] = ss;
+        index[j] = ii;
+    }
+    j = 1;
+    for (i = 1; i < n; i++) {
+        if (!(off[i] > off[j - 1] + 1e-3)) continue;
+        off[j] = off[i];
+        sl[j] = sl[i];
+        index[j] = index[i];
+        j++;
+    }
+    return j;
+}
+
+/* Peaks of the vertical carrier. Threshold 12 keeps a real column and
+ * leaves the lattice gate (6, gap 9..20) untouched for the fallback. */
+static int db_peaks(const uint8_t *row, int width, int *peaks, int cap) {
+    int np = 0, last = -100, x;
+    if (cap > OS_STRIPE_MAX_PEAKS) cap = OS_STRIPE_MAX_PEAKS;
+    for (x = 8; x < width - 8 && np < cap; x++) {
+        double hp = lattice_hp(row, width, x);
+        if (hp < 12.0) continue;
+        if (!(hp >= lattice_hp(row, width, x - 1) && hp > lattice_hp(row, width, x + 1) &&
+              hp >= lattice_hp(row, width, x - 2) && hp > lattice_hp(row, width, x + 2)))
+            continue;
+        if (x - last < 8) {
+            if (np > 0 && hp > lattice_hp(row, width, peaks[np - 1])) {
+                peaks[np - 1] = x;
+                last = x;
+            }
+            continue;
+        }
+        peaks[np++] = x;
+        last = x;
+    }
+    return np;
+}
+
+enum { DB_CAP = 192 };
+
+typedef struct {
+    int *ys;
+    float *xs;
+    int n, cap;
+    int last_y;
+    float mx;
+} DbCol;
+
+static int db_add(DbCol *c, int y, float x) {
+    if (c->n >= c->cap) {
+        int ncap = c->cap > 0 ? c->cap * 2 : 16;
+        int *ny = realloc(c->ys, (size_t)ncap * sizeof(int));
+        float *nx;
+        if (!ny) return 0;
+        c->ys = ny;
+        nx = realloc(c->xs, (size_t)ncap * sizeof(float));
+        if (!nx) return 0;
+        c->xs = nx;
+        c->cap = ncap;
+    }
+    c->ys[c->n] = y;
+    c->xs[c->n] = x;
+    c->n++;
+    c->last_y = y;
+    return 1;
+}
+
+static void db_release(DbCol *cols, int nc) {
+    int i;
+    if (!cols) return;
+    for (i = 0; i < nc; i++) {
+        free(cols[i].ys);
+        free(cols[i].xs);
+    }
+    free(cols);
+}
+
+static void db_sort(DbCol *c) {
+    int i, j;
+    if (c->n <= 1) return;
+    for (i = 1; i < c->n; i++) {
+        int y = c->ys[i];
+        float x = c->xs[i];
+        j = i;
+        while (j > 0 && c->ys[j - 1] > y) {
+            c->ys[j] = c->ys[j - 1];
+            c->xs[j] = c->xs[j - 1];
+            j--;
+        }
+        c->ys[j] = y;
+        c->xs[j] = x;
+    }
+    j = 1;
+    for (i = 1; i < c->n; i++) {
+        if (c->ys[i] == c->ys[j - 1]) {
+            c->xs[j - 1] = 0.5f * (c->xs[j - 1] + c->xs[i]);
+            continue;
+        }
+        c->ys[j] = c->ys[i];
+        c->xs[j] = c->xs[i];
+        j++;
+    }
+    c->n = j;
+}
+
+static int db_x_at(const DbCol *c, int y, float *xo) {
+    int lo, hi, mid;
+    float t;
+    if (c->n < 1 || y < c->ys[0] || y > c->ys[c->n - 1]) return 0;
+    lo = 0;
+    hi = c->n - 1;
+    while (lo + 1 < hi) {
+        mid = (lo + hi) >> 1;
+        if (c->ys[mid] <= y) lo = mid;
+        else hi = mid;
+    }
+    if (hi == lo || c->ys[hi] == c->ys[lo]) {
+        *xo = c->xs[lo];
+        return 1;
+    }
+    t = (float)(y - c->ys[lo]) / (float)(c->ys[hi] - c->ys[lo]);
+    *xo = c->xs[lo] * (1.f - t) + c->xs[hi] * t;
+    return 1;
+}
+
+static int db_pix(const uint8_t *img, int width, int height, const DbCol *c, int y) {
+    float x;
+    int xi;
+    if (y < 0 || y >= height) return -1;
+    if (!db_x_at(c, y, &x)) return -1;
+    xi = (int)(x >= 0.f ? x + 0.5f : x - 0.5f);
+    if (xi < 0) xi = 0;
+    if (xi >= width) xi = width - 1;
+    return img[(size_t)y * width + xi];
+}
+
+/* Integer period of the vertical brightness carrier. It grows when the
+ * wall is closer, so the lag is measured on this frame. */
+static int db_period(const uint8_t *img, int width, int height, DbCol *cols, const int *ord, int ns) {
+    double acc[121];
+    int cnt[121];
+    float *sig;
+    int i, lag, best, used;
+    double best_s;
+    memset(acc, 0, sizeof acc);
+    memset(cnt, 0, sizeof cnt);
+    sig = malloc((size_t)height * sizeof(float));
+    if (!sig) return 0;
+    used = 0;
+    for (i = 0; i < ns && used < 32; i++) {
+        DbCol *c = &cols[ord[i]];
+        int y0, y1, y, len, n;
+        double mean;
+        if (c->n < 16) continue;
+        y0 = c->ys[0];
+        y1 = c->ys[c->n - 1];
+        if (y1 - y0 < 80) continue;
+        len = 0;
+        mean = 0;
+        for (y = y0; y <= y1; y++) {
+            int g = db_pix(img, width, height, c, y);
+            if (g < 0) continue;
+            sig[len++] = (float)g;
+            mean += g;
+        }
+        if (len < 80) continue;
+        mean /= (double)len;
+        for (n = 0; n < len; n++) sig[n] = (float)(sig[n] - mean);
+        for (lag = 12; lag <= 120 && lag < len; lag++) {
+            double dot = 0;
+            int a;
+            for (a = 0; a < len - lag; a++) dot += (double)sig[a] * (double)sig[a + lag];
+            acc[lag] += dot;
+            cnt[lag] += len - lag;
+        }
+        used++;
+    }
+    free(sig);
+    if (used < 1) return 0;
+    best = 0;
+    best_s = -1e300;
+    for (lag = 12; lag <= 120; lag++) {
+        double s;
+        if (!cnt[lag]) continue;
+        s = acc[lag] / (double)cnt[lag];
+        if (s > best_s) {
+            best_s = s;
+            best = lag;
+        }
+    }
+    if (best < 12 || !(best_s > 0.0)) return 0;
+    return best;
+}
+
+/* Symbol 0..5 is the phase of that carrier. 255 means this stripe had
+ * too little column to measure; it still keeps its place in the order. */
+static int db_symbol(const uint8_t *img, int width, int height, const DbCol *c, int period) {
+    int y0, y1, y, cnt, sym;
+    double sum, mean, ss, sc;
+    float ph, cyc;
+    if (c->n < 2) return 255;
+    y0 = c->ys[0];
+    y1 = c->ys[c->n - 1];
+    if (y0 < 8) y0 = 8;
+    if (y1 > height - 9) y1 = height - 9;
+    if (y1 - y0 < period) return 255;
+    sum = 0;
+    cnt = 0;
+    for (y = y0; y <= y1; y += 2) {
+        int g = db_pix(img, width, height, c, y);
+        if (g < 0) continue;
+        sum += g;
+        cnt++;
+    }
+    if (cnt < period / 2) return 255;
+    mean = sum / (double)cnt;
+    ss = 0;
+    sc = 0;
+    for (y = y0; y <= y1; y += 2) {
+        int g = db_pix(img, width, height, c, y);
+        double d;
+        float ang;
+        if (g < 0) continue;
+        d = (double)g - mean;
+        ang = 6.28318530718f * (float)y / (float)period;
+        ss += d * (double)os_sin(ang);
+        sc += d * (double)os_cos(ang);
+    }
+    ph = os_atan2((float)ss, (float)sc);
+    cyc = ph / 6.28318530718f;
+    if (cyc < 0.f) cyc += 1.f;
+    sym = (int)(cyc * 6.f + 0.5f);
+    if (sym >= 6) sym = 0;
+    if (sym < 0) sym = 0;
+    return sym;
+}
+
+static void db_perm(int idx, int out[6]) {
+    int pool[6];
+    int n, i, j, f, q;
+    for (i = 0; i < 6; i++) pool[i] = i;
+    n = 6;
+    for (i = 0; i < 6; i++) {
+        f = 1;
+        for (j = 2; j < n; j++) f *= j;
+        q = n <= 1 ? 0 : idx / f;
+        if (n > 1) idx %= f;
+        out[i] = pool[q];
+        for (j = q; j < n - 1; j++) pool[j] = pool[j + 1];
+        n--;
+    }
+}
+
+/* The same word can sit in several places, so a short window is not a name.
+ * The whole run is. A permutation absorbs the carrier's phase offset, and
+ * the code index is this stripe's place in that run. */
+static int db_align(const unsigned char *sym, int n, const uint8_t *seq, int ncode,
+                    int *rev_out, int *off_out) {
+    int best_h = -1, second_h = -1, best_rev = 0, best_off = 0, ties = 0;
+    int rev, perm_i;
+    if (n < 24 || n > ncode || n > DB_CAP) return 0;
+    for (rev = 0; rev < 2; rev++) {
+        for (perm_i = 0; perm_i < 720; perm_i++) {
+            int perm[6];
+            unsigned char mapped[DB_CAP];
+            int i, lim;
+            db_perm(perm_i, perm);
+            for (i = 0; i < n; i++) {
+                int s = rev ? sym[n - 1 - i] : sym[i];
+                mapped[i] = s < 6 ? (unsigned char)perm[s] : 255;
+            }
+            lim = ncode - n;
+            for (int off = 0; off <= lim; off++) {
+                int h = 0;
+                const uint8_t *w = seq + off;
+                for (i = 0; i < n; i++) {
+                    h += mapped[i] == w[i];
+                    if (second_h >= 0 && h + (n - i - 1) <= second_h) break;
+                }
+                if (h > best_h) {
+                    if (best_h >= 0 && (rev != best_rev || off != best_off)) second_h = best_h;
+                    best_h = h;
+                    best_rev = rev;
+                    best_off = off;
+                    ties = 1;
+                } else if (rev == best_rev && off == best_off) {
+                    continue;
+                } else if (h == best_h) {
+                    ties++;
+                } else if (h > second_h) {
+                    second_h = h;
+                }
+            }
+        }
+    }
+    if (best_h * 100 < n * 60) return 0;
+    if (ties != 1) return 0;
+    if (second_h >= 0 && best_h - second_h < 8) return 0;
+    *rev_out = best_rev;
+    *off_out = best_off;
+    return 1;
+}
+
+static int debruijn_fill(const openscan_calib *cal, const uint8_t *pattern, int width, int height,
+                         float near_mm, float far_mm, const int *ys, int nrows, Hit *hits,
+                         int *counts) {
+    DbCol *cols;
+    int ord[DB_CAP];
+    unsigned char sym[DB_CAP];
+    Peq pls[DB_CAP];
+    double soff[OPENSCAN_MAX_PLANES], ssl[OPENSCAN_MAX_PLANES];
+    int sindex[OPENSCAN_MAX_PLANES];
+    double R[9], dof;
+    const openscan_pinhole *proj;
+    int nc, ns, y, i, nt, period, rev, off, total, seen[6], nuniq;
+    if (!cal || !pattern || !ys || !hits || !counts) return 0;
+    if (width < 640 || height < 400 || nrows < 8) return 0;
+    if (cal->ncode < 32 || cal->ncode > OPENSCAN_MAX_CODE) return 0;
+    if (!(cal->sx > 1.0) || cal->pattern_w < 8) return 0;
+    proj = &cal->cam[2];
+    if (!(proj->fx > 1.0) || !(proj->fy > 1.0)) return 0;
+    memset(seen, 0, sizeof seen);
+    nuniq = 0;
+    for (i = 0; i < cal->ncode; i++) {
+        int id = cal->code_id[i];
+        if (id > 5) return 0;
+        if (!seen[id]) {
+            seen[id] = 1;
+            nuniq++;
+        }
+    }
+    if (nuniq != 6) return 0;
+    nt = db_slope_table(cal, soff, ssl, sindex);
+    if (nt < 4) return 0;
+    if (sindex[nt - 1] == sindex[0]) return 0;
+    dof = (soff[nt - 1] - soff[0]) / (double)(sindex[nt - 1] - sindex[0]);
+    if (!(dof > 1.0 && dof < 30.0)) return 0;
+    cols = calloc(DB_CAP, sizeof(DbCol));
+    if (!cols) return 0;
+    nc = 0;
+    for (y = 32; y < height - 32; y += 12) {
+        int peaks[OS_STRIPE_MAX_PEAKS];
+        int assigned[OS_STRIPE_MAX_PEAKS];
+        unsigned char taken[DB_CAP];
+        int np = db_peaks(pattern + (size_t)y * width, width, peaks, OS_STRIPE_MAX_PEAKS);
+        int p;
+        memset(taken, 0, (size_t)nc);
+        for (p = 0; p < np; p++) {
+            int best = -1, bd = 7, c, d, lx;
+            assigned[p] = -1;
+            for (c = 0; c < nc; c++) {
+                if (taken[c] || cols[c].n < 1) continue;
+                if (y - cols[c].last_y > 48) continue;
+                lx = (int)(cols[c].xs[cols[c].n - 1] + 0.5f);
+                d = peaks[p] - lx;
+                if (d < 0) d = -d;
+                if (d < bd) {
+                    bd = d;
+                    best = c;
+                }
+            }
+            if (best < 0) continue;
+            taken[best] = 1;
+            if (db_add(&cols[best], y, (float)peaks[p])) assigned[p] = best;
+        }
+        for (p = 0; p < np; p++) {
+            if (assigned[p] >= 0) continue;
+            if (nc >= DB_CAP) break;
+            if (db_add(&cols[nc], y, (float)peaks[p])) nc++;
+        }
+    }
+    ns = 0;
+    for (i = 0; i < nc; i++) {
+        if (cols[i].n < 8) continue;
+        cols[i].mx = median_of(cols[i].xs, cols[i].n);
+        ord[ns++] = i;
+    }
+    for (i = 1; i < ns; i++) {
+        int key = ord[i], j = i;
+        while (j > 0 && cols[ord[j - 1]].mx > cols[key].mx) {
+            ord[j] = ord[j - 1];
+            j--;
+        }
+        ord[j] = key;
+    }
+    {
+        int w = 0;
+        for (i = 0; i < ns; i++) {
+            int id = ord[i];
+            DbCol *src, *dst;
+            int nn;
+            int *ny;
+            float *nx;
+            if (w > 0 && cols[id].mx - cols[ord[w - 1]].mx <= 6.f) {
+                dst = &cols[ord[w - 1]];
+                src = &cols[id];
+                nn = dst->n + src->n;
+                ny = realloc(dst->ys, (size_t)nn * sizeof(int));
+                if (!ny) goto fail;
+                dst->ys = ny;
+                nx = realloc(dst->xs, (size_t)nn * sizeof(float));
+                if (!nx) goto fail;
+                dst->xs = nx;
+                memcpy(dst->ys + dst->n, src->ys, (size_t)src->n * sizeof(int));
+                memcpy(dst->xs + dst->n, src->xs, (size_t)src->n * sizeof(float));
+                dst->n = nn;
+                dst->cap = nn;
+                dst->mx = median_of(dst->xs, dst->n);
+                free(src->ys);
+                free(src->xs);
+                src->ys = NULL;
+                src->xs = NULL;
+                src->n = 0;
+                continue;
+            }
+            ord[w++] = id;
+        }
+        ns = w;
+    }
+    if (ns < 24) goto fail;
+    for (i = 0; i < ns; i++) db_sort(&cols[ord[i]]);
+    period = db_period(pattern, width, height, cols, ord, ns);
+    if (period < 12) goto fail;
+    for (i = 0; i < ns; i++)
+        sym[i] = (unsigned char)db_symbol(pattern, width, height, &cols[ord[i]], period);
+    if (!db_align(sym, ns, cal->code_id, cal->ncode, &rev, &off)) goto fail;
+    rodriques(proj->rvec, R);
+    for (i = 0; i < ns; i++) {
+        int code = rev ? off + (ns - 1 - i) : off + i;
+        double offset, slope;
+        int slot;
+        if (code < 0 || code >= cal->ncode) goto fail;
+        offset = proj->cx + (double)cal->pattern_w * cal->sx - cal->sx * (double)code;
+        slope = db_slope(soff, ssl, nt, offset);
+        slot = sindex[0] + os_lround((float)((offset - soff[0]) / dof));
+        fill_peq(proj, R, slope, offset, slot, &pls[i]);
+    }
+    total = 0;
+    for (i = 0; i < nrows; i++) {
+        Hit *h = hits + i * OS_STRIPE_MAX_PEAKS;
+        int row_y = ys[i];
+        int k = 0, s;
+        counts[i] = 0;
+        for (s = 0; s < OS_STRIPE_MAX_PEAKS; s++) {
+            h[s].ok = 0;
+            h[s].x = -1;
+        }
+        for (s = 0; s < ns && k < OS_STRIPE_MAX_PEAKS; s++) {
+            float xf;
+            int xi;
+            double xu, yu, z, X, Y;
+            if (!db_x_at(&cols[ord[s]], row_y, &xf)) continue;
+            xi = (int)(xf >= 0.f ? xf + 0.5f : xf - 0.5f);
+            if (xi < 0 || xi >= width) continue;
+            if (!undistort_ok(&cal->cam[0], xi, row_y, &xu, &yu)) continue;
+            if (!plane_at(&pls[s], xu, yu, &z, &X, &Y)) continue;
+            if (z < near_mm || z > far_mm) continue;
+            h[k].x = xi;
+            h[k].pi = pls[s].index;
+            h[k].z = (float)z;
+            h[k].X = (float)X;
+            h[k].Y = (float)Y;
+            h[k].tone = pattern[(size_t)row_y * width + xi] / 255.f;
+            h[k].ok = 1;
+            k++;
+            total++;
+        }
+        counts[i] = k;
+    }
+    if (total < 200) {
+        for (i = 0; i < nrows; i++) {
+            Hit *h = hits + i * OS_STRIPE_MAX_PEAKS;
+            int s;
+            counts[i] = 0;
+            for (s = 0; s < OS_STRIPE_MAX_PEAKS; s++) {
+                h[s].ok = 0;
+                h[s].x = -1;
+            }
+        }
+        goto fail;
+    }
+    db_release(cols, nc);
+    return 1;
+fail:
+    db_release(cols, nc);
+    return 0;
+}
+
 void os_stripe_free(os_stripe_cloud *cloud) {
     if (!cloud) return;
     free(cloud->pt);
@@ -1712,7 +2246,7 @@ int os_stripe_make(const openscan_calib *cal,
     int *ys;
     Hit *hits;
     int *counts;
-    int cols, total;
+    int cols, total, decoded;
     float *zs;
     if (out) memset(out, 0, sizeof *out);
     if (!out || !cal || !pattern || width < 16 || height < 16) return -1;
@@ -1739,12 +2273,16 @@ int os_stripe_make(const openscan_calib *cal,
     for (int y = 0; y < height && nrows < OS_STRIPE_MAX_ROWS; y += step) ys[nrows++] = y;
     flat = clean_flat(clean, width, height);
     for (r = 0; r < nrows * OS_STRIPE_MAX_PEAKS; r++) hits[r].x = -1;
-    /* A full frame assigns one plane per column rank. The hint is the center
-     * column. The small wall has no lattice, so it keeps the plane walk.
-     * A 1280-wide frame that failed the lattice is noise around that hint.
-     * Emitting it paints a sheet at the slider depth. */
-    if (!lattice_fill(cal, pattern, width, height, flipped, hint_mm, near_mm, far_mm, ys, nrows,
-                      hits, counts)) {
+    /* The code names each stripe. The lattice remains when that match fails.
+     * A full frame that failed both is noise around the distance hint.
+     * Emitting it paints a sheet at the slider depth. The small wall has no
+     * lattice, so it keeps the plane walk. */
+    decoded = 0;
+    if (cal->ncode >= 32 && cal->sx > 1.0 && cal->pattern_w >= 8)
+        decoded = debruijn_fill(cal, pattern, width, height, near_mm, far_mm, ys, nrows, hits,
+                                counts);
+    if (!decoded && !lattice_fill(cal, pattern, width, height, flipped, hint_mm, near_mm, far_mm,
+                                  ys, nrows, hits, counts)) {
         if (width >= 640 && height >= 400) {
             free(ys);
             free(hits);

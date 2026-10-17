@@ -2,6 +2,7 @@
 #define OPENSCAN_CALIB_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 #ifdef __cplusplus
@@ -12,13 +13,16 @@ extern "C" {
  * The owner of a unit supplies calib/<serial>.txt.
  *
  *   <width> <height>
- *   <a> <b>
+ *   <sx> <sy>       projector scales, raw pixels per code on x
  *   <pattern_w> <pattern_h>
- *   <code> <offset>
+ *   <code_div> <code_off>
  *   <15 floats>     camera 1: fx fy cx cy k1 k2 p1 p2 k3 + 6 zeros
  *   <15 floats>     camera 2: fx fy cx cy k1 k2 p1 p2 k3 + rodrigues(3) + t(3 mm)
  *   <15 floats>     projector modelled as a third pinhole
- *   ... lookup and spatial code ...
+ *   <nplanes>
+ *   <index> <slope> <offset>     one projector line per row
+ *   <ncode>
+ *   <6 ints>                     one spatial-code word per column
  *   ***DevID:<sn>***CalibrateDate:...
  *
  * Camera 2's translation is in millimetres relative to camera 1.
@@ -40,6 +44,7 @@ typedef struct openscan_plane {
 } openscan_plane;
 
 #define OPENSCAN_MAX_PLANES 160
+#define OPENSCAN_MAX_CODE 256
 
 typedef struct openscan_calib {
     int width, height;
@@ -48,6 +53,14 @@ typedef struct openscan_calib {
     openscan_pinhole cam[3]; /* 0 pattern camera, 1 clean camera, 2 projector */
     int nplanes;
     openscan_plane plane[OPENSCAN_MAX_PLANES];
+    /* sx is raw projector pixels per code. sy is the other projector scale.
+     * code_id is the first-seen vocabulary id of each spatial-code column.
+     * ncode is 0 when the file has no code table. */
+    double sx, sy;
+    int pattern_w, pattern_h;
+    int code_div, code_off;
+    int ncode;
+    uint8_t code_id[OPENSCAN_MAX_CODE];
 } openscan_calib;
 
 /* A factory file starts with the image width. Leading space is ignored,

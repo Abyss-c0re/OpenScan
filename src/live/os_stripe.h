@@ -25,8 +25,9 @@ typedef struct os_stripe_cloud {
 /* pattern and clean are width by height luminance. pattern is camera A.
  * The NIR columns are already in that frame while A is streaming.
  * flipped is 1 when those buffers are rotated 180° from the calibration.
- * hint_mm is the depth of the center column on a full camera frame.
- * The column rank fixes the plane, and the ray intersection is the relief.
+ * hint_mm is the depth of the center column for the lattice fallback.
+ * A spatial code names the plane from the stripe phase. Without that code
+ * the column rank fixes the plane. The ray intersection is the relief.
  * Points outside near_mm..far_mm are dropped.
  * Returns 0. out->pt is NULL when nothing measured.
  * docs/projector.md. */

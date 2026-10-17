@@ -11,6 +11,19 @@ static int read_doubles(FILE *f, double *dst, int n) {
     return 0;
 }
 
+/* First time a 6-symbol word appears it takes the next vocabulary id. */
+static int code_vocab(int vocab[][6], int *nv, const int s[6]) {
+    int i, k;
+    for (i = 0; i < *nv; i++) {
+        for (k = 0; k < 6; k++)
+            if (vocab[i][k] != s[k]) break;
+        if (k == 6) return i;
+    }
+    if (*nv >= 8) return 255;
+    for (k = 0; k < 6; k++) vocab[*nv][k] = s[k];
+    return (*nv)++;
+}
+
 int openscan_calib_load(const char *path, openscan_calib *out) {
     memset(out, 0, sizeof *out);
     FILE *f = fopen(path, "r");
@@ -19,12 +32,12 @@ int openscan_calib_load(const char *path, openscan_calib *out) {
         fclose(f);
         return -1;
     }
-    double skip[4];
-    if (read_doubles(f, skip, 2) < 0) { fclose(f); return -1; }
-    int iw, ih, code, off;
-    if (fscanf(f, "%d %d", &iw, &ih) != 2) { fclose(f); return -1; }
-    if (fscanf(f, "%d %d", &code, &off) != 2) { fclose(f); return -1; }
-    (void)iw; (void)ih; (void)code; (void)off;
+    double scale[2];
+    if (read_doubles(f, scale, 2) < 0) { fclose(f); return -1; }
+    out->sx = scale[0];
+    out->sy = scale[1];
+    if (fscanf(f, "%d %d", &out->pattern_w, &out->pattern_h) != 2) { fclose(f); return -1; }
+    if (fscanf(f, "%d %d", &out->code_div, &out->code_off) != 2) { fclose(f); return -1; }
 
     for (int c = 0; c < 3; c++) {
         double v[15];
@@ -36,9 +49,8 @@ int openscan_calib_load(const char *path, openscan_calib *out) {
         p->tvec[0] = v[12]; p->tvec[1] = v[13]; p->tvec[2] = v[14];
     }
 
-    /* 130 light planes, then the spatial-code table. Planes are what the stripe decoder
-     * intersects with each decoded stripe. The code table is not needed to
-     * cut the plane. */
+    /* Planes are the calibrated projector lines. The code table, when the
+     * file has one, is the vocabulary the stripe decoder aligns. */
     int np = 0;
     if (fscanf(f, "%d", &np) == 1 && np > 0) {
         if (np > OPENSCAN_MAX_PLANES) np = OPENSCAN_MAX_PLANES;
@@ -54,6 +66,22 @@ int openscan_calib_load(const char *path, openscan_calib *out) {
             out->plane[i].offset = offset;
         }
         out->nplanes = np;
+    }
+
+    int ncode = 0;
+    if (fscanf(f, "%d", &ncode) == 1 && ncode > 0 && ncode <= OPENSCAN_MAX_CODE) {
+        int vocab[8][6];
+        int nv = 0;
+        int i;
+        for (i = 0; i < ncode; i++) {
+            int s[6];
+            if (fscanf(f, "%d %d %d %d %d %d", &s[0], &s[1], &s[2], &s[3], &s[4], &s[5]) != 6) {
+                ncode = 0;
+                break;
+            }
+            out->code_id[i] = (uint8_t)code_vocab(vocab, &nv, s);
+        }
+        out->ncode = ncode;
     }
 
     char line[512];
