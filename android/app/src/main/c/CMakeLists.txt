@@ -17,6 +17,6 @@ add_library(openscanjni SHARED
 )
 
 target_include_directories(openscanjni PRIVATE "${OPENSCAN_SRC}/include")
-target_compile_definitions(openscanjni PRIVATE OPENSCAN_VERSION="0.6.14" OPENSCAN_HOST="android")
+target_compile_definitions(openscanjni PRIVATE OPENSCAN_VERSION="0.6.15" OPENSCAN_HOST="android")
 target_link_options(openscanjni PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
 target_link_libraries(openscanjni log android)
